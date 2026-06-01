@@ -1,0 +1,53 @@
+rover_rl_policy:
+  ros__parameters:
+    # --- Model ---
+    # 路徑指向 export_policy.py 產出的 .ts 檔（在 Jetson 上的絕對路徑）
+    model_path: "/home/aa/rover_rl_ws/models/sa1_v2_policy.ts"
+    device: "cuda:0"                  # Jetson AGX Orin iGPU；若不穩定可退回 "cpu"
+
+    # --- Topics（CampusRover 實車配置） ---
+    topic_lidar: "/velodyne_points"
+    topic_odom: "/odom"
+    topic_goal: "/goal_pose"
+    # ★ 改走 lcr_cmd_vel_mux（避免 joy/nav 互相搶；mux 會把 /input/nav_cmd_vel → /output/cmd_vel）
+    topic_cmd_vel: "/input/nav_cmd_vel"
+    publish_obs_debug: false
+
+    # --- QoS ---
+    lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS
+
+    # --- LiDAR 校準 ---
+    # CampusRover URDF: velodyne_link 相對 base_link 無 yaw 旋轉 → offset=0
+    lidar_yaw_offset_deg: 0.0
+    lidar_z_filter_m: 0.5             # 訓練值；在 sensor frame |z|>0.5 過濾地板/天花板
+    lidar_r_min_m: 0.9                # VLP-16 硬體盲區（訓練值）
+    lidar_r_max_m: 20.0
+
+    # --- Obs normalizer（必須與訓練 ObservationsCfgVLP16 一致；勿改） ---
+    obs_max_acceleration: 1.0
+    obs_max_linear_velocity: 1.0
+    obs_max_angular_velocity: 1.5     # 注意：obs term 用 1.5，動作端用 2.0
+    robot_radius_m: 0.35              # 與訓練一致；實際半寬 0.26 為保守值來源
+    episode_horizon_s: 60.0
+
+    # --- Action limits（鎖在訓練分布內，不要因為底盤更強就放寬！） ---
+    # 底盤能力: max_speed=1.5, acc_max=1.2, omega_max=1.2 — 但 policy 沒見過 > 訓練值
+    # 不要 extrapolate，保持訓練值
+    act_max_linear_velocity: 1.0
+    act_max_linear_accel: 0.5
+    act_max_angular_velocity: 2.0
+
+    # --- 控制週期 ---
+    control_dt: 0.2                   # 5 Hz；訓練 dt 一致，勿改
+    deterministic: true               # 首次部署用 argmax；穩定後可試 false 看 stochastic 是否更平順
+    timeout_lidar_s: 0.5              # VLP-16 10Hz 雙回掃，0.5s 足夠
+    timeout_odom_s: 0.3               # /odom 20Hz，0.3s 偵測掉線
+
+    # --- Goal ---
+    # 若有完整 SLAM/AMCL：goal_frame="map"
+    # 若無 map，只跑相對導航：改 "odom"
+    goal_frame: "map"
+    goal_tolerance_m: 0.6             # 略放寬避免在 goal 附近震盪
+
+    # --- Safety ---
+    safety_lidar_emergency_stop_m: 0.40   # 首次部署保守值，穩定後可降到 0.30

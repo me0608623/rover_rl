@@ -1,0 +1,24 @@
+# Build artifacts
+build/
+install/
+log/
+.director-mode/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Models（不 commit 大檔，由 Release 或 LFS 管理；可單獨開白名單）
+models/*.ts
+models/*.pt
+!models/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
