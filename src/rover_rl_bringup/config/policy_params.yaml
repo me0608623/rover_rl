@@ -1,9 +1,10 @@
 rover_rl_policy:
   ros__parameters:
     # --- Model ---
-    # 路徑指向 export_policy.py 產出的 .ts 檔（在 Jetson 上的絕對路徑）
-    model_path: "/home/aa/rover_rl_ws/models/sa1_v2_policy.ts"
-    device: "cuda:0"                  # Jetson AGX Orin iGPU；若不穩定可退回 "cpu"
+    # 路徑指向 export_policy.py 產出的 .ts 檔。
+    # 三個 baseline 都在 ~/rover_rl/models/，sa6_tc_dense_420k 為首選（420k steps）。
+    model_path: "/home/aa/rover_rl/models/sa6_tc_dense_420k.ts"
+    device: "cpu"                     # 車上 torch 是 CPU 版；裝 CUDA torch 後可改 cuda:0
 
     # --- Topics（CampusRover 實車配置） ---
     # ★ preprocessor 節點先把 /velodyne_points 處理成 72-bin sweep 後發到此 topic
@@ -61,8 +62,9 @@ rover_rl_policy:
     cmd_max_accel_angular: 3.0        # rad/s² slew limit
 
     # --- mode ---
-    # nav (預設) / idle / estop / manual / paused
-    initial_mode: "nav"
+    # nav (跑導航) / idle (待命) / estop (急停) / manual (搖桿) / paused
+    # 首次啟動建議 idle，確認 cmd_vel 為 0、policy 推論正常後再切 nav
+    initial_mode: "idle"
     base_frame: "base_footprint"
 
     # --- Goal / 定位（採 spot_rl + rover2_ws pattern） ---
