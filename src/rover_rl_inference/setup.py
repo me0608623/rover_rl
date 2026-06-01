@@ -19,6 +19,7 @@ setup(
     entry_points={
         "console_scripts": [
             "policy_node = rover_rl_inference.policy_node:main",
+            "ros_smoke_test = rover_rl_inference.ros_smoke_test:main",
             "export_policy = rover_rl_inference.export_policy:main",
         ],
     },
