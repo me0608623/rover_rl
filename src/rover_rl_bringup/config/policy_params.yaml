@@ -43,11 +43,13 @@ rover_rl_policy:
     timeout_lidar_s: 0.5              # VLP-16 10Hz 雙回掃，0.5s 足夠
     timeout_odom_s: 0.3               # /odom 20Hz，0.3s 偵測掉線
 
-    # --- Goal ---
-    # 若有完整 SLAM/AMCL：goal_frame="map"
-    # 若無 map，只跑相對導航：改 "odom"
+    # --- Goal / 定位（採 spot_rl + rover2_ws pattern） ---
+    # goal_frame: "map" → 需要 NDT 提供 map→odom，localizer 用 cached offset
+    #              "odom" → 不需 NDT，純 odom 模式（適合無地圖測試）
     goal_frame: "map"
-    goal_tolerance_m: 0.6             # 略放寬避免在 goal 附近震盪
+    goal_tolerance_m: 0.6
+    topic_ndt_pose: "/ndt_pose"
+    require_ndt: false              # true=NDT 未穩定就拒絕動；false=fallback 純 odom             # 略放寬避免在 goal 附近震盪
 
     # --- Safety ---
     safety_lidar_emergency_stop_m: 0.40   # 首次部署保守值，穩定後可降到 0.30

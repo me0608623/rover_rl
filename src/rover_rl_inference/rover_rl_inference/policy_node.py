@@ -22,23 +22,24 @@ import time
 
 import numpy as np
 import rclpy
-import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
-from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
-from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray
 
-# 必須 import 才會註冊 PoseStamped 的 tf2 轉換 plugin
-import tf2_geometry_msgs  # noqa: F401
-
 from .action_decoder import ActionParams, decode_logits_to_cmd
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
+from .localization import MapOdomOffsetTracker, world_to_body
 from .model_runtime import PolicyRunner, load_bundle
 from .obs_builder import ObsParams, build_obs_raw
+
+
+def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
+    siny_cosp = 2.0 * (qw * qz + qx * qy)
+    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+    return math.atan2(siny_cosp, cosy_cosp)
 
 
 class PolicyNode(Node):
@@ -78,10 +79,10 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_angular_velocity", 2.0)
 
         # goal handling
-        self.declare_parameter("goal_frame", "map")  # map / odom / base_link
-        self.declare_parameter("base_frame", "base_footprint")  # 機器人 footprint frame
+        self.declare_parameter("goal_frame", "map")  # map / odom
         self.declare_parameter("goal_tolerance_m", 0.5)
-        self.declare_parameter("tf_timeout_s", 0.1)
+        self.declare_parameter("topic_ndt_pose", "/ndt_pose")
+        self.declare_parameter("require_ndt", False)   # true=必須 NDT 才允許動
 
         # safety
         self.declare_parameter("safety_lidar_emergency_stop_m", 0.30)
@@ -121,14 +122,13 @@ class PolicyNode(Node):
             dt=self.control_dt,
         )
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
-        self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
-        self.tf_timeout = float(gp("tf_timeout_s").value)
         self.safety_estop_m = float(gp("safety_lidar_emergency_stop_m").value)
+        self.require_ndt = bool(gp("require_ndt").value)
+        topic_ndt_pose = gp("topic_ndt_pose").get_parameter_value().string_value
 
-        # --- TF ---
-        self._tf_buffer = tf2_ros.Buffer()
-        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
+        # --- 定位（採 spot_rl + rover2_ws pattern：cached map→odom offset） ---
+        self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
 
         # --- model ---
         if not model_path or not os.path.isfile(model_path):
@@ -148,6 +148,8 @@ class PolicyNode(Node):
         self._lock = threading.Lock()
         self._latest_pc: np.ndarray | None = None
         self._latest_pc_t = 0.0
+        self._odom_xy = (0.0, 0.0)
+        self._odom_yaw = 0.0
         self._odom_v = 0.0
         self._odom_w = 0.0
         self._odom_t = 0.0
@@ -170,6 +172,7 @@ class PolicyNode(Node):
         self.create_subscription(PointCloud2, topic_lidar, self._cb_lidar, sensor_qos)
         self.create_subscription(Odometry, topic_odom, self._cb_odom, 10)
         self.create_subscription(PoseStamped, topic_goal, self._cb_goal, 10)
+        self.create_subscription(PoseStamped, topic_ndt_pose, self._cb_ndt_pose, 10)
         self.pub_cmd = self.create_publisher(Twist, topic_cmd_vel, 10)
         self.pub_obs = (
             self.create_publisher(Float32MultiArray, "~/obs_debug", 10)
@@ -193,11 +196,27 @@ class PolicyNode(Node):
             self._latest_pc_t = now
 
     def _cb_odom(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
+        q = msg.pose.pose.orientation
         tw = msg.twist.twist
+        yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
         with self._lock:
+            self._odom_xy = (p.x, p.y)
+            self._odom_yaw = yaw
             self._odom_v = tw.linear.x
             self._odom_w = tw.angular.z
             self._odom_t = time.monotonic()
+
+    def _cb_ndt_pose(self, msg: PoseStamped) -> None:
+        """收到 NDT 時用當下 odom 同步 → offset tracker."""
+        with self._lock:
+            odom_x, odom_y = self._odom_xy
+            speed = self._odom_v
+        self.localizer.on_ndt_pose(
+            msg.pose.position.x, msg.pose.position.y, odom_x, odom_y,
+        )
+        # 嘗試更新 offset（內部會閘門：靜止 + 穩定 + 間隔）
+        self.localizer.try_update_offset(robot_speed_mps=speed)
 
     def _cb_goal(self, msg: PoseStamped) -> None:
         with self._lock:
@@ -210,32 +229,45 @@ class PolicyNode(Node):
             f"({self._goal_world[0]:.2f}, {self._goal_world[1]:.2f}) — RNN hidden state 已重置"
         )
 
-    def _goal_in_body_frame(self) -> tuple[float, float] | None:
-        """用 TF 把 goal (in goal_frame) → base_frame (body local)."""
+    def _goal_in_body_frame(self) -> tuple[float, float, str] | None:
+        """用 cached offset + odom 算 body-frame goal.
+
+        Returns:
+            (body_x, body_y, source_tag) 或 None（如果條件不足）
+        """
         with self._lock:
             goal_world = self._goal_world
             goal_frame = self._goal_frame_used or self.goal_frame
+            odom_x, odom_y = self._odom_xy
+            odom_yaw = self._odom_yaw
         if goal_world is None:
             return None
 
-        gp = PoseStamped()
-        gp.header.frame_id = goal_frame
-        gp.header.stamp = RclpyTime().to_msg()  # latest available
-        gp.pose.position.x = goal_world[0]
-        gp.pose.position.y = goal_world[1]
-        gp.pose.orientation.w = 1.0
-        try:
-            transformed = self._tf_buffer.transform(
-                gp, self.base_frame, timeout=Duration(seconds=self.tf_timeout),
-            )
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException,
-                tf2_ros.ConnectivityException, tf2_ros.TransformException) as e:
-            self.get_logger().warn(
-                f"TF {goal_frame} → {self.base_frame} 失敗: {e}",
-                throttle_duration_sec=2.0,
-            )
+        # 取得機器人在 map frame 的 pose（依優先順序：offset / ndt / odom_only）
+        robot_pose = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
+
+        # 若 goal_frame == odom，把 odom-frame goal 視為基準（不需 offset）
+        # 若 goal_frame == map，goal 是在 map frame，robot_pose 也在 map frame → 對齊
+        # 若 require_ndt 且 NDT 尚未穩定 → 拒絕
+        if self.require_ndt and robot_pose.source == "odom_only":
             return None
-        return transformed.pose.position.x, transformed.pose.position.y
+
+        # 注意：若 goal 在 odom，但 robot_pose 已換到 map → 維度不一致
+        # 此處設計：goal_frame 與 robot_pose source 必須一致
+        if goal_frame == "odom":
+            # 強制用 odom-only pose（不加 offset）
+            robot_x, robot_y, robot_yaw = odom_x, odom_y, odom_yaw
+            source = "odom_only(forced)"
+        else:
+            robot_x = robot_pose.x
+            robot_y = robot_pose.y
+            robot_yaw = robot_pose.yaw
+            source = robot_pose.source
+
+        gx, gy = world_to_body(
+            goal_world[0], goal_world[1], robot_x, robot_y, robot_yaw,
+        )
+        return gx, gy, source
 
     # ----- main loop -----
 
@@ -258,14 +290,14 @@ class PolicyNode(Node):
         if goal_world is None:
             return self._publish_stop("尚未收到 goal", warn=False)
 
-        # goal → body frame via TF (處理 map→odom→base_link 完整鏈)
+        # goal → body frame（採 spot_rl/rover2_ws pattern：cached offset + odom）
         gb = self._goal_in_body_frame()
         if gb is None:
-            return self._publish_stop("TF 尚未就緒")
-        gx, gy = gb
+            return self._publish_stop("定位尚未就緒（require_ndt=true 但 NDT 未穩定）")
+        gx, gy, pose_source = gb
         dist = math.hypot(gx, gy)
         if dist < self.goal_tolerance:
-            self._publish_stop("到達 goal", warn=False)
+            self._publish_stop(f"到達 goal (source={pose_source})", warn=False)
             return
 
         # lidar sweep

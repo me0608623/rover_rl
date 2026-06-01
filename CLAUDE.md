@@ -53,7 +53,18 @@ base_link ─(URDF static)─ base_footprint / velodyne_link / imu_link
 | odom → base_link | rover driver | campusrover_base launch |
 | base_link → child | URDF | robot_state_publisher |
 
-**rover_rl policy_node 用 tf2 從 `goal_frame`（預設 map）transform 到 `base_frame`（預設 base_footprint）算 body-frame goal**，不靠手算。所以必須有完整 TF chain 才能跑。
+**rover_rl policy_node 採 spot_rl + rover2_ws 驗證過的 pattern**：
+- 訂閱 `/ndt_pose`（NDT 只在 is_converged=True 時發）
+- 用「近 1 秒收到且累積 ≥ 5 次」判定 NDT 穩定
+- 機器人靜止 + NDT 穩定時 cache `map→odom` offset（每 5 秒重算，delta > 0.3m 拒絕）
+- 即時計算：`robot_in_map = odom_xy + cached_offset`
+- 手動算 body-frame goal：`goal_body = R(-yaw) · (goal_map - robot_map)`
+- Fallback：NDT 未穩定 → 用 odom_only 來源（`require_ndt: false` 時允許）
+
+**為何不直接用 `tf_buffer.transform(PoseStamped, target)`**？
+- NDT 更新頻率低（1-10 Hz），TF lookup 可能 stale 或失敗
+- cached offset 即使 NDT 暫時消失仍能跑（safer fallback）
+- 跟 rover2_ws 既有 rl_policy_node 同 pattern，行為一致
 
 ### 啟動順序（用戶手動）
 
