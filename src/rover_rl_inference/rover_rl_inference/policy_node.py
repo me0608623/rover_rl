@@ -22,23 +22,23 @@ import time
 
 import numpy as np
 import rclpy
+import tf2_ros
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.time import Time as RclpyTime
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray
+
+# 必須 import 才會註冊 PoseStamped 的 tf2 轉換 plugin
+import tf2_geometry_msgs  # noqa: F401
 
 from .action_decoder import ActionParams, decode_logits_to_cmd
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
 from .model_runtime import PolicyRunner, load_bundle
-from .obs_builder import ObsParams, build_obs_raw, world_goal_to_body
-
-
-def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
-    siny_cosp = 2.0 * (qw * qz + qx * qy)
-    cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
-    return math.atan2(siny_cosp, cosy_cosp)
+from .obs_builder import ObsParams, build_obs_raw
 
 
 class PolicyNode(Node):
@@ -79,7 +79,9 @@ class PolicyNode(Node):
 
         # goal handling
         self.declare_parameter("goal_frame", "map")  # map / odom / base_link
+        self.declare_parameter("base_frame", "base_footprint")  # 機器人 footprint frame
         self.declare_parameter("goal_tolerance_m", 0.5)
+        self.declare_parameter("tf_timeout_s", 0.1)
 
         # safety
         self.declare_parameter("safety_lidar_emergency_stop_m", 0.30)
@@ -119,8 +121,14 @@ class PolicyNode(Node):
             dt=self.control_dt,
         )
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
+        self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
+        self.tf_timeout = float(gp("tf_timeout_s").value)
         self.safety_estop_m = float(gp("safety_lidar_emergency_stop_m").value)
+
+        # --- TF ---
+        self._tf_buffer = tf2_ros.Buffer()
+        self._tf_listener = tf2_ros.TransformListener(self._tf_buffer, self)
 
         # --- model ---
         if not model_path or not os.path.isfile(model_path):
@@ -140,8 +148,6 @@ class PolicyNode(Node):
         self._lock = threading.Lock()
         self._latest_pc: np.ndarray | None = None
         self._latest_pc_t = 0.0
-        self._odom_xy = (0.0, 0.0)
-        self._odom_yaw = 0.0
         self._odom_v = 0.0
         self._odom_w = 0.0
         self._odom_t = 0.0
@@ -187,13 +193,8 @@ class PolicyNode(Node):
             self._latest_pc_t = now
 
     def _cb_odom(self, msg: Odometry) -> None:
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
         tw = msg.twist.twist
-        yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
         with self._lock:
-            self._odom_xy = (p.x, p.y)
-            self._odom_yaw = yaw
             self._odom_v = tw.linear.x
             self._odom_w = tw.angular.z
             self._odom_t = time.monotonic()
@@ -205,9 +206,36 @@ class PolicyNode(Node):
             self.runner.reset()
             self._start_t = time.monotonic()
         self.get_logger().info(
-            f"new goal in frame={self._goal_frame_used}: "
-            f"({self._goal_world[0]:.2f}, {self._goal_world[1]:.2f}) — hidden state reset"
+            f"收到新 goal frame={self._goal_frame_used}: "
+            f"({self._goal_world[0]:.2f}, {self._goal_world[1]:.2f}) — RNN hidden state 已重置"
         )
+
+    def _goal_in_body_frame(self) -> tuple[float, float] | None:
+        """用 TF 把 goal (in goal_frame) → base_frame (body local)."""
+        with self._lock:
+            goal_world = self._goal_world
+            goal_frame = self._goal_frame_used or self.goal_frame
+        if goal_world is None:
+            return None
+
+        gp = PoseStamped()
+        gp.header.frame_id = goal_frame
+        gp.header.stamp = RclpyTime().to_msg()  # latest available
+        gp.pose.position.x = goal_world[0]
+        gp.pose.position.y = goal_world[1]
+        gp.pose.orientation.w = 1.0
+        try:
+            transformed = self._tf_buffer.transform(
+                gp, self.base_frame, timeout=Duration(seconds=self.tf_timeout),
+            )
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException,
+                tf2_ros.ConnectivityException, tf2_ros.TransformException) as e:
+            self.get_logger().warn(
+                f"TF {goal_frame} → {self.base_frame} 失敗: {e}",
+                throttle_duration_sec=2.0,
+            )
+            return None
+        return transformed.pose.position.x, transformed.pose.position.y
 
     # ----- main loop -----
 
@@ -217,8 +245,6 @@ class PolicyNode(Node):
             pc = self._latest_pc
             pc_age = now - self._latest_pc_t
             odom_age = now - self._odom_t
-            odom_xy = self._odom_xy
-            odom_yaw = self._odom_yaw
             v = self._odom_v
             w = self._odom_w
             goal_world = self._goal_world
@@ -226,19 +252,20 @@ class PolicyNode(Node):
             elapsed = now - self._start_t
 
         if pc is None or pc_age > self.timeout_lidar_s:
-            return self._publish_stop("lidar timeout")
+            return self._publish_stop("LiDAR timeout")
         if odom_age > self.timeout_odom_s:
-            return self._publish_stop("odom timeout")
+            return self._publish_stop("Odom timeout")
         if goal_world is None:
-            return self._publish_stop("no goal", warn=False)
+            return self._publish_stop("尚未收到 goal", warn=False)
 
-        # goal → body
-        gx, gy = world_goal_to_body(
-            goal_world[0], goal_world[1], odom_xy[0], odom_xy[1], odom_yaw,
-        )
+        # goal → body frame via TF (處理 map→odom→base_link 完整鏈)
+        gb = self._goal_in_body_frame()
+        if gb is None:
+            return self._publish_stop("TF 尚未就緒")
+        gx, gy = gb
         dist = math.hypot(gx, gy)
         if dist < self.goal_tolerance:
-            self._publish_stop("goal reached", warn=False)
+            self._publish_stop("到達 goal", warn=False)
             return
 
         # lidar sweep

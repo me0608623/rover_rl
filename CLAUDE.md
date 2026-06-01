@@ -30,6 +30,71 @@ obs_raw [B, 139] ── normalize + slice → obs79 [B, 79]
 - **5 Hz 控制週期**（dt=0.2s）— 訓練值，**勿改**
 - **動作上限**：v=1.0 m/s, a=0.5 m/s², ω=2.0 rad/s — **不要 extrapolate** 即使底盤更強
 
+## TF tree 與啟動順序（重要）
+
+實車跑起來時完整 TF chain：
+
+```
+world ─(static, 由 ndt_localizer/tf_static)─ map
+                                                │
+map ─(動態, 由 ndt_localizer_node 發布)── odom
+                                                │
+odom ─(由 campusrover_base driver 發布)── base_link
+                                                │
+base_link ─(URDF static)─ base_footprint / velodyne_link / imu_link
+```
+
+各段負責方：
+
+| TF 段 | 發布者 | 啟動方式 |
+|---|---|---|
+| world → map | static_transform_publisher | NDT launch 自帶 |
+| **map → odom** | ndt_localizer_node | `ros2 launch ndt_localizer ndt_localizer_launch.py` |
+| odom → base_link | rover driver | campusrover_base launch |
+| base_link → child | URDF | robot_state_publisher |
+
+**rover_rl policy_node 用 tf2 從 `goal_frame`（預設 map）transform 到 `base_frame`（預設 base_footprint）算 body-frame goal**，不靠手算。所以必須有完整 TF chain 才能跑。
+
+### 啟動順序（用戶手動）
+
+```bash
+# Terminal 1: NDT 定位（rover_rl 不啟，由您獨立啟動）
+cd ~/Documents/ndt_ws && source install/setup.bash
+ros2 launch ndt_localizer ndt_localizer_launch.py
+
+# Terminal 2: 底盤 driver（發布 /odom + odom→base_link TF）
+cd ~/rover2_ws && source install/setup.bash
+ros2 launch campusrover_base <existing_launch>.py
+
+# Terminal 3: VLP-16 driver（發布 /velodyne_points）
+ros2 launch velodyne velodyne-all-nodes-VLP16-launch.py
+
+# Terminal 4: rover_rl + BEV（一個 launch 全包）
+cd ~/rover_rl_ws && source install/setup.bash
+source ~/rover2_ws/install/setup.bash       # ★ 必須 source 才找得到 campusrover_rl_policy
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py
+```
+
+### deploy_with_bev.launch.py 參數
+
+| arg | 預設 | 說明 |
+|---|---|---|
+| `params_file` | 內建 yaml | 覆寫 policy_params.yaml |
+| `model_path` | "" | 覆寫 yaml 的 model_path |
+| `enable_bev` | true | false 則只啟 policy |
+| `bev_show` | image_view | rviz / image_view / window / none |
+| `log_level` | info | debug / info / warn / error |
+
+### 驗證 TF 是否完整
+
+```bash
+# 檢查 map → base_footprint 可不可以查
+ros2 run tf2_ros tf2_echo map base_footprint
+
+# 看不到 → 缺 NDT，或 base_frame 名字錯
+# 看得到但跳動 → NDT 還沒收斂，等 5~10 秒
+```
+
 ## 參考：rover2_ws 既有 stack
 
 實車上已有 ROS 2 stack 在 `/home/aa/rover2_ws/`，部分元件可重用：
