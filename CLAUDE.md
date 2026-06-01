@@ -166,6 +166,65 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 ⚠️ **這三個都是 T-Corridor 課程**。實車場景若不是 T 走廊（例：開放廣場、長廊），policy 可能表現不佳。
 如果實測有問題，跟 PC 端訓練組要求一個 open-scene baseline 重訓。
 
+## BEV 處理（純可視化，不是 policy 輸入）
+
+**rover_rl 推論完全不需要 BEV**。模型輸入是 72-bin 1D LiDAR sweep，不是 2D 影像。
+
+兩條獨立分支：
+```
+/velodyne_points (PointCloud2)
+   │
+   ├─→ rover_rl policy_node ── 72-bin sweep ─→ RL ─→ cmd_vel
+   │
+   └─→ rover2_ws bev_node ── 極座標影像 ─→ /bev_polar_image  (可選，純 debug)
+```
+
+### 是否啟動 BEV
+
+**建議啟動**，作為 debug 工具：
+- 上電前肉眼確認 LiDAR 看得到牆/障礙物
+- 排查 sensor 異常時直接看極座標圖比 raw PointCloud2 直覺
+- **不要把 BEV 程式抄進 rover_rl**，重用 rover2_ws 的版本就好
+
+### 啟動方式（車上 Claude 不需要寫，照抄）
+
+```bash
+# 啟動 rover2_ws 的 bev_node（與 rover_rl 並行）
+cd /home/aa/rover2_ws && source install/setup.bash
+ros2 launch campusrover_rl_policy bev.launch.py use_rviz:=true
+# 或 use_image_view:=true 用 rqt_image_view 看
+```
+
+預期 RViz 看到：
+- 中央機器人（圈）
+- 72-bin 極座標 LiDAR sweep（圓周上的距離值）
+- 障礙物在對應角度顯示為近距離 bin
+
+⚠️ 如果 BEV 沒看到任何障礙物 → policy 也看不到 → 別上電。
+
+## ONNX / TensorRT 轉換（目前不做）
+
+**結論：用 TorchScript 就好，不要花時間轉 ONNX。**
+
+數字證明：
+- Model 大小：1.4 MB
+- Jetson Orin TorchScript 推論延遲：~3-5 ms
+- Policy 控制週期：200 ms (5 Hz)
+- 延遲占用：~2%（剩 195 ms 完全空閒）
+
+ONNX/TensorRT 在這個 model 上**完全沒收益**：
+- 即使 TensorRT FP16 把延遲降到 1 ms，5 Hz policy 也用不到
+- ONNX export 對 vanilla RNN + index_select 需要手動拆，多 debug 時間
+- 跨平台價值零（Jetson 已有 PyTorch）
+
+**什麼時候才考慮 ONNX**：
+1. 模型放大 10x（不會發生，這是 30-hidden RNN）
+2. 整合 ONNX-only inference server（rover2_ws 全部 PyTorch，不需）
+3. 用 CPU-only 邊緣裝置（Orin 有 GPU，跳過）
+
+**重要禁令**：車上 Claude **不要主動** 寫 `export_policy_onnx.py`，
+除非用戶明確要求並說明理由。
+
 ## sim-to-real 已知 gap（按嚴重度排序）
 
 1. **LiDAR 高度 1.6m (訓練) vs 1.43m (實車)** — beam 角度落點不同
