@@ -20,6 +20,7 @@ setup(
         "console_scripts": [
             "policy_node = rover_rl_inference.policy_node:main",
             "lidar_preprocessor = rover_rl_inference.lidar_preprocessor_node:main",
+            "bev_play = rover_rl_inference.bev_play_node:main",
             "ros_smoke_test = rover_rl_inference.ros_smoke_test:main",
             "export_policy = rover_rl_inference.export_policy:main",
         ],

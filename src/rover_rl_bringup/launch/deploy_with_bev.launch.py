@@ -35,7 +35,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PythonExpression
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
@@ -50,7 +50,6 @@ def generate_launch_description():
     model_path = LaunchConfiguration("model_path")
     enable_bev = LaunchConfiguration("enable_bev")
     enable_preprocessor = LaunchConfiguration("enable_preprocessor")
-    bev_show = LaunchConfiguration("bev_show")
     log_level = LaunchConfiguration("log_level")
 
     # ── 0. LiDAR preprocessor node（先處理再給 RL） ────────────────────────
@@ -79,30 +78,24 @@ def generate_launch_description():
         arguments=["--ros-args", "--log-level", log_level],
     )
 
-    # ── 2. BEV node（讀 rover2_ws 的 bev.launch.py） ────────────────────────
-    # 若 rover2_ws 不在 workspace path，可改用直接 Node() 方式
-    try:
-        bev_pkg_share = get_package_share_directory("campusrover_rl_policy")
-        bev_launch_path = os.path.join(bev_pkg_share, "launch", "bev.launch.py")
-        bev_action = IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(bev_launch_path),
-            launch_arguments={
-                "pointcloud_topic": "/velodyne_points",
-                "use_rviz": PythonExpression(["'", bev_show, "' == 'rviz'"]),
-                "use_image_view": PythonExpression(["'", bev_show, "' == 'image_view'"]),
-                "show_window": PythonExpression(["'", bev_show, "' == 'window'"]),
-            }.items(),
-        )
-        bev_group = GroupAction(
-            [bev_action],
-            condition=IfCondition(enable_bev),
-        )
-        bev_unavailable_msg = []
-    except Exception:
-        bev_group = LogInfo(
-            msg="[rover_rl] campusrover_rl_policy 未安裝，BEV 無法啟動（請 source rover2_ws）"
-        )
-        bev_unavailable_msg = []
+    # ── 2. BEV node（rover_rl 自包，移植自訓練端 play_eval/bev_renderer.py） ──
+    bev_play_node = Node(
+        package="rover_rl_inference",
+        executable="bev_play",
+        name="rover_rl_bev_play",
+        output="screen",
+        emulate_tty=True,
+        parameters=[
+            {"frame_mode": "body",
+             "rate_hz": 5.0,
+             "r_max": 20.0,
+             "r_robot": 0.35,
+             "topic_obs_debug": "/rover_rl_policy/obs_debug"},
+        ],
+        arguments=["--ros-args", "--log-level", log_level],
+        condition=IfCondition(enable_bev),
+    )
+    bev_group = GroupAction([bev_play_node])
 
     # ── 3. Banner ─────────────────────────────────────────────────────────
     banner = LogInfo(msg=(
@@ -123,15 +116,15 @@ def generate_launch_description():
             "model_path", default_value="",
             description="覆寫 yaml model_path；空字串=用 yaml 預設",
         ),
-        DeclareLaunchArgument("enable_bev", default_value="true"),
+        DeclareLaunchArgument(
+            "enable_bev", default_value="true",
+            description="啟動 rover_rl 自包的 play-style BEV node "
+                        "（matplotlib 渲染 → /rover_rl/bev_image）",
+        ),
         DeclareLaunchArgument(
             "enable_preprocessor", default_value="true",
             description="是否啟動 rover_rl 自己的 lidar_preprocessor；"
                         "若已有外部 preprocessor 可設 false",
-        ),
-        DeclareLaunchArgument(
-            "bev_show", default_value="image_view",
-            description="rviz / image_view / window / none",
         ),
         DeclareLaunchArgument("log_level", default_value="info"),
         banner,
