@@ -19,7 +19,16 @@ def lidar_sweep_72_real(
     z_filter: float = 0.5,
     num_bins: int = 72,
     yaw_offset: float = 0.0,
+    *,
+    motion_compensation: tuple[float, float, float] | None = None,
 ) -> np.ndarray:
+    """
+    Args:
+        ...
+        motion_compensation: (dx, dy, dyaw) in body frame — 估算 LiDAR 掃描期間
+            機器人位移；補償掃描畸變（spot_rl/spot_obs_process.cpp delay_pose）。
+            約等於 odom.twist × scan_duration。None 不補償。
+    """
     """轉點雲 → 72-bin normalized sweep.
 
     Args:
@@ -44,7 +53,14 @@ def lidar_sweep_72_real(
         if pts.size == 0:
             return np.ones(num_bins, dtype=np.float32)
 
-    x, y = pts[:, 0], pts[:, 1]
+    x, y = pts[:, 0].copy(), pts[:, 1].copy()
+    # Motion compensation：把掃描期間機器人移過的距離扣回（讓點雲對齊 "scan-end pose"）
+    if motion_compensation is not None:
+        dx, dy, dyaw = motion_compensation
+        # 簡單 0th-order：把點雲整體往機器人前進方向移動 -dx, -dy
+        # 不處理 dyaw 因為 atan2 binning 對小角度旋轉容忍度高（< 1 bin = 5°）
+        x = x - dx
+        y = y - dy
     r = np.sqrt(x * x + y * y)
     mask = (r >= r_min) & (r <= r_max)
     if not mask.any():

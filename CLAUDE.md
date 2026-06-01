@@ -30,6 +30,61 @@ obs_raw [B, 139] ── normalize + slice → obs79 [B, 79]
 - **5 Hz 控制週期**（dt=0.2s）— 訓練值，**勿改**
 - **動作上限**：v=1.0 m/s, a=0.5 m/s², ω=2.0 rad/s — **不要 extrapolate** 即使底盤更強
 
+## 多 Mode 設計 + Path 整合（採 spot_rl pattern）
+
+### 支援的 5 種 mode
+
+| Mode | 行為 | cmd_vel 發布 | 推論 |
+|---|---|---|---|
+| `nav` | 正常運作（預設） | yes（policy 輸出） | yes |
+| `idle` | 待命 | yes（強制 0） | no |
+| `estop` | 緊急停車 | yes（強制 0） | no |
+| `manual` | 外部接管（搖桿） | **no**（讓出 topic） | no |
+| `paused` | 暫停推論但保留 hidden | yes（強制 0） | no |
+
+### 切換方式（3 種）
+
+```bash
+# A. ROS topic 訂閱式（最方便）
+ros2 topic pub --once /rover_rl_policy/mode std_msgs/String "data: 'estop'"
+
+# B. ROS service（適合 supervisor 整合）
+ros2 service call /rover_rl_policy/set_mode std_srvs/srv/SetBool "{data: false}"  # → idle
+ros2 service call /rover_rl_policy/set_mode std_srvs/srv/SetBool "{data: true}"   # → nav
+
+# C. launch param
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py initial_mode:=idle
+```
+
+### Hot-swap model (不需重啟 node)
+
+```bash
+ros2 param set /rover_rl_policy model_path /path/to/new_model.ts
+ros2 service call /rover_rl_policy/load_model std_srvs/srv/Trigger
+```
+
+### Path / Subgoal 整合
+
+policy_node 同時訂閱兩個來源：
+
+| Topic | Type | 用途 | 來源 |
+|---|---|---|---|
+| `/goal_pose` | `geometry_msgs/PoseStamped` | 單一目標（RViz Nav2 Goal） | 手動 / Nav2 |
+| `/global_path` | `nav_msgs/Path` | 多 waypoint 路徑 | **campusrover_routing** / AIT* |
+
+**Subgoal 選取邏輯**（rover_rl_inference/subgoal_selector.py）：
+1. 收到 Path 時 `prefer_path=True`（覆蓋 single goal）
+2. 從 path 找離機器人最近的 waypoint
+3. 往前找第一個距離 ≥ `path_lookahead_m`（預設 2m）的 waypoint = carrot
+4. 走到尾還沒達 lookahead → 取最後一點作為 final goal
+
+**campusrover_routing 整合**：routing 是 service-based（`RoutingPath.srv`），需要中間節點：
+```
+routing service ── srv call ──→ pick path[0] ──publish──→ /global_path ──→ rover_rl
+```
+
+如果您要 rover_rl 直接呼叫 routing service，告訴我，我加 service client。
+
 ## TF tree 與啟動順序（重要）
 
 實車跑起來時完整 TF chain：
@@ -85,6 +140,30 @@ cd ~/rover_rl_ws && source install/setup.bash
 source ~/rover2_ws/install/setup.bash       # ★ 必須 source 才找得到 campusrover_rl_policy
 ros2 launch rover_rl_bringup deploy_with_bev.launch.py
 ```
+
+### Timer 結構（採 spot_rl 多 timer pattern）
+
+| Timer | Rate | 工作 |
+|---|---|---|
+| inference_timer | 5 Hz (control_dt=0.2) | RL 推論 → 更新 target cmd |
+| cmd_timer | **20 Hz** (cmd_rate_hz) | low-pass + slew-rate → 發 cmd_vel |
+| marker_timer | 10 Hz (marker_rate_hz) | 發 RViz markers |
+| heartbeat_timer | 0.5 Hz | log 系統狀態 |
+
+**為何分開？**
+- Inference 5 Hz 固定（訓練 dt=0.2s），但 cmd_vel 20 Hz republish 避免底盤/mux watchdog
+- Cmd timer 用 last_target + filter，inference 暫時延遲也不會斷流
+- Marker 10 Hz 對 RViz 視覺夠用，省 CPU
+
+### cmd_vel 過濾管線（採 spot_rl/pid.cpp）
+
+```
+policy raw cmd ──→ first-order low-pass (α=0.3) ──→ slew-rate limit (±1 m/s²) ──→ deadband ──→ cmd_vel
+```
+
+- α=0.3: 70% 舊 + 30% 新，平滑離散動作跳階
+- Slew: |Δcmd| ≤ max_accel × dt，防 policy 從 +0.5 直跳 -0.5
+- Deadband: |cmd| < 0.02 強制歸 0，避免 jitter
 
 ### deploy_with_bev.launch.py 參數
 

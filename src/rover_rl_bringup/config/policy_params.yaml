@@ -8,10 +8,14 @@ rover_rl_policy:
     # --- Topics（CampusRover 實車配置） ---
     topic_lidar: "/velodyne_points"
     topic_odom: "/odom"
-    topic_goal: "/goal_pose"
+    topic_goal_pose: "/goal_pose"
+    topic_global_path: "/global_path"     # campusrover_routing / AIT* 任一都可
     # ★ 改走 lcr_cmd_vel_mux（避免 joy/nav 互相搶；mux 會把 /input/nav_cmd_vel → /output/cmd_vel）
     topic_cmd_vel: "/input/nav_cmd_vel"
+    topic_markers: "~/markers"
+    topic_obs_debug: "~/obs_debug"
     publish_obs_debug: false
+    publish_markers: true
 
     # --- QoS ---
     lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS
@@ -38,16 +42,31 @@ rover_rl_policy:
     act_max_angular_velocity: 2.0
 
     # --- 控制週期 ---
-    control_dt: 0.2                   # 5 Hz；訓練 dt 一致，勿改
+    control_dt: 0.2                   # 5 Hz inference；訓練 dt 一致，勿改
+    cmd_rate_hz: 20.0                 # 20 Hz cmd_vel republish（解 watchdog 風險）
+    marker_rate_hz: 10.0
     deterministic: true               # 首次部署用 argmax；穩定後可試 false 看 stochastic 是否更平順
     timeout_lidar_s: 0.5              # VLP-16 10Hz 雙回掃，0.5s 足夠
     timeout_odom_s: 0.3               # /odom 20Hz，0.3s 偵測掉線
+    lidar_motion_compensation: true   # 補償掃描期間機器人位移 (spot_rl delay_pose)
+
+    # --- cmd_vel filter (low-pass + slew-rate) ---
+    cmd_alpha_linear: 0.3
+    cmd_alpha_angular: 0.5
+    cmd_max_accel_linear: 1.0         # m/s² slew limit
+    cmd_max_accel_angular: 3.0        # rad/s² slew limit
+
+    # --- mode ---
+    # nav (預設) / idle / estop / manual / paused
+    initial_mode: "nav"
+    base_frame: "base_footprint"
 
     # --- Goal / 定位（採 spot_rl + rover2_ws pattern） ---
     # goal_frame: "map" → 需要 NDT 提供 map→odom，localizer 用 cached offset
     #              "odom" → 不需 NDT，純 odom 模式（適合無地圖測試）
     goal_frame: "map"
     goal_tolerance_m: 0.6
+    path_lookahead_m: 2.0           # carrot lookahead (pure-pursuit-like)
     topic_ndt_pose: "/ndt_pose"
     require_ndt: false              # true=NDT 未穩定就拒絕動；false=fallback 純 odom             # 略放寬避免在 goal 附近震盪
 

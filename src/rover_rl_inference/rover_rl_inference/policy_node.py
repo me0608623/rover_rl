@@ -1,17 +1,23 @@
-"""rover_rl_inference policy node (ROS 2 Humble).
+"""rover_rl_inference policy node — full deployment 版.
 
-訂閱：
-    LiDAR (sensor_msgs/PointCloud2)
-    Odometry (nav_msgs/Odometry)
-    Goal pose (geometry_msgs/PoseStamped)
+整合元件：
+  - localization.MapOdomOffsetTracker  : NDT cached offset + fallback
+  - subgoal_selector.SubgoalSelector   : Path/PoseStamped → carrot lookahead
+  - cmd_filter.CmdFilter               : low-pass + slew-rate
+  - mode_manager.ModeManager           : nav / idle / estop / manual / paused
+  - markers                            : RViz MarkerArray debug
+  - lidar_preprocess.lidar_sweep_72_real (+ motion compensation)
 
-發布：
-    cmd_vel (geometry_msgs/Twist)
-    obs_debug (std_msgs/Float32MultiArray, optional)
+Timer 結構：
+  - inference_timer (5 Hz):  RL 推論 → 更新 target cmd
+  - cmd_timer (20 Hz):       low-pass/slew filter → 發 cmd_vel
+  - marker_timer (10 Hz):    發 RViz markers
+  - heartbeat_timer (1 Hz):  log 狀態
 
-控制週期：固定 dt=0.2s (5 Hz)；訊號中斷 > timeout 自動停車。
-
-所有 topic 名 / frame / 參數均可由 ros2 param 覆寫，預設取自 params.yaml。
+Mode 切換：
+  - 訂閱 `~/mode` (std_msgs/String): "nav" / "idle" / "estop" / "manual" / "paused"
+  - 服務 `~/set_mode` (std_srvs/SetBool): true=nav, false=idle
+  - 服務 `~/load_model` (std_srvs/Trigger): 重載 model_path 指向的 .ts
 """
 from __future__ import annotations
 
@@ -23,17 +29,23 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
+from std_srvs.srv import SetBool, Trigger
+from visualization_msgs.msg import MarkerArray
 
 from .action_decoder import ActionParams, decode_logits_to_cmd
+from .cmd_filter import CmdFilter, CmdFilterParams
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
 from .localization import MapOdomOffsetTracker, world_to_body
+from .markers import build_marker_array
+from .mode_manager import Mode, ModeManager
 from .model_runtime import PolicyRunner, load_bundle
 from .obs_builder import ObsParams, build_obs_raw
+from .subgoal_selector import SubgoalSelector
 
 
 def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
@@ -45,68 +57,108 @@ def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
 class PolicyNode(Node):
     def __init__(self):
         super().__init__("rover_rl_policy")
+        self._declare_params()
+        self._read_params()
+        self._load_model()
+        self._init_state()
+        self._init_pubsub()
+        self._init_timers()
+        self._init_services()
 
-        # --- declare params ---
+        self.get_logger().info(
+            f"rover_rl_policy 啟動完成\n"
+            f"  模型: {self._model_path} (raw_obs={self.bundle.raw_obs_dim}, "
+            f"hidden={self.bundle.hidden_dim})\n"
+            f"  模式: {self.mode_mgr.mode.value} (require_ndt={self.require_ndt})\n"
+            f"  時鐘: inference {1/self.control_dt:.1f}Hz, cmd {self.cmd_rate_hz}Hz, "
+            f"marker {self.marker_rate_hz}Hz"
+        )
+
+    # ──────────────────────────── 參數宣告 ────────────────────────────
+
+    def _declare_params(self) -> None:
         self.declare_parameter("model_path", "")
-        self.declare_parameter("device", "cpu")  # "cpu" or "cuda:0"
-        self.declare_parameter("control_dt", 0.2)
+        self.declare_parameter("device", "cpu")
+        # rates
+        self.declare_parameter("control_dt", 0.2)        # inference
+        self.declare_parameter("cmd_rate_hz", 20.0)
+        self.declare_parameter("marker_rate_hz", 10.0)
+        self.declare_parameter("publish_markers", True)
+        # timeouts
         self.declare_parameter("timeout_lidar_s", 0.5)
-        self.declare_parameter("timeout_odom_s", 0.5)
+        self.declare_parameter("timeout_odom_s", 0.3)
+        # policy
         self.declare_parameter("deterministic", True)
-
+        # topics
         self.declare_parameter("topic_lidar", "/velodyne_points")
         self.declare_parameter("topic_odom", "/odom")
-        self.declare_parameter("topic_goal", "/goal_pose")
-        self.declare_parameter("topic_cmd_vel", "/cmd_vel")
+        self.declare_parameter("topic_goal_pose", "/goal_pose")
+        self.declare_parameter("topic_global_path", "/global_path")
+        self.declare_parameter("topic_cmd_vel", "/input/nav_cmd_vel")
+        self.declare_parameter("topic_ndt_pose", "/ndt_pose")
+        self.declare_parameter("topic_markers", "~/markers")
+        self.declare_parameter("topic_obs_debug", "~/obs_debug")
         self.declare_parameter("publish_obs_debug", False)
-
+        # qos
         self.declare_parameter("lidar_qos_best_effort", True)
+        # LiDAR
         self.declare_parameter("lidar_yaw_offset_deg", 0.0)
         self.declare_parameter("lidar_z_filter_m", 0.5)
         self.declare_parameter("lidar_r_min_m", 0.9)
         self.declare_parameter("lidar_r_max_m", 20.0)
-
-        # obs normalizers (match training)
+        self.declare_parameter("lidar_motion_compensation", True)
+        # obs normalizer (與訓練端對齊)
         self.declare_parameter("obs_max_acceleration", 1.0)
         self.declare_parameter("obs_max_linear_velocity", 1.0)
         self.declare_parameter("obs_max_angular_velocity", 1.5)
         self.declare_parameter("robot_radius_m", 0.35)
         self.declare_parameter("episode_horizon_s", 60.0)
-
-        # action params (match training DiscreteDifferentialDriveActionCfg)
+        # action limits (鎖在訓練分布)
         self.declare_parameter("act_max_linear_velocity", 1.0)
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
-
-        # goal handling
-        self.declare_parameter("goal_frame", "map")  # map / odom
-        self.declare_parameter("goal_tolerance_m", 0.5)
-        self.declare_parameter("topic_ndt_pose", "/ndt_pose")
-        self.declare_parameter("require_ndt", False)   # true=必須 NDT 才允許動
-
+        # goal / localization
+        self.declare_parameter("goal_frame", "map")
+        self.declare_parameter("base_frame", "base_footprint")
+        self.declare_parameter("goal_tolerance_m", 0.6)
+        self.declare_parameter("path_lookahead_m", 2.0)
+        self.declare_parameter("require_ndt", False)
         # safety
-        self.declare_parameter("safety_lidar_emergency_stop_m", 0.30)
+        self.declare_parameter("safety_lidar_emergency_stop_m", 0.40)
+        # cmd filter
+        self.declare_parameter("cmd_alpha_linear", 0.3)
+        self.declare_parameter("cmd_alpha_angular", 0.5)
+        self.declare_parameter("cmd_max_accel_linear", 1.0)
+        self.declare_parameter("cmd_max_accel_angular", 3.0)
+        # initial mode
+        self.declare_parameter("initial_mode", "nav")
 
-        # --- read params ---
+    def _read_params(self) -> None:
         gp = self.get_parameter
-        model_path = gp("model_path").get_parameter_value().string_value
-        device = gp("device").get_parameter_value().string_value
+        self._model_path = gp("model_path").get_parameter_value().string_value
+        self._device = gp("device").get_parameter_value().string_value
         self.control_dt = float(gp("control_dt").value)
+        self.cmd_rate_hz = float(gp("cmd_rate_hz").value)
+        self.marker_rate_hz = float(gp("marker_rate_hz").value)
+        self.publish_markers = bool(gp("publish_markers").value)
         self.timeout_lidar_s = float(gp("timeout_lidar_s").value)
         self.timeout_odom_s = float(gp("timeout_odom_s").value)
         self.deterministic = bool(gp("deterministic").value)
-
-        topic_lidar = gp("topic_lidar").get_parameter_value().string_value
-        topic_odom = gp("topic_odom").get_parameter_value().string_value
-        topic_goal = gp("topic_goal").get_parameter_value().string_value
-        topic_cmd_vel = gp("topic_cmd_vel").get_parameter_value().string_value
+        self.topic_lidar = gp("topic_lidar").get_parameter_value().string_value
+        self.topic_odom = gp("topic_odom").get_parameter_value().string_value
+        self.topic_goal = gp("topic_goal_pose").get_parameter_value().string_value
+        self.topic_path = gp("topic_global_path").get_parameter_value().string_value
+        self.topic_cmd = gp("topic_cmd_vel").get_parameter_value().string_value
+        self.topic_ndt = gp("topic_ndt_pose").get_parameter_value().string_value
+        self.topic_markers = gp("topic_markers").get_parameter_value().string_value
+        self.topic_obs_debug = gp("topic_obs_debug").get_parameter_value().string_value
         self.publish_obs_debug = bool(gp("publish_obs_debug").value)
-
+        self.lidar_qos_be = bool(gp("lidar_qos_best_effort").value)
         self.lidar_yaw_offset = math.radians(float(gp("lidar_yaw_offset_deg").value))
         self.lidar_z_filter = float(gp("lidar_z_filter_m").value)
         self.lidar_r_min = float(gp("lidar_r_min_m").value)
         self.lidar_r_max = float(gp("lidar_r_max_m").value)
-
+        self.lidar_motion_comp = bool(gp("lidar_motion_compensation").value)
         self.obs_params = ObsParams(
             max_acceleration=float(gp("obs_max_acceleration").value),
             max_linear_velocity=float(gp("obs_max_linear_velocity").value),
@@ -122,30 +174,35 @@ class PolicyNode(Node):
             dt=self.control_dt,
         )
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
+        self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
-        self.safety_estop_m = float(gp("safety_lidar_emergency_stop_m").value)
+        self.path_lookahead = float(gp("path_lookahead_m").value)
         self.require_ndt = bool(gp("require_ndt").value)
-        topic_ndt_pose = gp("topic_ndt_pose").get_parameter_value().string_value
-
-        # --- 定位（採 spot_rl + rover2_ws pattern：cached map→odom offset） ---
-        self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
-
-        # --- model ---
-        if not model_path or not os.path.isfile(model_path):
-            raise RuntimeError(
-                f"model_path missing or invalid: {model_path!r}. "
-                "Set ros2 param model_path to a torchscript bundle from export_policy.py"
-            )
-        self.bundle = load_bundle(model_path, device=device)
-        self.runner = PolicyRunner(self.bundle)
-        self.get_logger().info(
-            f"loaded policy bundle: {model_path} on {device} "
-            f"(raw_obs={self.bundle.raw_obs_dim}, used_obs={self.bundle.used_obs_dim}, "
-            f"hidden={self.bundle.hidden_dim}, preprocess={self.bundle.preprocess_dim})"
+        self.safety_estop_m = float(gp("safety_lidar_emergency_stop_m").value)
+        self.cmd_filter_params = CmdFilterParams(
+            alpha_linear=float(gp("cmd_alpha_linear").value),
+            alpha_angular=float(gp("cmd_alpha_angular").value),
+            max_accel_linear=float(gp("cmd_max_accel_linear").value),
+            max_accel_angular=float(gp("cmd_max_accel_angular").value),
         )
+        self._initial_mode = gp("initial_mode").get_parameter_value().string_value or "nav"
 
-        # --- state ---
+    # ──────────────────────────── 模型載入 ────────────────────────────
+
+    def _load_model(self) -> None:
+        if not self._model_path or not os.path.isfile(self._model_path):
+            raise RuntimeError(
+                f"model_path 無效: {self._model_path!r}。"
+                "請 export_policy.py 後設定為 .ts 絕對路徑"
+            )
+        self.bundle = load_bundle(self._model_path, device=self._device)
+        self.runner = PolicyRunner(self.bundle)
+
+    # ──────────────────────────── 狀態與元件 ────────────────────────────
+
+    def _init_state(self) -> None:
         self._lock = threading.Lock()
+        # sensor cache
         self._latest_pc: np.ndarray | None = None
         self._latest_pc_t = 0.0
         self._odom_xy = (0.0, 0.0)
@@ -153,40 +210,71 @@ class PolicyNode(Node):
         self._odom_v = 0.0
         self._odom_w = 0.0
         self._odom_t = 0.0
-        self._goal_world: tuple[float, float] | None = None
-        self._goal_frame_used: str | None = None
         self._last_accel = 0.0
         self._start_t = time.monotonic()
+        # 上次 policy 推論的「目標 cmd」（給 cmd timer 取用）
+        self._target_v = 0.0
+        self._target_w = 0.0
+        self._target_set_t = 0.0
+        # 上次 sweep（給 marker 用）
+        self._last_sweep: np.ndarray | None = None
+        # 上次 subgoal（給 marker 用）
+        self._last_subgoal_body: tuple[float, float] | None = None
+        self._last_subgoal_source: str | None = None
+        # 元件
+        self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
+        self.subgoals = SubgoalSelector(lookahead_m=self.path_lookahead)
+        self.cmd_filter = CmdFilter(self.cmd_filter_params)
+        try:
+            initial = Mode.parse(self._initial_mode)
+        except ValueError:
+            self.get_logger().warn(f"未知 initial_mode={self._initial_mode!r}，使用 nav")
+            initial = Mode.NAV
+        self.mode_mgr = ModeManager(initial=initial, on_change=self._on_mode_change)
 
-        # --- pubs/subs ---
+    # ──────────────────────────── ROS 介面 ────────────────────────────
+
+    def _init_pubsub(self) -> None:
         sensor_qos = QoSProfile(
-            reliability=(
-                QoSReliabilityPolicy.BEST_EFFORT
-                if bool(gp("lidar_qos_best_effort").value)
-                else QoSReliabilityPolicy.RELIABLE
-            ),
+            reliability=(QoSReliabilityPolicy.BEST_EFFORT
+                         if self.lidar_qos_be else QoSReliabilityPolicy.RELIABLE),
             durability=QoSDurabilityPolicy.VOLATILE,
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=5,
         )
-        self.create_subscription(PointCloud2, topic_lidar, self._cb_lidar, sensor_qos)
-        self.create_subscription(Odometry, topic_odom, self._cb_odom, 10)
-        self.create_subscription(PoseStamped, topic_goal, self._cb_goal, 10)
-        self.create_subscription(PoseStamped, topic_ndt_pose, self._cb_ndt_pose, 10)
-        self.pub_cmd = self.create_publisher(Twist, topic_cmd_vel, 10)
+        self.create_subscription(PointCloud2, self.topic_lidar, self._cb_lidar, sensor_qos)
+        self.create_subscription(Odometry, self.topic_odom, self._cb_odom, 10)
+        self.create_subscription(PoseStamped, self.topic_goal, self._cb_goal, 10)
+        self.create_subscription(Path, self.topic_path, self._cb_path, 10)
+        self.create_subscription(PoseStamped, self.topic_ndt, self._cb_ndt_pose, 10)
+        self.create_subscription(String, "~/mode", self._cb_mode_topic, 10)
+
+        self.pub_cmd = self.create_publisher(Twist, self.topic_cmd, 10)
+        self.pub_markers = (
+            self.create_publisher(MarkerArray, self.topic_markers, 10)
+            if self.publish_markers else None
+        )
         self.pub_obs = (
-            self.create_publisher(Float32MultiArray, "~/obs_debug", 10)
-            if self.publish_obs_debug
-            else None
+            self.create_publisher(Float32MultiArray, self.topic_obs_debug, 10)
+            if self.publish_obs_debug else None
         )
 
-        self.timer = self.create_timer(self.control_dt, self._tick)
-        self.get_logger().info(
-            f"subs: lidar={topic_lidar}, odom={topic_odom}, goal={topic_goal} | "
-            f"pub: cmd_vel={topic_cmd_vel}"
-        )
+    def _init_timers(self) -> None:
+        self.timer_infer = self.create_timer(self.control_dt, self._tick_inference)
+        self.timer_cmd = self.create_timer(1.0 / max(self.cmd_rate_hz, 1.0), self._tick_cmd)
+        if self.publish_markers:
+            self.timer_marker = self.create_timer(
+                1.0 / max(self.marker_rate_hz, 1.0), self._tick_marker,
+            )
+        self.timer_heartbeat = self.create_timer(2.0, self._tick_heartbeat)
+        self._cmd_last_t = time.monotonic()
 
-    # ----- callbacks -----
+    def _init_services(self) -> None:
+        self.create_service(SetBool, "~/set_mode", self._srv_set_mode)
+        self.create_service(Trigger, "~/load_model", self._srv_load_model)
+        self.create_service(Trigger, "~/reset_hidden", self._srv_reset_hidden)
+
+    # ──────────────────────────── Callbacks ────────────────────────────
 
     def _cb_lidar(self, msg: PointCloud2) -> None:
         pts = pointcloud2_to_xyz(msg)
@@ -207,100 +295,147 @@ class PolicyNode(Node):
             self._odom_w = tw.angular.z
             self._odom_t = time.monotonic()
 
-    def _cb_ndt_pose(self, msg: PoseStamped) -> None:
-        """收到 NDT 時用當下 odom 同步 → offset tracker."""
-        with self._lock:
-            odom_x, odom_y = self._odom_xy
-            speed = self._odom_v
-        self.localizer.on_ndt_pose(
-            msg.pose.position.x, msg.pose.position.y, odom_x, odom_y,
-        )
-        # 嘗試更新 offset（內部會閘門：靜止 + 穩定 + 間隔）
-        self.localizer.try_update_offset(robot_speed_mps=speed)
-
     def _cb_goal(self, msg: PoseStamped) -> None:
+        frame = msg.header.frame_id or self.goal_frame
+        self.subgoals.set_single_goal(msg.pose.position.x, msg.pose.position.y, frame)
+        self.runner.reset()
+        self.cmd_filter.reset()
         with self._lock:
-            self._goal_world = (msg.pose.position.x, msg.pose.position.y)
-            self._goal_frame_used = msg.header.frame_id or self.goal_frame
-            self.runner.reset()
             self._start_t = time.monotonic()
         self.get_logger().info(
-            f"收到新 goal frame={self._goal_frame_used}: "
-            f"({self._goal_world[0]:.2f}, {self._goal_world[1]:.2f}) — RNN hidden state 已重置"
+            f"收到 goal_pose frame={frame} ({msg.pose.position.x:.2f},{msg.pose.position.y:.2f})"
         )
 
-    def _goal_in_body_frame(self) -> tuple[float, float, str] | None:
-        """用 cached offset + odom 算 body-frame goal.
-
-        Returns:
-            (body_x, body_y, source_tag) 或 None（如果條件不足）
-        """
+    def _cb_path(self, msg: Path) -> None:
+        if not msg.poses:
+            self.subgoals.clear_path()
+            return
+        frame = msg.header.frame_id or self.goal_frame
+        pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        self.subgoals.set_path(pts, frame)
+        self.subgoals.prefer_path = True
+        self.runner.reset()
+        self.cmd_filter.reset()
         with self._lock:
-            goal_world = self._goal_world
-            goal_frame = self._goal_frame_used or self.goal_frame
-            odom_x, odom_y = self._odom_xy
-            odom_yaw = self._odom_yaw
-        if goal_world is None:
-            return None
-
-        # 取得機器人在 map frame 的 pose（依優先順序：offset / ndt / odom_only）
-        robot_pose = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
-
-        # 若 goal_frame == odom，把 odom-frame goal 視為基準（不需 offset）
-        # 若 goal_frame == map，goal 是在 map frame，robot_pose 也在 map frame → 對齊
-        # 若 require_ndt 且 NDT 尚未穩定 → 拒絕
-        if self.require_ndt and robot_pose.source == "odom_only":
-            return None
-
-        # 注意：若 goal 在 odom，但 robot_pose 已換到 map → 維度不一致
-        # 此處設計：goal_frame 與 robot_pose source 必須一致
-        if goal_frame == "odom":
-            # 強制用 odom-only pose（不加 offset）
-            robot_x, robot_y, robot_yaw = odom_x, odom_y, odom_yaw
-            source = "odom_only(forced)"
-        else:
-            robot_x = robot_pose.x
-            robot_y = robot_pose.y
-            robot_yaw = robot_pose.yaw
-            source = robot_pose.source
-
-        gx, gy = world_to_body(
-            goal_world[0], goal_world[1], robot_x, robot_y, robot_yaw,
+            self._start_t = time.monotonic()
+        self.get_logger().info(
+            f"收到 path frame={frame} ({len(pts)} waypoints, lookahead={self.path_lookahead}m)"
         )
-        return gx, gy, source
 
-    # ----- main loop -----
+    def _cb_ndt_pose(self, msg: PoseStamped) -> None:
+        with self._lock:
+            ox, oy = self._odom_xy
+            speed = self._odom_v
+        self.localizer.on_ndt_pose(msg.pose.position.x, msg.pose.position.y, ox, oy)
+        self.localizer.try_update_offset(robot_speed_mps=speed)
 
-    def _tick(self) -> None:
+    def _cb_mode_topic(self, msg: String) -> None:
+        try:
+            self.mode_mgr.set(Mode.parse(msg.data), reason="topic ~/mode")
+        except ValueError as e:
+            self.get_logger().warn(f"mode topic 收到無效值: {e}")
+
+    # ──────────────────────────── Services ────────────────────────────
+
+    def _srv_set_mode(self, req: SetBool.Request, res: SetBool.Response):
+        target = Mode.NAV if req.data else Mode.IDLE
+        changed = self.mode_mgr.set(target, reason="service ~/set_mode")
+        res.success = True
+        res.message = f"mode={self.mode_mgr.mode.value} (changed={changed})"
+        return res
+
+    def _srv_load_model(self, req: Trigger.Request, res: Trigger.Response):
+        new_path = self.get_parameter("model_path").get_parameter_value().string_value
+        try:
+            if not new_path or not os.path.isfile(new_path):
+                raise RuntimeError(f"model_path 無效: {new_path!r}")
+            new_bundle = load_bundle(new_path, device=self._device)
+            self.bundle = new_bundle
+            self.runner = PolicyRunner(new_bundle)
+            self.cmd_filter.reset()
+            self._model_path = new_path
+            res.success = True
+            res.message = (f"已重載: {new_path} (raw_obs={new_bundle.raw_obs_dim}, "
+                           f"hidden={new_bundle.hidden_dim})")
+            self.get_logger().info(res.message)
+        except Exception as e:
+            res.success = False
+            res.message = f"重載失敗: {e}"
+            self.get_logger().error(res.message)
+        return res
+
+    def _srv_reset_hidden(self, req: Trigger.Request, res: Trigger.Response):
+        self.runner.reset()
+        self.cmd_filter.reset()
+        with self._lock:
+            self._target_v = 0.0
+            self._target_w = 0.0
+        res.success = True
+        res.message = "RNN hidden state 與 cmd filter 已重置"
+        return res
+
+    def _on_mode_change(self, old: Mode, new: Mode, reason: str) -> None:
+        self.get_logger().info(f"mode: {old.value} → {new.value} (reason: {reason})")
+        if new in (Mode.IDLE, Mode.ESTOP, Mode.PAUSED):
+            with self._lock:
+                self._target_v = 0.0
+                self._target_w = 0.0
+            self.cmd_filter.reset()
+
+    # ──────────────────────────── Timer: 推論 (5 Hz) ────────────────────────────
+
+    def _tick_inference(self) -> None:
+        if not self.mode_mgr.is_active():
+            return
+
         now = time.monotonic()
         with self._lock:
             pc = self._latest_pc
             pc_age = now - self._latest_pc_t
             odom_age = now - self._odom_t
+            odom_x, odom_y = self._odom_xy
+            odom_yaw = self._odom_yaw
             v = self._odom_v
             w = self._odom_w
-            goal_world = self._goal_world
             last_accel = self._last_accel
             elapsed = now - self._start_t
 
         if pc is None or pc_age > self.timeout_lidar_s:
-            return self._publish_stop("LiDAR timeout")
+            return self._set_target_stop("LiDAR timeout")
         if odom_age > self.timeout_odom_s:
-            return self._publish_stop("Odom timeout")
-        if goal_world is None:
-            return self._publish_stop("尚未收到 goal", warn=False)
+            return self._set_target_stop("Odom timeout")
+        if not self.subgoals.has_target():
+            return self._set_target_stop("尚未收到 goal/path", warn=False)
 
-        # goal → body frame（採 spot_rl/rover2_ws pattern：cached offset + odom）
-        gb = self._goal_in_body_frame()
-        if gb is None:
-            return self._publish_stop("定位尚未就緒（require_ndt=true 但 NDT 未穩定）")
-        gx, gy, pose_source = gb
+        # 機器人在 map frame 的位姿
+        robot_pose = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
+        if self.require_ndt and robot_pose.source == "odom_only":
+            return self._set_target_stop("require_ndt=true 但 NDT 未穩定")
+
+        # 取得 sub-goal（lookahead 或 single）
+        choice = self.subgoals.select(robot_pose.x, robot_pose.y)
+        if choice is None:
+            return self._set_target_stop("無法選定 subgoal")
+
+        # 若 subgoal 與 robot 在不同 frame：goal_frame=odom 強制用 odom_only pose
+        if choice.frame == "odom":
+            robot_x, robot_y, robot_yaw_use = odom_x, odom_y, odom_yaw
+        else:
+            robot_x, robot_y, robot_yaw_use = robot_pose.x, robot_pose.y, robot_pose.yaw
+
+        gx, gy = world_to_body(choice.x, choice.y, robot_x, robot_y, robot_yaw_use)
         dist = math.hypot(gx, gy)
-        if dist < self.goal_tolerance:
-            self._publish_stop(f"到達 goal (source={pose_source})", warn=False)
-            return
+        if choice.source != "path_lookahead" and dist < self.goal_tolerance:
+            return self._set_target_stop(
+                f"到達 {choice.source} (dist={dist:.2f})", warn=False,
+            )
 
-        # lidar sweep
+        # LiDAR sweep（含 motion compensation）
+        motion_comp = None
+        if self.lidar_motion_comp:
+            # 估算掃描期間移動：dt 用 pc_age；body frame 速度直接 ×dt
+            dt_scan = max(min(pc_age, 0.15), 0.0)
+            motion_comp = (v * dt_scan, 0.0, w * dt_scan)
         sweep = lidar_sweep_72_real(
             pc,
             r_max=self.lidar_r_max,
@@ -309,56 +444,133 @@ class PolicyNode(Node):
             z_filter=self.lidar_z_filter,
             num_bins=self.obs_params.lidar_num_bins,
             yaw_offset=self.lidar_yaw_offset,
+            motion_compensation=motion_comp,
         )
+        with self._lock:
+            self._last_sweep = sweep
+            self._last_subgoal_body = (gx, gy)
+            self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
 
-        # emergency stop on hard obstacle
+        # 緊急停車（在 normalize 前的 raw m）
         if self._too_close(sweep):
-            return self._publish_stop("emergency stop: obstacle within safety zone")
+            self.mode_mgr.set(Mode.ESTOP, reason="LiDAR < safety_estop")
+            return self._set_target_stop("EMERGENCY: LiDAR 進入安全區")
 
+        # RL 推論
         obs = build_obs_raw(
             self.bundle.raw_obs_dim,
-            last_accel=last_accel,
-            linear_vel=v,
-            angular_vel=w,
-            goal_body_x=gx,
-            goal_body_y=gy,
-            lidar_sweep_72=sweep,
-            elapsed_s=elapsed,
+            last_accel=last_accel, linear_vel=v, angular_vel=w,
+            goal_body_x=gx, goal_body_y=gy,
+            lidar_sweep_72=sweep, elapsed_s=elapsed,
             params=self.obs_params,
         )
-
         logits = self.runner.step(obs)
         cmd_v, cmd_w, accel = decode_logits_to_cmd(
-            logits,
-            current_linear_vel=v,
-            params=self.act_params,
-            deterministic=self.deterministic,
+            logits, current_linear_vel=v,
+            params=self.act_params, deterministic=self.deterministic,
         )
 
         with self._lock:
             self._last_accel = accel
-
-        msg = Twist()
-        msg.linear.x = cmd_v
-        msg.angular.z = cmd_w
-        self.pub_cmd.publish(msg)
+            self._target_v = cmd_v
+            self._target_w = cmd_w
+            self._target_set_t = now
 
         if self.pub_obs is not None:
-            out = Float32MultiArray()
-            out.data = obs.tolist()
-            self.pub_obs.publish(out)
+            m = Float32MultiArray()
+            m.data = obs.tolist()
+            self.pub_obs.publish(m)
+
+    def _set_target_stop(self, reason: str, warn: bool = True) -> None:
+        with self._lock:
+            self._target_v = 0.0
+            self._target_w = 0.0
+        if warn:
+            self.get_logger().warn(reason, throttle_duration_sec=2.0)
 
     def _too_close(self, sweep_norm: np.ndarray) -> bool:
         denom = max(self.lidar_r_max - self.obs_params.robot_radius, 1e-6)
-        # normalized value at safety threshold (m from sensor center)
         thr_norm = (self.safety_estop_m - self.obs_params.robot_radius) / denom
         return bool((sweep_norm < thr_norm).any())
 
-    def _publish_stop(self, reason: str, warn: bool = True) -> None:
-        if warn:
-            self.get_logger().warn(reason, throttle_duration_sec=1.0)
+    # ──────────────────────────── Timer: cmd_vel 發布 (20 Hz) ────────────────────────────
+
+    def _tick_cmd(self) -> None:
+        if not self.mode_mgr.should_publish_cmd():
+            return
+        now = time.monotonic()
+        dt = max(now - self._cmd_last_t, 1e-3)
+        self._cmd_last_t = now
+
+        with self._lock:
+            tgt_v = self._target_v
+            tgt_w = self._target_w
+        if self.mode_mgr.force_zero_cmd():
+            tgt_v = 0.0
+            tgt_w = 0.0
+
+        # Inference 過期保護：若 target 已 > 5 個 cmd_dt 沒更新 → 強制 0
+        if (self.mode_mgr.mode == Mode.NAV
+                and now - self._target_set_t > 5.0 / max(self.cmd_rate_hz, 1.0)):
+            tgt_v, tgt_w = 0.0, 0.0
+
+        out_v, out_w = self.cmd_filter.step(tgt_v, tgt_w, dt)
         msg = Twist()
+        msg.linear.x = out_v
+        msg.angular.z = out_w
         self.pub_cmd.publish(msg)
+
+    # ──────────────────────────── Timer: markers (10 Hz) ────────────────────────────
+
+    def _tick_marker(self) -> None:
+        if self.pub_markers is None:
+            return
+        with self._lock:
+            sweep = self._last_sweep
+            subgoal = self._last_subgoal_body
+            source = self._last_subgoal_source
+            out_v = self.cmd_filter._last_v
+            out_w = self.cmd_filter._last_w
+
+        nearest = None
+        if sweep is not None and sweep.size > 0:
+            idx_min = int(np.argmin(sweep))
+            denom = self.lidar_r_max - self.obs_params.robot_radius
+            dist = float(sweep[idx_min]) * denom + self.obs_params.robot_radius
+            angle = (2.0 * math.pi * idx_min / sweep.size) - math.pi
+            nearest = (angle, dist)
+
+        marr = build_marker_array(
+            frame_id=self.base_frame,
+            stamp=self.get_clock().now().to_msg(),
+            robot_radius=self.obs_params.robot_radius,
+            subgoal_xy=subgoal,
+            subgoal_source=source,
+            cmd_v=out_v, cmd_w=out_w,
+            nearest_lidar_bin=nearest,
+            mode=self.mode_mgr.mode.value,
+        )
+        self.pub_markers.publish(marr)
+
+    # ──────────────────────────── Heartbeat (0.5 Hz) ────────────────────────────
+
+    def _tick_heartbeat(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            pc_age = now - self._latest_pc_t if self._latest_pc is not None else float("inf")
+            odom_age = now - self._odom_t if self._odom_t else float("inf")
+            tgt_v = self._target_v
+            tgt_w = self._target_w
+        ndt_age = self.localizer.ndt_age_s
+        ndt_ok = "yes" if self.localizer.is_ndt_stable() else "no"
+        off = self.localizer.offset
+        off_str = f"({off[0]:+.2f},{off[1]:+.2f})" if off else "—"
+        self.get_logger().info(
+            f"[HB] mode={self.mode_mgr.mode.value} | "
+            f"lidar_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
+            f"ndt={ndt_ok}(age={ndt_age:.1f}s,offset={off_str}) | "
+            f"target v={tgt_v:+.2f} w={tgt_w:+.2f}"
+        )
 
 
 def main(args=None):
