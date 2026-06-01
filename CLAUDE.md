@@ -30,6 +30,91 @@ obs_raw [B, 139] ── normalize + slice → obs79 [B, 79]
 - **5 Hz 控制週期**（dt=0.2s）— 訓練值，**勿改**
 - **動作上限**：v=1.0 m/s, a=0.5 m/s², ω=2.0 rad/s — **不要 extrapolate** 即使底盤更強
 
+## LiDAR 前處理：獨立節點架構（採 spot_rl/spot_obs_process.cpp pattern）
+
+**重要**：rover_rl 把 LiDAR 前處理切成**獨立節點**，與 RL 推論節點解耦。
+這跟 spot_rl 的設計一致（spot_obs_process.cpp 是獨立節點，AI 訂閱處理後的 obs）。
+
+```
+/velodyne_points (raw PointCloud2, 10Hz)
+       │
+       ▼
+┌────────────────────────────────┐
+│ rover_rl_lidar_preprocessor    │
+│  • PointCloud2 → 72-bin sweep  │   (對齊訓練 wd_like_sweep_72)
+│  • r_min=0.9, r_max=20         │
+│  • z_filter=0.5                │
+│  • motion compensation         │
+└────────────────────────────────┘
+       │
+       ├─→ /rover_rl/lidar_sweep_72  (Float32MultiArray[72], 正規化 [0,1])
+       │      ↓
+       │      ▼
+       │   policy_node 訂閱此 topic → RL 推論
+       │
+       └─→ /rover_rl/lidar_scan      (LaserScan, 可選, 給 RViz/costmap)
+```
+
+### 為何要切獨立節點？
+
+1. **可驗證**：`ros2 topic echo /rover_rl/lidar_sweep_72` 直接看處理結果
+2. **獨立除錯**：preprocessor 對不對是一回事，policy 對不對是另一回事
+3. **複用**：其他 policy / 視覺化都可訂閱同一個 sweep
+4. **匹配 spot_rl 架構**：spot 是 `spot_obs_process.cpp` 獨立節點發 `RL_body_obs`，
+   `ai_model_action.py` 訂閱 — 同樣 pattern
+
+### 啟動方式
+
+`deploy_with_bev.launch.py` 預設**會自動啟動 preprocessor**：
+
+```bash
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py
+# 內含：
+#   - lidar_preprocessor （/velodyne_points → /rover_rl/lidar_sweep_72）
+#   - policy_node         （訂閱 /rover_rl/lidar_sweep_72 → /input/nav_cmd_vel）
+#   - bev_node            （rover2_ws 視覺化）
+```
+
+### 切換成「policy_node inline 處理」（不推薦，但保留）
+
+```yaml
+# policy_params.yaml
+use_inline_preprocess: true   # policy_node 自己訂閱 /velodyne_points 並處理
+```
+
+```bash
+ros2 launch ... enable_preprocessor:=false   # 關閉獨立 preprocessor
+```
+
+### 驗證 preprocessor 正常
+
+```bash
+# 1. 看處理後的 sweep 數值（應介於 0~1，0=非常近，1=>=20m 或無回波）
+ros2 topic echo /rover_rl/lidar_sweep_72 --once | head -20
+
+# 2. 用 RViz 看 LaserScan
+ros2 run rviz2 rviz2
+# Add Display → LaserScan → topic = /rover_rl/lidar_scan
+
+# 3. 確認頻率
+ros2 topic hz /rover_rl/lidar_sweep_72   # 預期 ~10 Hz
+```
+
+### 訓練端 vs 部署端對齊
+
+兩邊用**完全相同**的 sweep 公式（避免 sim-to-real obs mismatch）：
+
+| 處理步驟 | 訓練端（obs_functions.py） | 部署端（lidar_preprocess.py） |
+|---|---|---|
+| 輸入 | Isaac Sim ray_hits_w | VLP-16 PointCloud2 |
+| z_filter | `\|z_hit\| > 0.5` 過濾 | 同 |
+| 角度 binning | `atan2(y, x)` → 72 bins | 同 |
+| Min-pool | 同 bin 取最小距離 | 同 |
+| 正規化 | `(d - r_robot) / (r_max - r_robot)` | 同 |
+| r_min | 0.9 (VLP-16 盲區) | 0.9 |
+| r_max | 20.0 | 20.0 |
+| r_robot | 0.35 (body_radius) | 0.35 |
+
 ## 多 Mode 設計 + Path 整合（採 spot_rl pattern）
 
 ### 支援的 5 種 mode

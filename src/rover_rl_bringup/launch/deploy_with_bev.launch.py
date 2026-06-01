@@ -42,12 +42,28 @@ from launch_ros.actions import Node
 def generate_launch_description():
     pkg_share = get_package_share_directory("rover_rl_bringup")
     default_params = os.path.join(pkg_share, "config", "policy_params.yaml")
+    default_pre_params = os.path.join(pkg_share, "config",
+                                       "lidar_preprocessor_params.yaml")
 
     params_file = LaunchConfiguration("params_file")
+    preprocessor_params_file = LaunchConfiguration("preprocessor_params_file")
     model_path = LaunchConfiguration("model_path")
     enable_bev = LaunchConfiguration("enable_bev")
+    enable_preprocessor = LaunchConfiguration("enable_preprocessor")
     bev_show = LaunchConfiguration("bev_show")
     log_level = LaunchConfiguration("log_level")
+
+    # ── 0. LiDAR preprocessor node（先處理再給 RL） ────────────────────────
+    preprocessor_node = Node(
+        package="rover_rl_inference",
+        executable="lidar_preprocessor",
+        name="rover_rl_lidar_preprocessor",
+        output="screen",
+        emulate_tty=True,
+        parameters=[preprocessor_params_file],
+        arguments=["--ros-args", "--log-level", log_level],
+        condition=IfCondition(enable_preprocessor),
+    )
 
     # ── 1. Policy node ────────────────────────────────────────────────────
     policy_node = Node(
@@ -101,16 +117,25 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument(
+            "preprocessor_params_file", default_value=default_pre_params,
+        ),
+        DeclareLaunchArgument(
             "model_path", default_value="",
             description="覆寫 yaml model_path；空字串=用 yaml 預設",
         ),
         DeclareLaunchArgument("enable_bev", default_value="true"),
+        DeclareLaunchArgument(
+            "enable_preprocessor", default_value="true",
+            description="是否啟動 rover_rl 自己的 lidar_preprocessor；"
+                        "若已有外部 preprocessor 可設 false",
+        ),
         DeclareLaunchArgument(
             "bev_show", default_value="image_view",
             description="rviz / image_view / window / none",
         ),
         DeclareLaunchArgument("log_level", default_value="info"),
         banner,
+        preprocessor_node,
         policy_node,
         bev_group,
     ])

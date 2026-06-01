@@ -6,7 +6,11 @@ rover_rl_policy:
     device: "cuda:0"                  # Jetson AGX Orin iGPU；若不穩定可退回 "cpu"
 
     # --- Topics（CampusRover 實車配置） ---
-    topic_lidar: "/velodyne_points"
+    # ★ preprocessor 節點先把 /velodyne_points 處理成 72-bin sweep 後發到此 topic
+    #    policy_node 預設訂閱 preprocessed sweep，不直接吃 raw PointCloud2
+    topic_lidar_sweep: "/rover_rl/lidar_sweep_72"
+    topic_lidar_raw: "/velodyne_points"             # 只在 use_inline_preprocess=true 時用
+    use_inline_preprocess: false                     # false=要先啟 lidar_preprocessor 節點
     topic_odom: "/odom"
     topic_goal_pose: "/goal_pose"
     topic_global_path: "/global_path"     # campusrover_routing / AIT* 任一都可

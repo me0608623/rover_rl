@@ -29,7 +29,7 @@ import time
 import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry, Path
+from nav_msgs.msg import Odometry, Path as NavPath
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
@@ -90,7 +90,11 @@ class PolicyNode(Node):
         # policy
         self.declare_parameter("deterministic", True)
         # topics
-        self.declare_parameter("topic_lidar", "/velodyne_points")
+        # 預設：訂閱「已預處理」的 72-bin sweep（由 lidar_preprocessor_node 發布）
+        # fallback：若沒收到 preprocessed sweep，自動 fallback 訂閱 raw PointCloud2 並自己處理
+        self.declare_parameter("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
+        self.declare_parameter("topic_lidar_raw", "/velodyne_points")
+        self.declare_parameter("use_inline_preprocess", False)
         self.declare_parameter("topic_odom", "/odom")
         self.declare_parameter("topic_goal_pose", "/goal_pose")
         self.declare_parameter("topic_global_path", "/global_path")
@@ -144,7 +148,9 @@ class PolicyNode(Node):
         self.timeout_lidar_s = float(gp("timeout_lidar_s").value)
         self.timeout_odom_s = float(gp("timeout_odom_s").value)
         self.deterministic = bool(gp("deterministic").value)
-        self.topic_lidar = gp("topic_lidar").get_parameter_value().string_value
+        self.topic_lidar_sweep = gp("topic_lidar_sweep").get_parameter_value().string_value
+        self.topic_lidar_raw = gp("topic_lidar_raw").get_parameter_value().string_value
+        self.use_inline_preprocess = bool(gp("use_inline_preprocess").value)
         self.topic_odom = gp("topic_odom").get_parameter_value().string_value
         self.topic_goal = gp("topic_goal_pose").get_parameter_value().string_value
         self.topic_path = gp("topic_global_path").get_parameter_value().string_value
@@ -203,8 +209,11 @@ class PolicyNode(Node):
     def _init_state(self) -> None:
         self._lock = threading.Lock()
         # sensor cache
+        self._latest_sweep: np.ndarray | None = None
+        self._latest_sweep_t = 0.0
         self._latest_pc: np.ndarray | None = None
         self._latest_pc_t = 0.0
+        self._sweep_source: str = "none"   # 'preprocessor_topic' / 'inline'
         self._odom_xy = (0.0, 0.0)
         self._odom_yaw = 0.0
         self._odom_v = 0.0
@@ -242,10 +251,18 @@ class PolicyNode(Node):
             history=QoSHistoryPolicy.KEEP_LAST,
             depth=5,
         )
-        self.create_subscription(PointCloud2, self.topic_lidar, self._cb_lidar, sensor_qos)
+        # 優先：訂閱已預處理的 sweep（來自 lidar_preprocessor_node）
+        self.create_subscription(
+            Float32MultiArray, self.topic_lidar_sweep, self._cb_sweep, 10,
+        )
+        # Fallback：raw PointCloud2（use_inline_preprocess=true 或外部 preprocessor 沒啟動）
+        if self.use_inline_preprocess:
+            self.create_subscription(
+                PointCloud2, self.topic_lidar_raw, self._cb_lidar_raw, sensor_qos,
+            )
         self.create_subscription(Odometry, self.topic_odom, self._cb_odom, 10)
         self.create_subscription(PoseStamped, self.topic_goal, self._cb_goal, 10)
-        self.create_subscription(Path, self.topic_path, self._cb_path, 10)
+        self.create_subscription(NavPath, self.topic_path, self._cb_path, 10)
         self.create_subscription(PoseStamped, self.topic_ndt, self._cb_ndt_pose, 10)
         self.create_subscription(String, "~/mode", self._cb_mode_topic, 10)
 
@@ -276,7 +293,23 @@ class PolicyNode(Node):
 
     # ──────────────────────────── Callbacks ────────────────────────────
 
-    def _cb_lidar(self, msg: PointCloud2) -> None:
+    def _cb_sweep(self, msg: Float32MultiArray) -> None:
+        """收到外部 preprocessor 處理好的 72-bin sweep（首選來源）."""
+        if len(msg.data) != self.obs_params.lidar_num_bins:
+            self.get_logger().warn(
+                f"sweep 維度錯 ({len(msg.data)} != {self.obs_params.lidar_num_bins})，忽略",
+                throttle_duration_sec=5.0,
+            )
+            return
+        now = time.monotonic()
+        sweep = np.asarray(msg.data, dtype=np.float32)
+        with self._lock:
+            self._latest_sweep = sweep
+            self._latest_sweep_t = now
+            self._sweep_source = "preprocessor_topic"
+
+    def _cb_lidar_raw(self, msg: PointCloud2) -> None:
+        """Fallback：raw PointCloud2，自己處理（use_inline_preprocess=true 時啟用）."""
         pts = pointcloud2_to_xyz(msg)
         now = time.monotonic()
         with self._lock:
@@ -390,8 +423,10 @@ class PolicyNode(Node):
 
         now = time.monotonic()
         with self._lock:
+            sweep_pre = self._latest_sweep
+            sweep_age = now - self._latest_sweep_t if sweep_pre is not None else float("inf")
             pc = self._latest_pc
-            pc_age = now - self._latest_pc_t
+            pc_age = now - self._latest_pc_t if pc is not None else float("inf")
             odom_age = now - self._odom_t
             odom_x, odom_y = self._odom_xy
             odom_yaw = self._odom_yaw
@@ -400,8 +435,19 @@ class PolicyNode(Node):
             last_accel = self._last_accel
             elapsed = now - self._start_t
 
-        if pc is None or pc_age > self.timeout_lidar_s:
-            return self._set_target_stop("LiDAR timeout")
+        # 選 sweep 來源：preprocessor topic 首選；沒收到/過期 → fallback inline
+        sweep_from_topic = sweep_pre is not None and sweep_age <= self.timeout_lidar_s
+        if sweep_from_topic:
+            sweep_active = sweep_pre
+            sweep_source_tag = "topic"
+        elif self.use_inline_preprocess and pc is not None and pc_age <= self.timeout_lidar_s:
+            sweep_active = None       # 等下方算
+            sweep_source_tag = "inline_fallback"
+        else:
+            reason = "LiDAR timeout"
+            if not self.use_inline_preprocess:
+                reason += "（且 use_inline_preprocess=false，需啟動 lidar_preprocessor_node）"
+            return self._set_target_stop(reason)
         if odom_age > self.timeout_odom_s:
             return self._set_target_stop("Odom timeout")
         if not self.subgoals.has_target():
@@ -430,24 +476,27 @@ class PolicyNode(Node):
                 f"到達 {choice.source} (dist={dist:.2f})", warn=False,
             )
 
-        # LiDAR sweep（含 motion compensation）
-        motion_comp = None
-        if self.lidar_motion_comp:
-            # 估算掃描期間移動：dt 用 pc_age；body frame 速度直接 ×dt
-            dt_scan = max(min(pc_age, 0.15), 0.0)
-            motion_comp = (v * dt_scan, 0.0, w * dt_scan)
-        sweep = lidar_sweep_72_real(
-            pc,
-            r_max=self.lidar_r_max,
-            r_robot=self.obs_params.robot_radius,
-            r_min=self.lidar_r_min,
-            z_filter=self.lidar_z_filter,
-            num_bins=self.obs_params.lidar_num_bins,
-            yaw_offset=self.lidar_yaw_offset,
-            motion_compensation=motion_comp,
-        )
+        # LiDAR sweep 取得
+        if sweep_active is None:
+            # inline fallback：自己從 PointCloud2 處理
+            motion_comp = None
+            if self.lidar_motion_comp:
+                dt_scan = max(min(pc_age, 0.15), 0.0)
+                motion_comp = (v * dt_scan, 0.0, w * dt_scan)
+            sweep_active = lidar_sweep_72_real(
+                pc,
+                r_max=self.lidar_r_max,
+                r_robot=self.obs_params.robot_radius,
+                r_min=self.lidar_r_min,
+                z_filter=self.lidar_z_filter,
+                num_bins=self.obs_params.lidar_num_bins,
+                yaw_offset=self.lidar_yaw_offset,
+                motion_compensation=motion_comp,
+            )
+        sweep = sweep_active
         with self._lock:
             self._last_sweep = sweep
+            self._sweep_source = sweep_source_tag
             self._last_subgoal_body = (gx, gy)
             self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
 
@@ -557,17 +606,21 @@ class PolicyNode(Node):
     def _tick_heartbeat(self) -> None:
         now = time.monotonic()
         with self._lock:
-            pc_age = now - self._latest_pc_t if self._latest_pc is not None else float("inf")
+            sweep_age = (now - self._latest_sweep_t
+                         if self._latest_sweep is not None else float("inf"))
+            pc_age = (now - self._latest_pc_t
+                      if self._latest_pc is not None else float("inf"))
             odom_age = now - self._odom_t if self._odom_t else float("inf")
             tgt_v = self._target_v
             tgt_w = self._target_w
+            sweep_src = self._sweep_source
         ndt_age = self.localizer.ndt_age_s
         ndt_ok = "yes" if self.localizer.is_ndt_stable() else "no"
         off = self.localizer.offset
         off_str = f"({off[0]:+.2f},{off[1]:+.2f})" if off else "—"
         self.get_logger().info(
-            f"[HB] mode={self.mode_mgr.mode.value} | "
-            f"lidar_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
+            f"[HB] mode={self.mode_mgr.mode.value} sweep_src={sweep_src} | "
+            f"sweep_age={sweep_age:.2f}s pc_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
             f"ndt={ndt_ok}(age={ndt_age:.1f}s,offset={off_str}) | "
             f"target v={tgt_v:+.2f} w={tgt_w:+.2f}"
         )
