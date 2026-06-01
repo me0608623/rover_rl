@@ -1,34 +1,48 @@
-"""bev_play_node — 移植訓練端 play_eval/bev_renderer.py 到 ROS 2.
+"""bev_play_node — 對齊 play_rnn_car.py LiveBEVVisualizer 風格.
 
-訓練側 BEV 風格（matplotlib 黑底科研風）：
-  • 72-bin LiDAR 極座標圖（紅<2m / 橙<5m / 綠>5m / 灰=max_range）
-  • 距離環 2m / 5m / 10m / 15m / 20m
-  • 機器人圓圈 + 航向箭頭（白）
-  • 目標箭頭（黃）
-  • 中文資訊面板（步驟/動作/航向/最近障礙/平均距離）
+訓練端 play 看到的 BEV (scripts/.../play_eval/play_rnn_car.py::LiveBEVVisualizer)：
 
-與訓練端差異：
-  • 移除 RNN aux 7D 預測 panel（部署沒 ground truth）
-  • 移除多 goal 場景（沒 simulator）
-  • 用 Agg backend headless render → 發布為 sensor_msgs/Image
-    可直接在 RViz / rqt_image_view 看，不需 X display
+  ┌─────────────────────────────────────────────┐ ← text_ax (上方資料面板)
+  │ Charge RL BEV — 72-bin LiDAR (Body)         │
+  │ AGENT/ACTION   LIDAR/GOAL    MODE / STATE   │
+  │   Step       │   Nearest    │  Status       │
+  │   Raw idx    │   Mean       │  Pose src     │
+  │   v          │   <2m/2~5    │  Hidden       │
+  │   omega      │   Goal body  │  Sweep src    │
+  │   accel      │   Goal dist  │  Frame yaw    │
+  ├─────────────────────────────────────────────┤
+  │                                             │ ← ax (BEV 視覺層)
+  │     · · · · · · · ·                         │
+  │   · · · 距離環 ·  · · ·                      │
+  │  ·    + 黃箭頭→  · ·                         │
+  │  ·    白機器人      ·                        │
+  │   · · · trail · · ·                          │
+  │     · · · · · · · ·                         │
+  └─────────────────────────────────────────────┘
 
-訂閱：
-  /rover_rl/lidar_sweep_72   Float32MultiArray[72]   ← 已預處理 sweep
-  /rover_rl_policy/obs_debug Float32MultiArray[79]   ← obs (含 goal body frame, optional)
-  /input/nav_cmd_vel         Twist                     ← 動作顯示用 (optional)
-  /odom                      Odometry                   ← yaw 顯示 (optional)
+部署版差異（vs 訓練端）：
+  - 移除 ORCA/RVO2 column → 改 MODE/STATE（rover_rl 模式狀態）
+  - 移除 termination goal（無 ground truth）→ 只顯示 obs 中 subgoal
+  - 移除多 goal 場景（無 simulator）
+  - Trail 改從 /odom 取（不是 simulator ground truth）
+  - Agg backend headless render → sensor_msgs/Image
 
-發布：
-  /rover_rl/bev_image        sensor_msgs/Image (rgb8)
+訂閱:
+  /rover_rl/lidar_sweep_72   Float32MultiArray[72]
+  /rover_rl_policy/obs_debug Float32MultiArray[79]   (optional, 取 goal body)
+  /input/nav_cmd_vel         Twist                     (optional, 動作)
+  /odom                      Odometry                   (optional, yaw + trail)
+  /rover_rl_policy/mode      可選 (status badge)
 
-注意：matplotlib render 比較重，預設 5 Hz 更新。
+發布:
+  /rover_rl/bev_image  sensor_msgs/Image (rgb8, ~5 Hz)
 """
 from __future__ import annotations
 
 import math
 import threading
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -36,12 +50,12 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import Image
-from std_msgs.msg import Float32MultiArray
+from std_msgs.msg import Float32MultiArray, String
 
-# Headless rendering — 不依賴 X display
 import matplotlib
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
 
 
 def _yaw_from_quat(qx, qy, qz, qw):
@@ -53,71 +67,89 @@ class BevPlayNode(Node):
     def __init__(self):
         super().__init__("rover_rl_bev_play")
 
-        # ── 參數 ──
         self.declare_parameter("topic_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("topic_obs_debug", "/rover_rl_policy/obs_debug")
         self.declare_parameter("topic_cmd_vel", "/input/nav_cmd_vel")
         self.declare_parameter("topic_odom", "/odom")
+        self.declare_parameter("topic_mode", "/rover_rl_policy/mode")
         self.declare_parameter("topic_image", "/rover_rl/bev_image")
-        self.declare_parameter("frame_mode", "body")        # 'body' 或 'world'
+        self.declare_parameter("frame_mode", "body")         # 'body' / 'world'
         self.declare_parameter("rate_hz", 5.0)
         self.declare_parameter("r_max", 20.0)
         self.declare_parameter("r_robot", 0.35)
-        self.declare_parameter("figure_dpi", 80)             # 80 = 約 480x480
-        self.declare_parameter("figure_size", 6.0)
+        self.declare_parameter("trail_length", 500)
+        self.declare_parameter("figure_dpi", 90)
+        self.declare_parameter("figure_w", 7.5)
+        self.declare_parameter("figure_h", 7.2)
 
         gp = self.get_parameter
-        topic_sweep = gp("topic_sweep").get_parameter_value().string_value
-        topic_obs = gp("topic_obs_debug").get_parameter_value().string_value
-        topic_cmd = gp("topic_cmd_vel").get_parameter_value().string_value
-        topic_odom = gp("topic_odom").get_parameter_value().string_value
-        topic_image = gp("topic_image").get_parameter_value().string_value
         self.frame_mode = gp("frame_mode").get_parameter_value().string_value
         self.rate_hz = float(gp("rate_hz").value)
         self.r_max = float(gp("r_max").value)
         self.r_robot = float(gp("r_robot").value)
+        self.trail_length = int(gp("trail_length").value)
         self.dpi = int(gp("figure_dpi").value)
-        self.fig_size = float(gp("figure_size").value)
+        self.fig_w = float(gp("figure_w").value)
+        self.fig_h = float(gp("figure_h").value)
 
         # ── 狀態 ──
         self._lock = threading.Lock()
-        self._sweep_norm: np.ndarray | None = None
-        self._sweep_t = 0.0
+        self._sweep: np.ndarray | None = None
         self._obs_79: np.ndarray | None = None
-        self._last_cmd = (0.0, 0.0)
+        self._last_cmd_v = 0.0
+        self._last_cmd_w = 0.0
+        self._odom_xy = (0.0, 0.0)
         self._odom_yaw = 0.0
+        self._mode_str = "unknown"
         self._step = 0
+        self._trail: deque[tuple[float, float]] = deque(maxlen=max(self.trail_length, 1))
+        # sweep / odom 來源狀態
+        self._sweep_t = 0.0
+        self._odom_t = 0.0
 
-        # ── matplotlib figure（單張，重複使用以省 GC） ──
+        # ── matplotlib figure（重用） ──
         plt.rcParams["font.sans-serif"] = [
-            "Noto Sans CJK TC", "WenQuanYi Micro Hei", "DejaVu Sans"
+            "DejaVu Sans", "Noto Sans CJK TC", "WenQuanYi Micro Hei",
         ]
         plt.rcParams["axes.unicode_minus"] = False
-        self.fig, self.ax = plt.subplots(
-            figsize=(self.fig_size, self.fig_size), dpi=self.dpi,
-        )
+        self.fig = plt.figure(figsize=(self.fig_w, self.fig_h),
+                              constrained_layout=True, dpi=self.dpi)
+        gs = self.fig.add_gridspec(nrows=2, ncols=1,
+                                    height_ratios=[1.8, 5.2], hspace=0.03)
+        self.text_ax = self.fig.add_subplot(gs[0])
+        self.ax = self.fig.add_subplot(gs[1])
         self.fig.patch.set_facecolor("#141414")
 
         # ── 訂閱 / 發布 ──
-        self.create_subscription(Float32MultiArray, topic_sweep, self._cb_sweep, 10)
-        self.create_subscription(Float32MultiArray, topic_obs, self._cb_obs, 10)
-        self.create_subscription(Twist, topic_cmd, self._cb_cmd, 10)
-        self.create_subscription(Odometry, topic_odom, self._cb_odom, 10)
-        self.pub_image = self.create_publisher(Image, topic_image, 5)
+        self.create_subscription(Float32MultiArray,
+            gp("topic_sweep").get_parameter_value().string_value, self._cb_sweep, 10)
+        self.create_subscription(Float32MultiArray,
+            gp("topic_obs_debug").get_parameter_value().string_value, self._cb_obs, 10)
+        self.create_subscription(Twist,
+            gp("topic_cmd_vel").get_parameter_value().string_value, self._cb_cmd, 10)
+        self.create_subscription(Odometry,
+            gp("topic_odom").get_parameter_value().string_value, self._cb_odom, 10)
+        self.create_subscription(String,
+            gp("topic_mode").get_parameter_value().string_value, self._cb_mode, 10)
+
+        self.pub_image = self.create_publisher(Image,
+            gp("topic_image").get_parameter_value().string_value, 5)
 
         self.timer = self.create_timer(1.0 / max(self.rate_hz, 1.0), self._tick)
-
         self.get_logger().info(
-            f"rover_rl_bev_play 啟動完成\n"
-            f"  訂閱: {topic_sweep}, {topic_obs}, {topic_cmd}, {topic_odom}\n"
-            f"  發布: {topic_image} ({self.fig_size*self.dpi:.0f}×{self.fig_size*self.dpi:.0f} px @ {self.rate_hz}Hz)\n"
-            f"  座標系: {self.frame_mode}"
+            f"rover_rl_bev_play (LiveBEVVisualizer style)\n"
+            f"  訂閱 sweep={gp('topic_sweep').value}, obs={gp('topic_obs_debug').value}, "
+            f"cmd={gp('topic_cmd_vel').value}, odom={gp('topic_odom').value}, "
+            f"mode={gp('topic_mode').value}\n"
+            f"  發布 image={gp('topic_image').value} "
+            f"({int(self.fig_w*self.dpi)}×{int(self.fig_h*self.dpi)} px @ {self.rate_hz}Hz)"
         )
 
+    # ── callbacks ──
     def _cb_sweep(self, msg: Float32MultiArray) -> None:
         arr = np.asarray(msg.data, dtype=np.float32)
         with self._lock:
-            self._sweep_norm = arr
+            self._sweep = arr
             self._sweep_t = time.monotonic()
 
     def _cb_obs(self, msg: Float32MultiArray) -> None:
@@ -127,73 +159,93 @@ class BevPlayNode(Node):
 
     def _cb_cmd(self, msg: Twist) -> None:
         with self._lock:
-            self._last_cmd = (float(msg.linear.x), float(msg.angular.z))
+            self._last_cmd_v = float(msg.linear.x)
+            self._last_cmd_w = float(msg.angular.z)
 
     def _cb_odom(self, msg: Odometry) -> None:
+        p = msg.pose.pose.position
         q = msg.pose.pose.orientation
         with self._lock:
+            self._odom_xy = (p.x, p.y)
             self._odom_yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
+            self._odom_t = time.monotonic()
+            # trail
+            if self._trail:
+                last = self._trail[-1]
+                d2 = (p.x - last[0]) ** 2 + (p.y - last[1]) ** 2
+                if d2 > 4.0:   # 跳躍 > 2m 視為 reset → 清空
+                    self._trail.clear()
+            self._trail.append((p.x, p.y))
 
+    def _cb_mode(self, msg: String) -> None:
+        with self._lock:
+            self._mode_str = msg.data or "unknown"
+
+    # ── main tick ──
     def _tick(self) -> None:
         with self._lock:
-            sweep = self._sweep_norm
+            sweep = self._sweep
             obs = self._obs_79
-            cmd = self._last_cmd
+            cmd_v = self._last_cmd_v
+            cmd_w = self._last_cmd_w
             yaw = self._odom_yaw
+            xy = self._odom_xy
+            trail = list(self._trail)
+            mode = self._mode_str
             self._step += 1
             step = self._step
+            sweep_age = time.monotonic() - self._sweep_t if self._sweep_t else float("inf")
+            odom_age = time.monotonic() - self._odom_t if self._odom_t else float("inf")
         if sweep is None:
             return
-        self._render(sweep, obs, cmd, yaw, step)
+
+        self._draw_bev(sweep, obs, yaw, xy, trail)
+        self._draw_top_panel(step, cmd_v, cmd_w, sweep, obs, mode,
+                              yaw, sweep_age, odom_age)
         msg = self._fig_to_image_msg()
         self.pub_image.publish(msg)
 
-    def _render(self, sweep_norm, obs_79, cmd, yaw, step):
+    # ── BEV plot ──
+    def _draw_bev(self, sweep_norm, obs_79, yaw, robot_xy, trail):
         ax = self.ax
         ax.cla()
         ax.set_facecolor("#141414")
         ax.set_aspect("equal", adjustable="box")
         ax.set_xlim(-self.r_max, self.r_max)
         ax.set_ylim(-self.r_max, self.r_max)
-        frame_label = "車體座標（前方為上）" if self.frame_mode == "body" else "世界座標"
-        ax.set_xlabel("X (m)", color="white")
-        ax.set_ylabel("Y (m)", color="white")
+        if self.frame_mode == "world":
+            xlabel, ylabel = "World X rel. robot (m)", "World Y rel. robot (m)"
+        else:
+            xlabel, ylabel = "Left-Right y (m)", "Forward x (m)"
+        ax.set_xlabel(xlabel, color="white")
+        ax.set_ylabel(ylabel, color="white")
         ax.tick_params(colors="white")
         ax.grid(True, color="#383838", linewidth=0.7)
-        ax.set_title(f"Charge BEV — 72-bin LiDAR ({frame_label})",
-                     color="white", fontsize=11)
 
         # 距離環
         for r_m in [2, 5, 10, 15, 20]:
             ax.add_patch(plt.Circle((0, 0), r_m, fill=False,
                                      color="#4a4a4a", linewidth=0.8))
-            ax.text(0.2, r_m, f"{r_m}m", color="#888888", fontsize=8)
 
-        # sweep 反正規化回 metric distance
-        # sweep_norm = (d - r_robot) / (r_max - r_robot)
-        # → d = sweep_norm * (r_max - r_robot) + r_robot
+        # sweep → metric
         denom = self.r_max - self.r_robot
         real_dist = sweep_norm * denom + self.r_robot
-
-        # 角度：訓練端 atan2(y, x) + π → bin_idx；bin 中心 = -π + (i + 0.5) × (2π/72)
         n_bins = sweep_norm.shape[0]
-        angles = -math.pi + (np.arange(n_bins) + 0.5) * (2 * math.pi / n_bins)
-
-        # body frame: x_fwd = d·cos(θ), y_left = d·sin(θ)；圖上 x=y_left, y=x_fwd
-        x_fwd = real_dist * np.cos(angles)
+        # 訓練端用 angles_deg = -180 + i*5 (沒加 0.5 offset)，這裡完全跟著
+        angles = np.radians(-180.0 + np.arange(n_bins) * (360.0 / n_bins))
+        x_forward = real_dist * np.cos(angles)
         y_left = real_dist * np.sin(angles)
         if self.frame_mode == "world":
             cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-            plot_x = cos_y * x_fwd - sin_y * y_left
-            plot_y = sin_y * x_fwd + cos_y * y_left
+            plot_x = cos_y * x_forward - sin_y * y_left
+            plot_y = sin_y * x_forward + cos_y * y_left
         else:
             plot_x = y_left
-            plot_y = x_fwd
+            plot_y = x_forward
 
-        # 連線
+        # 折線
         ax.plot(plot_x, plot_y, color="#7fbf7f", linewidth=1.2, alpha=0.8)
-
-        # 點顏色
+        # 點：綠/橙/紅/灰
         colors = np.full(real_dist.shape, "#50dc50", dtype=object)
         colors[real_dist < 5.0] = "#ffa500"
         colors[real_dist < 2.0] = "#ff3030"
@@ -203,71 +255,172 @@ class BevPlayNode(Node):
         sizes[real_dist < 2.0] = 54.0
         ax.scatter(plot_x, plot_y, c=colors.tolist(), s=sizes, zorder=3)
 
-        # 機器人（白圈 + 航向箭頭）
+        # 機器人：白圓 + 箭頭 + 中心點
         ax.add_patch(plt.Circle((0, 0), 0.3, fill=False, color="white",
                                  linewidth=2.0, zorder=4))
         if self.frame_mode == "world":
-            hx = 1.2 * math.cos(yaw)
-            hy = 1.2 * math.sin(yaw)
+            head_x, head_y = 1.2 * math.cos(yaw), 1.2 * math.sin(yaw)
         else:
-            hx, hy = 0.0, 1.2
-        ax.arrow(0, 0, hx, hy, color="white", width=0.04, head_width=0.35,
-                 length_includes_head=True, zorder=5)
+            head_x, head_y = 0.0, 1.2
+        ax.arrow(0, 0, head_x, head_y, color="white", width=0.04,
+                 head_width=0.35, length_includes_head=True, zorder=5)
+        ax.scatter([0], [0], c="white", s=28, marker="o",
+                   edgecolors="black", linewidths=0.6, zorder=7)
 
-        # 目標箭頭（從 obs[4:6] 取 body-frame goal）
+        # 軌跡（漸變色，橙→青）
+        if len(trail) >= 2:
+            arr = np.array(trail)
+            rel = arr - np.array(robot_xy)[None, :]
+            if self.frame_mode == "world":
+                tx, ty = rel[:, 0], rel[:, 1]
+            else:
+                cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+                xf = cos_y * rel[:, 0] + sin_y * rel[:, 1]
+                yl = -sin_y * rel[:, 0] + cos_y * rel[:, 1]
+                tx, ty = yl, xf
+            n = len(tx)
+            segs = np.column_stack([tx[:-1], ty[:-1],
+                                     tx[1:], ty[1:]]).reshape(-1, 2, 2)
+            alphas = np.linspace(0.15, 0.9, n - 1)
+            t = np.linspace(0, 1, n - 1)
+            cc = np.zeros((n - 1, 4))
+            cc[:, 0] = 0.6 * (1 - t) + 0.3 * t
+            cc[:, 1] = 0.3 * (1 - t) + 0.9 * t
+            cc[:, 2] = 0.1 * (1 - t) + 1.0 * t
+            cc[:, 3] = alphas
+            ax.add_collection(LineCollection(segs, colors=cc,
+                                              linewidths=1.5, zorder=2))
+
+        # subgoal（從 obs[4:6] 取，body frame）
         if obs_79 is not None and obs_79.shape[0] >= 6:
-            gx_body = float(obs_79[4])
-            gy_body = float(obs_79[5])
-            # clip 進視窗
-            gx_body_c = float(np.clip(gx_body, -self.r_max, self.r_max))
-            gy_body_c = float(np.clip(gy_body, -self.r_max, self.r_max))
+            gx, gy = float(obs_79[4]), float(obs_79[5])
+            gx_c = float(np.clip(gx, -self.r_max, self.r_max))
+            gy_c = float(np.clip(gy, -self.r_max, self.r_max))
             if self.frame_mode == "world":
                 cos_y, sin_y = math.cos(yaw), math.sin(yaw)
-                goal_x = cos_y * gx_body_c - sin_y * gy_body_c
-                goal_y = sin_y * gx_body_c + cos_y * gy_body_c
+                goal_x = cos_y * gx_c - sin_y * gy_c
+                goal_y = sin_y * gx_c + cos_y * gy_c
             else:
-                goal_x = gy_body_c
-                goal_y = gx_body_c
+                goal_x, goal_y = gy_c, gx_c
             ax.arrow(0, 0, goal_x, goal_y, color="#ffd040", width=0.035,
                      head_width=0.45, length_includes_head=True, zorder=4)
             ax.scatter([goal_x], [goal_y], c=["#ffd040"], s=80, zorder=5)
-        else:
-            gx_body = float("nan")
-            gy_body = float("nan")
 
-        # 資訊面板
-        near_idx = int(real_dist.argmin())
-        near_d = float(real_dist[near_idx])
-        near_angle = -180.0 + (near_idx + 0.5) * (360.0 / n_bins)
-        text_lines = [
-            f"步驟={step}  動作 v={cmd[0]:+.2f}m/s ω={cmd[1]:+.2f}rad/s",
-            f"座標系={frame_label}  航向={math.degrees(yaw):+.1f}°",
-            f"最近障礙: {near_d:.2f}m @ bin{near_idx} ({near_angle:+.0f}°)",
-            f"平均距離={float(real_dist.mean()):.2f}m  <2m={int((real_dist < 2.0).sum())}/{n_bins}",
+    # ── 上方資料面板（三欄 grid，對齊 LiveBEVVisualizer._draw_top_panel） ──
+    def _draw_top_panel(self, step, cmd_v, cmd_w, sweep, obs_79, mode,
+                         yaw, sweep_age, odom_age):
+        ax = self.text_ax
+        ax.cla()
+        ax.set_facecolor("#101214")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis("off")
+        ax.axhline(0.02, color="#3c3f44", linewidth=1.0)
+        for x in (0.33, 0.66):
+            ax.axvline(x, ymin=0.08, ymax=0.82, color="#272b30", linewidth=0.8)
+
+        # Status badge（右上）
+        if mode == "nav":
+            badge_color, badge_text = "#1f8f3a", " [ RL Control: nav ] "
+        elif mode == "estop":
+            badge_color, badge_text = "#b3261e", " [ EMERGENCY STOP ] "
+        elif mode == "manual":
+            badge_color, badge_text = "#ce8a17", " [ Manual override ] "
+        elif mode == "paused":
+            badge_color, badge_text = "#5b6175", " [ Paused ] "
+        elif mode == "idle":
+            badge_color, badge_text = "#3b4250", " [ Idle ] "
+        else:
+            badge_color, badge_text = "#3b4250", f" [ {mode} ] "
+        ax.text(0.985, 0.91, badge_text, transform=ax.transAxes,
+                ha="right", va="center", color="white", fontsize=10.5,
+                fontweight="bold",
+                bbox={"facecolor": badge_color, "edgecolor": "none",
+                      "alpha": 0.88, "boxstyle": "round,pad=0.45"})
+
+        # 標題
+        title_suffix = "World" if self.frame_mode == "world" else "Body (fwd=up)"
+        ax.text(0.02, 0.91,
+                f"rover_rl BEV — 72-bin LiDAR ({title_suffix})",
+                transform=ax.transAxes, color="white", fontsize=10.3,
+                fontweight="bold", ha="left", va="center")
+
+        x_left, x_mid, x_right = 0.02, 0.36, 0.69
+        y_header = 0.78
+        y_rows = [0.64, 0.53, 0.42, 0.31, 0.20, 0.09]
+        mono = "DejaVu Sans Mono"
+
+        # ── Column 1: AGENT / ACTION ──
+        ax.text(x_left, y_header, "AGENT / ACTION", transform=ax.transAxes,
+                color="#fff4a8", fontsize=9.2, fontweight="bold",
+                ha="left", va="center")
+        left_lines = [
+            f"Step   : {step}",
+            f"v cmd  : {cmd_v:+.3f} m/s",
+            f"w cmd  : {cmd_w:+.3f} rad/s",
+            f"w deg  : {math.degrees(cmd_w):+.1f}°/s",
+            f"sweep  : {'OK' if sweep_age < 0.5 else f'STALE {sweep_age:.1f}s'}",
+            f"odom   : {'OK' if odom_age < 0.3 else f'STALE {odom_age:.1f}s'}",
         ]
-        if not math.isnan(gx_body):
-            d_goal = math.hypot(gx_body, gy_body)
-            text_lines.append(f"目標(body)=({gx_body:+.2f},{gy_body:+.2f}) dist={d_goal:.2f}m")
-        text_lines.append("白=機器人  黃=目標  紅=近距危險  灰=無回波")
-        ax.text(
-            0.02, 0.98, "\n".join(text_lines),
-            transform=ax.transAxes, va="top", ha="left", color="white", fontsize=9,
-            bbox={"facecolor": "#202020", "edgecolor": "#606060", "alpha": 0.85},
-        )
+        for y, line in zip(y_rows, left_lines):
+            ax.text(x_left, y, line, transform=ax.transAxes,
+                    color="#ffe9a8", fontsize=7.6, fontfamily=mono,
+                    ha="left", va="center")
+
+        # ── Column 2: LIDAR / GOAL ──
+        ax.text(x_mid, y_header, "LIDAR / GOAL", transform=ax.transAxes,
+                color="#c9f7c9", fontsize=9.2, fontweight="bold",
+                ha="left", va="center")
+        denom = self.r_max - self.r_robot
+        real = sweep * denom + self.r_robot
+        n = real.shape[0]
+        near_idx = int(real.argmin())
+        near_d = float(real[near_idx])
+        near_ang = -180.0 + near_idx * (360.0 / n)
+        lt2 = int((real < 2.0).sum())
+        mid = int(((real >= 2.0) & (real < 5.0)).sum())
+        gx = gy = float("nan")
+        d_goal = float("nan")
+        if obs_79 is not None and obs_79.shape[0] >= 6:
+            gx, gy = float(obs_79[4]), float(obs_79[5])
+            d_goal = math.hypot(gx, gy)
+        mid_lines = [
+            f"Nearest: {near_d:.2f}m @ bin{near_idx}",
+            f"  angle: {near_ang:+.0f}°",
+            f"Mean   : {float(real.mean()):.2f}m",
+            f"<2m/2~5: {lt2}/{n}  {mid}/{n}",
+            f"Goal xy: ({gx:+.2f},{gy:+.2f})" if not math.isnan(gx) else "Goal xy: N/A",
+            f"Goal d : {d_goal:.2f}m" if not math.isnan(d_goal) else "Goal d : N/A",
+        ]
+        for y, line in zip(y_rows, mid_lines):
+            ax.text(x_mid, y, line, transform=ax.transAxes,
+                    color="#d8f7d8", fontsize=7.4, fontfamily=mono,
+                    ha="left", va="center")
+
+        # ── Column 3: MODE / STATE ──（部署版替換 ORCA/RVO2）
+        ax.text(x_right, y_header, "MODE / STATE", transform=ax.transAxes,
+                color="#88ccff", fontsize=9.2, fontweight="bold",
+                ha="left", va="center")
+        right_lines = [
+            f"Mode   : {mode}",
+            f"Frame  : {self.frame_mode}",
+            f"Yaw    : {math.degrees(yaw):+.1f}°",
+            f"Trail  : {len(self._trail)} pts",
+            f"sweep age: {sweep_age:.2f}s",
+            f"odom age : {odom_age:.2f}s",
+        ]
+        for y, line in zip(y_rows, right_lines):
+            ax.text(x_right, y, line, transform=ax.transAxes,
+                    color="#d8e6ff", fontsize=7.6, fontfamily=mono,
+                    ha="left", va="center")
 
     def _fig_to_image_msg(self) -> Image:
-        """matplotlib canvas → sensor_msgs/Image (rgb8)，不需 cv_bridge."""
         self.fig.canvas.draw()
         width, height = self.fig.canvas.get_width_height()
         try:
-            # matplotlib 3.x
             buf = np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8)
+            rgb = buf.reshape(height, width, 3)
         except AttributeError:
-            # 新版 matplotlib 改 API
             buf = np.frombuffer(self.fig.canvas.buffer_rgba(), dtype=np.uint8)
-            buf = buf.reshape(height, width, 4)[:, :, :3].copy().reshape(-1)
-        rgb = buf.reshape(height, width, 3)
-
+            rgb = buf.reshape(height, width, 4)[:, :, :3].copy()
         msg = Image()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = "rover_rl_bev"
