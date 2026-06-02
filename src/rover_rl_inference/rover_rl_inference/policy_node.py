@@ -356,10 +356,18 @@ class PolicyNode(Node):
         )
 
     def _cb_ndt_pose(self, msg: PoseStamped) -> None:
+        ndt_yaw = _yaw_from_quat(
+            msg.pose.orientation.x, msg.pose.orientation.y,
+            msg.pose.orientation.z, msg.pose.orientation.w,
+        )
         with self._lock:
             ox, oy = self._odom_xy
+            oyaw = self._odom_yaw
             speed = self._odom_v
-        self.localizer.on_ndt_pose(msg.pose.position.x, msg.pose.position.y, ox, oy)
+        self.localizer.on_ndt_pose(
+            msg.pose.position.x, msg.pose.position.y, ndt_yaw,
+            ox, oy, oyaw,
+        )
         self.localizer.try_update_offset(robot_speed_mps=speed)
 
     def _cb_mode_topic(self, msg: String) -> None:
@@ -614,10 +622,13 @@ class PolicyNode(Node):
             tgt_v = self._target_v
             tgt_w = self._target_w
             sweep_src = self._sweep_source
+        import math as _math
         ndt_age = self.localizer.ndt_age_s
         ndt_ok = "yes" if self.localizer.is_ndt_stable() else "no"
         off = self.localizer.offset
-        off_str = f"({off[0]:+.2f},{off[1]:+.2f})" if off else "—"
+        yoff = self.localizer.yaw_offset
+        off_str = (f"({off[0]:+.2f},{off[1]:+.2f},{_math.degrees(yoff):+.1f}°)"
+                   if off and yoff is not None else "—")
         self.get_logger().info(
             f"[HB] mode={self.mode_mgr.mode.value} sweep_src={sweep_src} | "
             f"sweep_age={sweep_age:.2f}s pc_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
