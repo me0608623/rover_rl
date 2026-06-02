@@ -673,16 +673,27 @@ class PolicyNode(Node):
             sweep_src = self._sweep_source
         import math as _math
         ndt_age = self.localizer.ndt_age_s
-        ndt_ok = "yes" if self.localizer.is_ndt_stable() else "no"
+        ndt_ok = self.localizer.is_ndt_stable()
         off = self.localizer.offset
         yoff = self.localizer.yaw_offset
+
+        def _h(age, limit):   # 健康標記：新鮮=✓，逾時=⚠
+            return "✓" if age < limit else "⚠"
+
+        # 資料健康度（lidar/odom/ndt）；inline 模式才額外顯示 raw pc
+        health = [
+            f"lidar {_h(sweep_age, 0.5)}{sweep_age:.2f}s",
+            f"odom {_h(odom_age, 0.5)}{odom_age:.2f}s",
+            f"ndt {'✓' if ndt_ok else '⚠'}{ndt_age:.1f}s",
+        ]
+        if sweep_src != "preprocessor_topic":
+            health.insert(1, f"pc {_h(pc_age, 0.5)}{pc_age:.2f}s")
         off_str = (f"({off[0]:+.2f},{off[1]:+.2f},{_math.degrees(yoff):+.1f}°)"
                    if off and yoff is not None else "—")
         self.get_logger().info(
-            f"[HB] mode={self.mode_mgr.mode.value} sweep_src={sweep_src} | "
-            f"sweep_age={sweep_age:.2f}s pc_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
-            f"ndt={ndt_ok}(age={ndt_age:.1f}s,offset={off_str}) | "
-            f"rate={self.speed_rate:.2f} target v={tgt_v:+.2f} w={tgt_w:+.2f}"
+            f"[HB] {self.mode_mgr.mode.value:<6} cmd v={tgt_v:+.2f} w={tgt_w:+.2f} "
+            f"(rate {self.speed_rate:.2f}) │ " + "  ".join(health) +
+            f" │ map→odom {off_str}"
         )
 
 
@@ -694,8 +705,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.get_logger().info("⏹ policy_node 已停止（cmd_vel 已歸 0，安全關閉）")
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

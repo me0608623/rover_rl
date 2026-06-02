@@ -18,6 +18,8 @@ cmd_vel 連續記錄成 CSV（+可選 wandb），供事後分析「角速度晃�
       policy_goal_ang_deg : policy obs 內的 goal body 角度（policy 實際在追的方向）
       → 兩者應一致；不一致 = 定位/TF/座標問題
   - wandb 可選；實車網路不穩建議 wandb_mode=offline，回頭 `wandb sync`
+  - 開錄時抓 policy_node 全部參數（speed_rate / cmd_alpha_* 等）→ 寫
+    `<csv>_params.json` sidecar + wandb run config（論文重現性 + 關聯晃動診斷）
 
 訂閱：
   /odom /ndt_pose /goal_pose /global_path /input/nav_cmd_vel
@@ -28,6 +30,7 @@ cmd_vel 連續記錄成 CSV（+可選 wandb），供事後分析「角速度晃�
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 import re
@@ -37,9 +40,26 @@ from datetime import datetime
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path as NavPath
+from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from std_msgs.msg import Float32MultiArray, String
+
+
+def _pv_to_py(pv):
+    """rcl_interfaces ParameterValue → python（避免版本差異，手動轉）."""
+    t = pv.type
+    return {
+        1: lambda: pv.bool_value,
+        2: lambda: pv.integer_value,
+        3: lambda: pv.double_value,
+        4: lambda: pv.string_value,
+        5: lambda: list(pv.byte_array_value),
+        6: lambda: list(pv.bool_array_value),
+        7: lambda: list(pv.integer_array_value),
+        8: lambda: list(pv.double_array_value),
+        9: lambda: list(pv.string_array_value),
+    }.get(t, lambda: None)()
 
 CSV_FIELDS = [
     "t_wall", "t_rel",
@@ -104,10 +124,12 @@ class DiagLoggerNode(Node):
         self.declare_parameter("topic_obs_debug", "/rover_rl_policy/obs_debug")
         self.declare_parameter("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("topic_record_ctrl", "/rover_rl/record")
+        # 開錄時抓此節點的全部參數（speed_rate 等）寫進 sidecar + wandb config
+        self.declare_parameter("policy_node_name", "rover_rl_policy")
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("robot_radius_m", 0.35)
-        # 待命：true=需 start 才錄（每次=乾淨新實驗）；false=啟動即待錄
-        self.declare_parameter("require_start", True)
+        # false(預設)=啟動即待錄，發 goal 即開始；true=需送 record start 才開錄
+        self.declare_parameter("require_start", False)
         # 只在有 goal 時寫列（省空間）；false=start 後一直寫
         self.declare_parameter("log_only_with_goal", True)
         self.declare_parameter("enable_wandb", False)
@@ -128,6 +150,7 @@ class DiagLoggerNode(Node):
         self.topic_obs = sv("topic_obs_debug")
         self.topic_sweep = sv("topic_lidar_sweep")
         self.topic_ctrl = sv("topic_record_ctrl")
+        self.policy_node_name = sv("policy_node_name")
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
         self.require_start = bool(gp("require_start").value)
@@ -152,6 +175,14 @@ class DiagLoggerNode(Node):
         self._writer = None
         self.csv_path = None
         self.wandb_run = None
+        # policy 參數擷取（用底層 rcl_interfaces service client）
+        self._cli_list = self.create_client(
+            ListParameters, f"/{self.policy_node_name}/list_parameters")
+        self._cli_get = self.create_client(
+            GetParameters, f"/{self.policy_node_name}/get_parameters")
+        self._params_timer = None
+        self._params_attempts = 0
+        self._policy_params = {}
         self._reset_run_stats()
 
     def _reset_run_stats(self) -> None:
@@ -199,6 +230,80 @@ class DiagLoggerNode(Node):
         self.get_logger().info(
             f"▶ 開始實驗 '{name}' → {self.csv_path}"
             + ("（指定 goal 後開始寫資料）" if self.log_only_with_goal else "")
+        )
+        self._schedule_param_capture()
+
+    # ── 擷取 policy_node 參數（speed_rate 等）→ sidecar json + wandb config ──
+    def _schedule_param_capture(self) -> None:
+        if self._params_timer is not None:
+            self._params_timer.cancel()
+        self._params_attempts = 0
+        self._policy_params = {}
+        self._params_csv_path = self.csv_path     # 綁定本次實驗
+        self._params_timer = self.create_timer(1.0, self._try_capture_params)
+
+    def _try_capture_params(self) -> None:
+        self._params_attempts += 1
+        if self._params_attempts > 15:
+            self.get_logger().warn(
+                f"擷取 {self.policy_node_name} 參數逾時（節點未起？）— CSV 仍正常記錄"
+            )
+            self._params_timer.cancel()
+            return
+        if not (self._cli_list.service_is_ready() and self._cli_get.service_is_ready()):
+            return                                # 下個 tick 再試
+        self._params_timer.cancel()
+        self._cli_list.call_async(
+            ListParameters.Request()).add_done_callback(self._on_list_params)
+
+    def _on_list_params(self, future) -> None:
+        try:
+            names = list(future.result().result.names)
+        except Exception as e:
+            self.get_logger().warn(f"list_parameters 失敗：{e}")
+            return
+        if not names:
+            return
+        req = GetParameters.Request()
+        req.names = names
+        self._cli_get.call_async(req).add_done_callback(
+            lambda f: self._on_get_params(f, names)
+        )
+
+    def _on_get_params(self, future, names) -> None:
+        try:
+            values = future.result().values
+        except Exception as e:
+            self.get_logger().warn(f"get_parameters 失敗：{e}")
+            return
+        params = {n: _pv_to_py(v) for n, v in zip(names, values)}
+        self._policy_params = params
+        # sidecar json（與 CSV 同名 _params.json）
+        meta = {
+            "csv": os.path.basename(self._params_csv_path or ""),
+            "policy_node": self.policy_node_name,
+            "captured_wall": time.time(),
+            "params": params,
+        }
+        try:
+            side = (self._params_csv_path or "").rsplit(".", 1)[0] + "_params.json"
+            with open(side, "w") as f:
+                json.dump(meta, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.get_logger().warn(f"寫 params sidecar 失敗：{e}")
+        # wandb config
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.config.update(params, allow_val_change=True)
+            except Exception as e:
+                self.get_logger().warn(f"wandb config 更新失敗：{e}")
+        key = {k: params.get(k) for k in (
+            "speed_rate", "cmd_alpha_linear", "cmd_alpha_angular",
+            "cmd_max_accel_angular", "act_max_angular_velocity", "control_dt",
+        ) if k in params}
+        self.get_logger().info(
+            f"已擷取 {self.policy_node_name} 參數 {len(params)} 項 → sidecar/wandb；"
+            f"關鍵：{key}"
         )
 
     def _init_wandb(self, run_name: str) -> None:
@@ -416,9 +521,14 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node.finalize()
+        node.finalize()   # 印出診斷摘要 + CSV 存檔位置（若有在記錄）
+        if node.csv_path is None:
+            node.get_logger().info(
+                "⏹ diag_logger 已停止（本次未啟動記錄，無 CSV 產生）"
+            )
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

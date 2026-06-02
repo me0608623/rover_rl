@@ -489,6 +489,15 @@ ros2 run rover_rl_inference routing_to_path
 ros2 run rover_rl_inference routing_click_bridge
 ```
 
+### diag_logger（診斷記錄）
+- **Executable**: `diag_logger`
+- **職責**: 被動訂閱 odom/ndt/goal/cmd_vel/obs，逐列寫 CSV（不影響推論），供事後分析晃動/不朝 goal
+- **CSV 存檔位置**: `~/rover_rl/logs/`（`log_dir` 參數預設，`deploy_full.launch.py` 亦設同值）
+- **檔名規則**: `diag_<YYYYMMDD>_<HHMMSS>[_<實驗名>].csv`
+  （`<實驗名>` 來自 start 時給的 label，經 `_safe_label()` 清特殊字元；不給就只有時間戳）
+- **Ctrl+C 後**: 自動印「診斷摘要 + CSV 完整路徑 + analyze_diag 指令」
+- **分析**: `ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag_<...>.csv`
+
 ## 故障排除清單
 
 | 症狀 | 檢查 | 修復 |

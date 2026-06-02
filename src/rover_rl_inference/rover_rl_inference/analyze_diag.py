@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import json
 import math
 import os
 import sys
@@ -49,6 +50,32 @@ def _stats(xs):
     var = sum((x - mean) ** 2 for x in xs) / n
     return {"n": n, "mean": mean, "std": math.sqrt(var),
             "min": min(xs), "max": max(xs)}
+
+
+def _print_params(csv_path: str) -> None:
+    """印出 sidecar _params.json 內的 policy 設定（若有）."""
+    side = csv_path.rsplit(".", 1)[0] + "_params.json"
+    if not os.path.isfile(side):
+        return
+    try:
+        with open(side) as f:
+            meta = json.load(f)
+        p = meta.get("params", {})
+    except Exception:
+        return
+    keys = ["speed_rate", "cmd_alpha_linear", "cmd_alpha_angular",
+            "cmd_max_accel_linear", "cmd_max_accel_angular",
+            "act_max_linear_velocity", "act_max_angular_velocity",
+            "control_dt", "goal_tolerance_m", "path_lookahead_m",
+            "require_ndt", "deterministic", "model_path"]
+    shown = [(k, p[k]) for k in keys if k in p]
+    print("-" * 60)
+    print(f"【當時 policy 參數】(來自 {os.path.basename(side)})")
+    for k, v in shown:
+        print(f"  {k:24s}= {v}")
+    extra = [k for k in p if k not in keys and k != "use_sim_time"]
+    if extra:
+        print(f"  (另有 {len(extra)} 項：{', '.join(extra[:8])}{' …' if len(extra) > 8 else ''})")
 
 
 def analyze(path: str) -> None:
@@ -91,6 +118,7 @@ def analyze(path: str) -> None:
     print("=" * 60)
     print(f"檔案: {path}")
     print(f"列數: {len(rows)}   時長: {dur:.1f}s")
+    _print_params(path)
     print("-" * 60)
     print("【角速度晃動】(變化越大越晃)")
     if dw_st:

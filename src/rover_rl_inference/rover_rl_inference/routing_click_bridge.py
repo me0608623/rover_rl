@@ -177,6 +177,12 @@ class RoutingClickBridge(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = RoutingClickBridge()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.get_logger().info("⏹ routing_click_bridge 已停止")
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()

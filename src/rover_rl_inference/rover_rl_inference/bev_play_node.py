@@ -513,9 +513,11 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.get_logger().info("⏹ bev_play 已停止")
         plt.close(node.fig)
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

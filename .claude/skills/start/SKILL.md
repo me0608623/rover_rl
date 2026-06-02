@@ -1,15 +1,17 @@
 ---
 name: start
-description: 開始一次 rover_rl 實驗 — 透過 ROS MCP 做 preflight 檢查、開啟診斷記錄(diag_logger)、看 camera 確認場景，然後盯關鍵指標。使用者打 "start [實驗名]" 時啟動。
+description: rover_rl 上路前 preflight + 上路後即時盯場 — 透過 ROS MCP 確認系統健康、看 camera 確認場景、盯 cmd_vel 晃動與是否朝 goal。使用者打 "start" 時啟動。
 user-invocable: true
 ---
 
-# /start — rover_rl 實驗開錄 + 即時盯場
+# /start — rover_rl preflight + 即時盯場
 
-使用者已 `deploy_rl`（diag_logger 待命中）。打 `start [實驗名]` 時，依序執行下列步驟。
-**核心分工：記錄由 diag_logger 節點負責（20Hz 可靠寫 CSV/wandb）；你用 ROS MCP 只做「開錄前確認」與「開錄後盯指標 + 看場景」，不要把 MCP 當記錄器。**
+**記錄是自動的**：`deploy_rl` 後 diag_logger 已待命，使用者一發 goal 就自動開始寫
+`~/rover_rl/logs/diag_<時間>.csv`（不需任何 start 指令）。所以本 skill **不負責開錄**，
+專做兩件事：**(A) 發 goal 前的 preflight 確認、(B) 發 goal 後的即時盯場**。
 
-實驗名取自使用者輸入（如 `start corridor_run3` → label=`corridor_run3`）；沒給就用空字串（節點會自動以時間戳命名）。
+**核心分工：記錄由 diag_logger 節點負責（20Hz 可靠）；你用 ROS MCP 只做確認與盯場，
+不要把 MCP 當記錄器。**
 
 ## Step 0：連線 ROS MCP
 
@@ -39,23 +41,15 @@ analyze_previously_received_image()
 ```
 描述畫面：前方是否淨空、有無人/障礙物。**場景明顯超出 T-corridor 訓練分布（開放廣場、極窄道）就提醒風險。**
 
-## Step 3：開始記錄
+## Step 3：preflight 結論 + 提示發 goal
 
-確認 preflight 綠燈後，觸發 diag_logger 開新實驗：
+把 Step 1/2 結果給使用者一句話結論（綠燈/紅燈）。綠燈就告訴他：
+**可以發 goal 了（RViz Nav2 Goal 或 routing），diag_logger 收到 goal 會自動開始寫
+`~/rover_rl/logs/diag_<時間>.csv`。** 紅燈先別發 goal，列出要修的項目。
 
-```
-publish_once(topic="/rover_rl/record", msg_type="std_msgs/msg/String",
-             msg={"data": "start <實驗名>"})
-```
-（或請使用者在終端 `ros2 topic pub --once /rover_rl/record std_msgs/String "{data: 'start <實驗名>'}"`）
+## Step 4：發 goal 後即時盯場
 
-回報：CSV 路徑會是 `~/rover_rl/logs/diag_<時間>_<實驗名>.csv`。
-
-## Step 4：提示下達 goal 並盯指標
-
-告訴使用者：現在可以發 goal（RViz Nav2 Goal 或 routing），diag_logger 收到 goal 才開始寫資料。
-
-開錄後每隔數秒抽樣盯（用 MCP subscribe_once，不需高頻）：
+每隔數秒抽樣盯（用 MCP subscribe_once，不需高頻）：
 - `/input/nav_cmd_vel`：`angular.z` 是否在 [-2,2]、是否劇烈跳動（晃動徵兆）
 - `/ndt_pose` vs goal：距離是否在縮短
 - `/rover_rl/lidar_sweep_72`：最近距離是否進入安全區
@@ -64,17 +58,14 @@ publish_once(topic="/rover_rl/record", msg_type="std_msgs/msg/String",
 
 ## Step 5：結束與分析
 
-使用者打 `stop`（或實驗結束）時：
-
-```
-publish_once(topic="/rover_rl/record", msg_type="std_msgs/msg/String",
-             msg={"data": "stop"})
-```
-diag_logger 會印晃動/朝向摘要。接著跑分析：
+實驗結束（使用者 Ctrl-C 關掉 deploy_rl）時 diag_logger 會自動印晃動/朝向摘要。
+然後跑分析：
 
 ```bash
 ros2 run rover_rl_inference analyze_diag      # 自動取最新 CSV，存 png
 ```
+（若想中途切下一段而不關 deploy_rl，可選擇送 `ros2 topic pub --once /rover_rl/record
+std_msgs/String "{data: 'start 下一段'}"` 開新檔；非必要。）
 把 `Δω RMS`、`|heading_err|平均`、`距離趨勢`、`heading vs policy_goal 一致性` 解讀給使用者：
 - heading 與 policy_goal_ang **不一致** → 定位/TF/座標 bug
 - 一致但都偏大 → policy 真的沒朝 goal（場景超訓練分布）

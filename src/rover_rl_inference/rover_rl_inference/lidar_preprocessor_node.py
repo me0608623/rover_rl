@@ -87,6 +87,8 @@ class LidarPreprocessorNode(Node):
         self._odom_v = 0.0
         self._odom_w = 0.0
         self._recv_count = 0
+        self._hb_last_n = 0
+        self._hb_last_t = time.monotonic()
 
         # ── QoS / sub / pub ──
         sensor_qos = QoSProfile(
@@ -186,9 +188,16 @@ class LidarPreprocessorNode(Node):
             self.pub_scan.publish(scan)
 
     def _heartbeat(self) -> None:
+        now = time.monotonic()
         with self._lock:
             n = self._recv_count
-        self.get_logger().info(f"[HB] 累計收 {n} 個 PointCloud2 frames")
+        dt = now - self._hb_last_t
+        hz = (n - self._hb_last_n) / dt if dt > 0 else 0.0
+        self._hb_last_n, self._hb_last_t = n, now
+        mark = "✓" if hz > 1.0 else "⚠"
+        self.get_logger().info(
+            f"[HB] PointCloud2 {mark}{hz:.1f}Hz (累計 {n})"
+        )
 
 
 def main(args=None):
@@ -199,8 +208,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.get_logger().info("⏹ lidar_preprocessor 已停止")
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
