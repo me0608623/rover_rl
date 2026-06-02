@@ -25,6 +25,8 @@ setup(
             "export_policy = rover_rl_inference.export_policy:main",
             "routing_to_path = rover_rl_inference.routing_to_path:main",
             "routing_click_bridge = rover_rl_inference.routing_click_bridge:main",
+            "diag_logger = rover_rl_inference.diag_logger_node:main",
+            "analyze_diag = rover_rl_inference.analyze_diag:main",
         ],
     },
 )

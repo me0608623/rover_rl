@@ -333,6 +333,27 @@ def generate_launch_description():
         condition=IfCondition(enable_bev),
     )
 
+    # ── Part 9: rover_rl — 診斷記錄（被動，不影響推論）──
+    diag_logger_node = Node(
+        package="rover_rl_inference",
+        executable="diag_logger",
+        name="rover_rl_diag_logger",
+        output="screen",
+        emulate_tty=True,
+        parameters=[{
+            "rate_hz": 20.0,
+            "log_dir": os.path.expanduser("~/rover_rl/logs"),
+            "topic_cmd_vel": "/input/nav_cmd_vel",
+            "topic_obs_debug": "/rover_rl_policy/obs_debug",
+            "topic_record_ctrl": "/rover_rl/record",
+            "require_start": LaunchConfiguration("require_start"),
+            "log_only_with_goal": True,
+            "enable_wandb": LaunchConfiguration("enable_wandb"),
+            "wandb_mode": LaunchConfiguration("wandb_mode"),
+        }],
+        condition=IfCondition(LaunchConfiguration("enable_diag")),
+    )
+
     # ── Banner ──
     banner = LogInfo(msg=(
         "================================\n"
@@ -366,6 +387,14 @@ def generate_launch_description():
         DeclareLaunchArgument("enable_mot", default_value="true"),
         DeclareLaunchArgument("enable_costmap", default_value="true"),
         DeclareLaunchArgument("rviz", default_value="true"),
+        DeclareLaunchArgument("enable_diag", default_value="true",
+                              description="診斷記錄節點（goal 後記 CSV 到 ~/rover_rl/logs）"),
+        DeclareLaunchArgument("require_start", default_value="true",
+                              description="true=待命，需另一終端送 start 才開錄（每次=乾淨實驗）"),
+        DeclareLaunchArgument("enable_wandb", default_value="false",
+                              description="診斷記錄同步上 wandb（需先 pip install wandb）"),
+        DeclareLaunchArgument("wandb_mode", default_value="offline",
+                              description="wandb 模式：offline(實車建議)/online/disabled"),
         DeclareLaunchArgument("map_file",
                               default_value="/home/aa/maps/4v3F.yaml"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -399,4 +428,5 @@ def generate_launch_description():
         preprocessor_node,
         policy_node,
         bev_play_node,
+        diag_logger_node,
     ])

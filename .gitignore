@@ -19,6 +19,10 @@ models/*.ts
 models/*.pt
 !models/.gitkeep
 
+# 診斷記錄（diag_logger 產出，實驗資料不入庫）
+logs/
+wandb/
+
 # OS
 .DS_Store
 Thumbs.db
