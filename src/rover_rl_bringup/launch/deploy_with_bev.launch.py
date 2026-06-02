@@ -32,6 +32,7 @@ from launch.actions import (
     GroupAction,
     IncludeLaunchDescription,
     LogInfo,
+    OpaqueFunction,
 )
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
@@ -64,19 +65,21 @@ def generate_launch_description():
         condition=IfCondition(enable_preprocessor),
     )
 
-    # ── 1. Policy node ────────────────────────────────────────────────────
-    policy_node = Node(
-        package="rover_rl_inference",
-        executable="policy_node",
-        name="rover_rl_policy",
-        output="screen",
-        emulate_tty=True,
-        parameters=[
-            params_file,
-            {"model_path": model_path},
-        ],
-        arguments=["--ros-args", "--log-level", log_level],
-    )
+    # ── 1. Policy node（用 OpaqueFunction 避免空字串覆蓋 yaml model_path）────
+    def make_policy_node(context, *args, **kwargs):
+        mp = LaunchConfiguration("model_path").perform(context)
+        extra = [{"model_path": mp}] if mp else []
+        return [Node(
+            package="rover_rl_inference",
+            executable="policy_node",
+            name="rover_rl_policy",
+            output="screen",
+            emulate_tty=True,
+            parameters=[params_file] + extra,
+            arguments=["--ros-args", "--log-level",
+                       LaunchConfiguration("log_level").perform(context)],
+        )]
+    policy_node = OpaqueFunction(function=make_policy_node)
 
     # ── 2. BEV node（rover_rl 自包，移植自訓練端 play_eval/bev_renderer.py） ──
     bev_play_node = Node(

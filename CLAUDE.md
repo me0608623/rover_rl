@@ -3,6 +3,10 @@
 > 此 repo 由 PC 端訓練組（/home/aa/IsaacLab）匯出，部署到 CampusRover 實車。
 > 您（車上的 Claude）的任務：**驗證 ROS 通訊運作正常，然後協助首次上電部署**。
 
+> **最後更新：2026-06-02** — 已實作 routing_to_path / routing_click_bridge / bev_play_node；
+> deploy_full.launch.py 可一次啟動完整棧（NDT + routing + RL policy）。
+> 技術細節參見 `ARCHITECTURE.md`。
+
 ## 語言偏好
 
 - 所有回覆、log、註解一律 **繁體中文**
@@ -65,14 +69,25 @@ obs_raw [B, 139] ── normalize + slice → obs79 [B, 79]
 
 ### 啟動方式
 
-`deploy_with_bev.launch.py` 預設**會自動啟動 preprocessor**：
+**3 種 launch 對應 3 種場景**：
+
+| Launch 檔 | 用途 | 含哪些節點 |
+|---|---|---|
+| `deploy.launch.py` | 最簡：只跑 policy | policy_node 單一節點 |
+| `deploy_with_bev.launch.py` | 標準：policy + preprocessor + BEV | preprocessor + policy + bev_play |
+| `deploy_full.launch.py` | 完整棧：rover_rl + campusrover | 上面三個 + NDT + routing + costmap + MOT + RViz |
 
 ```bash
+# 標準部署（NDT 由用戶另行啟動）
 ros2 launch rover_rl_bringup deploy_with_bev.launch.py
 # 內含：
-#   - lidar_preprocessor （/velodyne_points → /rover_rl/lidar_sweep_72）
-#   - policy_node         （訂閱 /rover_rl/lidar_sweep_72 → /input/nav_cmd_vel）
-#   - bev_node            （rover2_ws 視覺化）
+#   - lidar_preprocessor   (/velodyne_points → /rover_rl/lidar_sweep_72)
+#   - policy_node          (訂閱 sweep → /input/nav_cmd_vel)
+#   - bev_play_node        (→ /rover_rl/bev_image, matplotlib headless)
+
+# 完整棧（含 NDT + routing，一鍵全啟）
+source ~/rover_rl/setup_env.sh   # ROS_DOMAIN_ID=30, RMW=fastrtps 等
+ros2 launch rover_rl_bringup deploy_full.launch.py initial_mode:=idle
 ```
 
 ### 切換成「policy_node inline 處理」（不推薦，但保留）
@@ -163,12 +178,24 @@ policy_node 同時訂閱兩個來源：
 3. 往前找第一個距離 ≥ `path_lookahead_m`（預設 2m）的 waypoint = carrot
 4. 走到尾還沒達 lookahead → 取最後一點作為 final goal
 
-**campusrover_routing 整合**：routing 是 service-based（`RoutingPath.srv`），需要中間節點：
+**campusrover_routing 整合**：routing 是 service-based（`RoutingPath.srv`），**已有橋接節點**：
+
 ```
-routing service ── srv call ──→ pick path[0] ──publish──→ /global_path ──→ rover_rl
+RViz Publish Point (兩點)
+      │
+      ▼
+routing_click_bridge      ← 點第1次選起點，點第2次選終點 → 自動呼叫 routing
+      │ srv call
+      ▼
+routing_to_path_node  ── generation_path svc ──→ pick routing[0] ──publish──→ /global_path ──→ policy_node
 ```
 
-如果您要 rover_rl 直接呼叫 routing service，告訴我，我加 service client。
+或手動呼叫 service：
+```bash
+ros2 service call /rover_rl/routing_call campusrover_msgs/srv/RoutingPath \
+  "{origin: 'c1', destination: ['e0']}"
+# 結果自動 publish 到 /global_path
+```
 
 ## TF tree 與啟動順序（重要）
 
@@ -206,24 +233,42 @@ base_link ─(URDF static)─ base_footprint / velodyne_link / imu_link
 - cached offset 即使 NDT 暫時消失仍能跑（safer fallback）
 - 跟 rover2_ws 既有 rl_policy_node 同 pattern，行為一致
 
-### 啟動順序（用戶手動）
+### 啟動順序
 
+**方案 A：deploy_with_bev（分步啟動，推薦首次部署）**
 ```bash
-# Terminal 1: NDT 定位（rover_rl 不啟，由您獨立啟動）
+# Terminal 1: NDT 定位
 cd ~/Documents/ndt_ws && source install/setup.bash
 ros2 launch ndt_localizer ndt_localizer_launch.py
 
-# Terminal 2: 底盤 driver（發布 /odom + odom→base_link TF）
+# Terminal 2: 底盤 driver（/odom + odom→base_link TF）
 cd ~/rover2_ws && source install/setup.bash
 ros2 launch campusrover_base <existing_launch>.py
 
-# Terminal 3: VLP-16 driver（發布 /velodyne_points）
+# Terminal 3: VLP-16 driver
 ros2 launch velodyne velodyne-all-nodes-VLP16-launch.py
 
-# Terminal 4: rover_rl + BEV（一個 launch 全包）
-cd ~/rover_rl_ws && source install/setup.bash
-source ~/rover2_ws/install/setup.bash       # ★ 必須 source 才找得到 campusrover_rl_policy
-ros2 launch rover_rl_bringup deploy_with_bev.launch.py
+# Terminal 4: rover_rl（preprocessor + policy + bev）
+cd ~/rover_rl && source install/setup.bash
+source ~/rover2_ws/install/setup.bash   # campusrover_msgs 依賴
+source setup_env.sh                     # ROS_DOMAIN_ID + RMW
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py initial_mode:=idle
+```
+
+**方案 B：deploy_full（一鍵完整棧）**
+```bash
+# Terminal 1: 底盤 driver
+cd ~/rover2_ws && source install/setup.bash
+ros2 launch campusrover_base <existing_launch>.py
+
+# Terminal 2: VLP-16 driver
+ros2 launch velodyne velodyne-all-nodes-VLP16-launch.py
+
+# Terminal 3: 完整棧（包含 NDT + routing + RL + BEV）
+cd ~/rover_rl && source install/setup.bash
+source ~/rover2_ws/install/setup.bash
+source setup_env.sh
+ros2 launch rover_rl_bringup deploy_full.launch.py initial_mode:=idle
 ```
 
 ### Timer 結構（採 spot_rl 多 timer pattern）
@@ -256,9 +301,20 @@ policy raw cmd ──→ first-order low-pass (α=0.3) ──→ slew-rate limit
 |---|---|---|
 | `params_file` | 內建 yaml | 覆寫 policy_params.yaml |
 | `model_path` | "" | 覆寫 yaml 的 model_path |
-| `enable_bev` | true | false 則只啟 policy |
-| `bev_show` | image_view | rviz / image_view / window / none |
+| `enable_bev` | true | false 則不啟 bev_play |
+| `enable_preprocessor` | true | false 則不啟 lidar_preprocessor |
 | `log_level` | info | debug / info / warn / error |
+
+### deploy_full.launch.py 參數（完整棧）
+
+| arg | 預設 | 說明 |
+|---|---|---|
+| `initial_mode` | idle | 建議首次用 idle，確認後再改 nav |
+| `map_file` | `/home/aa/maps/4v3F.yaml` | NDT map |
+| `enable_mot` | true | 動態障礙物追蹤 |
+| `enable_costmap` | true | costmap |
+| `rviz` | true | RViz |
+| `enable_bev` | true | BEV play node |
 
 ### 驗證 TF 是否完整
 
@@ -279,7 +335,7 @@ ros2 run tf2_ros tf2_echo map base_footprint
 | `src/campusrover_base/` | 底盤 driver + URDF + TF | 不動。提供 `/odom` 與 `base_footprint`/`velodyne_link` TF |
 | `src/spot_rl/` | 舊版 spot RL policy（spot_model + warp_device_ros） | **參考，不依賴**。rover_rl 是獨立新版 |
 | `src/campusrover_navigation/` | 地圖 + costmap + planner | 可提供 `/goal_pose` 來源（RViz Nav2 goal） |
-| `launch_rl.sh` | 舊 RL 完整啟動腳本 | **照抄環境設定**：ROS_DOMAIN_ID=30, RMW=fastrtps |
+| `launch_rl.sh` | 舊 RL 完整啟動腳本 | 已過時；改用 `deploy_rl` alias（見下） |
 | `/home/aa/maps/4v3F.yaml` | 預設地圖 | 給 NDT localizer 用 |
 
 ### 注意：與 spot_rl 的差異
@@ -287,15 +343,53 @@ ros2 run tf2_ros tf2_echo map base_footprint
 - spot_rl 用 spot_model（不同 obs 維度、不同 action space）
 - rover_rl 用 SA6_TC checkpoint（VLP16 + 72-bin sweep + 19×19 discrete action）
 - **兩者不可互換 checkpoint**
+- **spot_rl 核心（ai_model_action.py / spot_obs_process.cpp）是 ROS 1，從未完成 ROS 2 移植**；rover_rl 才是完整的 ROS 2 RL deployment
+
+### deploy_rl alias（最快啟動方式）
+
+`.bashrc` 已有現成 alias，包含完整 source 順序與環境設定：
+
+```bash
+deploy_rl
+# 等同：
+# source /opt/ros/humble/setup.bash
+# source ~/rover2_ws/install/setup.bash
+# source ~/rover_rl/install/setup.bash
+# export ROS_DOMAIN_ID=55
+# export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+# ros2 launch rover_rl_bringup deploy_full.launch.py
+```
+
+⚠️ 直接用這個 alias，不要手動拼環境指令。
+
+### Zenoh Router 必須先運行
+
+所有 ROS 2 通訊走 `rmw_zenoh_cpp`，依賴一台 zenoh router hub（`192.168.3.13:7447`）。
+**節點啟動前先確認 zenoh router 在線**：
+
+```bash
+# 確認本機 zenoh router service 狀態
+systemctl status zenoh-router.service   # 應為 active (running)
+
+# 確認能連到遠端 router
+ping 192.168.3.13
+
+# 驗證 ROS 2 通訊
+ros2 topic list    # 有輸出 = zenoh 正常
+```
+
+若 `ros2 topic list` 無回應或超時 → zenoh router 沒連上，先解決這個再啟動任何節點。
 
 ## ROS 通訊驗證流程（首要任務）
 
 ### Step 1：環境檢查
 
 ```bash
-source /opt/ros/humble/setup.bash      # 或 jazzy，依車上版本
-export ROS_DOMAIN_ID=30
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+# ⚠️ 正確環境設定（RMW=zenoh, DOMAIN=55）— 直接用 alias 最安全
+source /opt/ros/humble/setup.bash
+export ROS_DOMAIN_ID=55
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+# 或直接：source ~/rover_rl/setup_env.sh
 
 # 檢查必要 topic 是否已被既有節點發布
 ros2 topic list | grep -E "velodyne_points|odom|goal_pose|cmd_vel"
@@ -311,8 +405,9 @@ ros2 topic list | grep -E "velodyne_points|odom|goal_pose|cmd_vel"
 ### Step 2：Build rover_rl
 
 ```bash
-cd ~/rover_rl_ws            # 假設 user 把 src/ 放這裡
+cd ~/rover_rl               # 實際路徑（/home/aa/rover_rl）
 source /opt/ros/humble/setup.bash
+source ~/rover2_ws/install/setup.bash   # campusrover_msgs 依賴
 colcon build --symlink-install --packages-select rover_rl_inference rover_rl_bringup
 source install/setup.bash
 ```
@@ -320,6 +415,9 @@ source install/setup.bash
 **常見錯誤**：
 - `ModuleNotFoundError: torch` → Jetson 用 NVIDIA wheel，見 DEPLOY_CAMPUSROVER.md
 - `Cannot find sensor_msgs` → 沒 source ROS 環境
+- `ModuleNotFoundError: campusrover_msgs` → `routing_to_path` / `routing_click_bridge` 需要此 package。
+  `rover_rl_inference/package.xml` 未宣告此依賴（已知缺失）。
+  修復：確認 `source ~/rover2_ws/install/setup.bash` 在 build 和 launch 前都執行。
 
 ### Step 3：把 model 放到位
 
@@ -341,9 +439,10 @@ cd /home/aa/rover2_ws && source install/setup.bash
 ros2 launch velodyne velodyne-all-nodes-VLP16-launch.py &
 ros2 launch campusrover_base rover_driver.launch.py &     # 看實際 launch 名
 
-# Terminal B: 啟動 rover_rl policy
-cd ~/rover_rl_ws && source install/setup.bash
-ros2 launch rover_rl_bringup deploy.launch.py log_level:=debug
+# Terminal B: 啟動 rover_rl（preprocessor + policy + bev）
+cd ~/rover_rl && source install/setup.bash
+source setup_env.sh    # ROS_DOMAIN_ID=30, RMW=fastrtps
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py log_level:=debug initial_mode:=idle
 
 # Terminal C: 確認資料流
 ros2 topic hz /velodyne_points              # 應 ≈ 10 Hz
@@ -370,6 +469,26 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 3. 觀察輪子方向是否朝期望（goal 在前 → 兩輪正轉）
 4. 用遙控器 deadman 隨時切回 joy 模式
 
+## 新增節點（2026-06 加入）
+
+### routing_to_path
+- **Executable**: `routing_to_path`
+- **職責**: campusrover_routing `generation_path` service → `/global_path` topic 橋接
+- **呼叫方式**: `ros2 service call /rover_rl/routing_call campusrover_msgs/srv/RoutingPath "{origin: 'c1', destination: ['e0']}"`
+- **效果**: 結果自動 2Hz republish 到 `/global_path` → policy_node 的 SubgoalSelector 接收
+
+### routing_click_bridge
+- **Executable**: `routing_click_bridge`
+- **職責**: RViz "Publish Point" 兩次點擊 → 自動呼叫 routing service → path 顯示 marker
+- **參數**: `building: itc`, `floor: 3`
+- **使用**: RViz 開 "Publish Point" 工具 → 第1點選起點 → 第2點選終點 → 自動觸發 routing
+
+兩者已整合進 `deploy_full.launch.py`，也可單獨啟動：
+```bash
+ros2 run rover_rl_inference routing_to_path
+ros2 run rover_rl_inference routing_click_bridge
+```
+
 ## 故障排除清單
 
 | 症狀 | 檢查 | 修復 |
@@ -377,10 +496,15 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 | policy_node 啟動 crash | `journalctl -xe` 或 launch output | 99% 是 `model_path` 錯或 torch 沒裝 |
 | /input/nav_cmd_vel 沒輸出 | `ros2 topic info /input/nav_cmd_vel -v` | 確認 mux config 接此 topic；或直接改 `topic_cmd_vel: /cmd_vel` 測試 |
 | 永遠輸出 0 cmd | log 看 `lidar timeout` 或 `odom timeout` | LiDAR/odom 訊號中斷；檢查 hz |
+| sweep_src=inline_fallback | preprocessor 節點死了 | `ros2 topic hz /rover_rl/lidar_sweep_72`；重啟 preprocessor |
 | Goal 永遠收不到 | `goal_frame` 設錯 | 改 `goal_frame: odom`（沒 map）或 `map`（有 NDT/AMCL） |
+| routing_click_bridge 找不到節點 | 地圖節點未啟 | 先確認 `/get_route_info` service 存在 |
 | 跑起來但車原地震 | normalizer 期望 139D 你給 79D（或反） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照 |
 | cmd 振幅異常大 | normalizer mean/var 沒 bake 進 model | 重新 export_policy.py（必須帶有 obs_normalizer 的 checkpoint） |
 | RViz Nav2 goal 不被收 | topic remap | 確認 `/goal_pose` 是 Nav2 standard，不是 `/move_base_simple/goal` |
+| /rover_rl/bev_image 沒畫面 | matplotlib Agg 依賴 | 確認 `pip install matplotlib` 已裝 |
+| RViz 啟動但沒有 display 設定 | rviz config 不在 repo | `deploy_full` 引用 `/home/aa/rviz/demo.rviz`（本機路徑，未納入 git）。換機器部署須手動複製或改 launch 路徑 |
+| 啟動後第一幀 LiDAR timeout | velodyne 比 policy 慢啟 | 正常現象（非 crash）。spot_rl 有 `delay.py` 延遲保護；rover_rl 沒有，第一幀 timeout 只是 warn log，約 1s 後自動恢復 |
 
 ## 任務分流（您與用戶協作時）
 
@@ -394,6 +518,7 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 | 重訓 model | ❌ 您沒訓練環境 | PC 端訓練組 |
 | 上電遙控 | ❌ | 用戶手動 |
 | 寫 ros2 service / E-stop | ✅ 用戶若要求 | 提需求 |
+| 序列多停靠點任務 | ❌ 目前不支援 | spot_rl 有 `service_seq.py`；rover_rl 僅支援單 goal 或單段 path，跨房間 A→B→C 需要用戶手動多次呼叫 routing_call |
 
 ## 模型選擇建議
 
@@ -414,31 +539,36 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 ```
 /velodyne_points (PointCloud2)
    │
-   ├─→ rover_rl policy_node ── 72-bin sweep ─→ RL ─→ cmd_vel
+   ├─→ rover_rl_lidar_preprocessor ── /rover_rl/lidar_sweep_72 ─→ policy_node ─→ cmd_vel
    │
-   └─→ rover2_ws bev_node ── 極座標影像 ─→ /bev_polar_image  (可選，純 debug)
+   └─→ rover_rl bev_play_node ── matplotlib Agg 極座標圖 ─→ /rover_rl/bev_image  (debug)
 ```
+
+### bev_play_node（現已整合進 rover_rl）
+
+`rover_rl_inference/bev_play_node.py` 移植自訓練端 `play_rnn_car.py::LiveBEVVisualizer`。
+
+**訂閱**：
+- `/rover_rl/lidar_sweep_72` (Float32MultiArray[72])
+- `/rover_rl_policy/obs_debug` (Float32MultiArray[79], 可選，取 goal body)
+- `/input/nav_cmd_vel` (Twist, 可選)
+- `/odom` (Odometry, 可選，trail + yaw)
+
+**發布**：
+- `/rover_rl/bev_image` (sensor_msgs/Image, rgb8, ~5 Hz)
+
+**deploy_with_bev.launch.py** 預設 `enable_bev:=true` 自動帶起此節點。
 
 ### 是否啟動 BEV
 
 **建議啟動**，作為 debug 工具：
 - 上電前肉眼確認 LiDAR 看得到牆/障礙物
 - 排查 sensor 異常時直接看極座標圖比 raw PointCloud2 直覺
-- **不要把 BEV 程式抄進 rover_rl**，重用 rover2_ws 的版本就好
-
-### 啟動方式（車上 Claude 不需要寫，照抄）
 
 ```bash
-# 啟動 rover2_ws 的 bev_node（與 rover_rl 並行）
-cd /home/aa/rover2_ws && source install/setup.bash
-ros2 launch campusrover_rl_policy bev.launch.py use_rviz:=true
-# 或 use_image_view:=true 用 rqt_image_view 看
+# deploy_with_bev 已自動啟動 bev_play；用 rqt_image_view 查看：
+ros2 run rqt_image_view rqt_image_view /rover_rl/bev_image
 ```
-
-預期 RViz 看到：
-- 中央機器人（圈）
-- 72-bin 極座標 LiDAR sweep（圓周上的距離值）
-- 障礙物在對應角度顯示為近距離 bin
 
 ⚠️ 如果 BEV 沒看到任何障礙物 → policy 也看不到 → 別上電。
 
@@ -468,9 +598,11 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
 ## sim-to-real 已知 gap（按嚴重度排序）
 
 1. **LiDAR 高度 1.6m (訓練) vs 1.43m (實車)** — beam 角度落點不同
-2. **訓練 ω_max=2.0 vs 底盤 1.2** — 全力轉時實際比 policy 預期慢 40%
+2. **訓練 ω_max=2.0 vs 底盤 1.2** — 全力轉時實際比 policy 預期慢 40%（見 `driver_chgh.yaml: profile_omega_max: 1.2`）
 3. **wheel 不對稱 1.9%** — odom drift 1%/m
 4. **訓練 T 走廊 vs 實車任意場景** — 泛化性未驗證
+5. **無 cmd_delay 補償** — spot_rl 有 `cmd_delay_time=1.0s` 的死時間補償（`fast_info_calculate()`：基於預測的延遲位姿更新 obs 中的速度和目標座標）。rover_rl 沒有此機制；若底盤響應 latency 明顯（>0.2s），policy 可能振盪。初步觀察若有振盪，考慮加大 `cmd_alpha_linear` 濾波。
+6. **底盤 deadband 未知** — spot_rl 強制最小移動速度 `minimum_will_move_speed=0.14 m/s`（避免 policy 輸出微小速度但馬達不動）。rover_rl deadband 僅 0.02 m/s。若實車觀察到 policy 有輸出但輪子靜止，需量測實際底盤死區並調高 `cmd_alpha_linear` 或在 action_decoder 加 floor。
 
 ## 與 PC 端的溝通介面
 
@@ -480,6 +612,55 @@ PC 端 repo：`/home/aa/IsaacLab/rover_rl`（私 SSH origin: `me0608623/rover_rl
 - 重訓 model（改 LiDAR 高度 / open scene / 新場景）
 - 匯出新的 .ts（用 `scripts/export_policy.py`，已 auto-detect 架構）
 - 提供新版 obs / action 規格
+
+## ROS MCP Server 使用指南
+
+**ros-mcp-server** 已全域安裝，可在此 session 直接對 rover_rl 的 ROS 2 環境下指令。
+
+### 啟動 rosbridge（每次使用前）
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/rover_rl/setup_env.sh   # ROS_DOMAIN_ID=55, RMW=rmw_zenoh_cpp
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml &
+# 看到 "Rosbridge WebSocket server started on port 9090" 即成功
+```
+
+### 連線
+
+在 Claude 對話中直接呼叫：
+```
+connect_to_robot(ip="127.0.0.1", port=9090)
+```
+
+### 常用操作範例
+
+```
+# 看所有 topic
+get_topics()
+
+# 確認 policy 有沒有在發 cmd_vel
+subscribe_once(topic="/input/nav_cmd_vel", timeout=3)
+
+# 切換 rover_rl mode
+call_service(service="/rover_rl_policy/set_mode", ...)
+
+# 查 lidar sweep 數值
+subscribe_once(topic="/rover_rl/lidar_sweep_72", timeout=2)
+
+# 確認 odom 頻率
+get_topic_details(topic="/odom")
+```
+
+### 與 rover_rl 部署整合
+
+rosbridge 要在 rover2_ws / rover_rl 之前啟動，並使用相同 RMW 環境：
+```bash
+source ~/rover_rl/setup_env.sh   # ← 必須，確保 zenoh + DOMAIN_ID=55 一致
+ros2 launch rosbridge_server rosbridge_websocket_launch.xml &
+```
+
+若 rosbridge 沒有 source rover_rl 環境就啟動，會連到不同 zenoh domain，看不到 rover_rl 的 topics。
 
 ## 安全條款（絕對遵守）
 

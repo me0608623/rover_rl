@@ -46,11 +46,12 @@ from collections import deque
 
 import numpy as np
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, PointCloud2
 from std_msgs.msg import Float32MultiArray, String
+import sensor_msgs_py.point_cloud2 as pc2
 
 import matplotlib
 matplotlib.use("Agg", force=True)
@@ -106,10 +107,16 @@ class BevPlayNode(Node):
         # sweep / odom 來源狀態
         self._sweep_t = 0.0
         self._odom_t = 0.0
+        # goal_pose（直接訂閱，不依賴 obs_debug）
+        self._goal_map: tuple[float, float] | None = None   # map frame (x, y)
+        # 原始點雲最近距離（不受 r_min 過濾）
+        self._raw_nearest: float | None = None
+        self._raw_nearest_ang: float | None = None
 
         # ── matplotlib figure（重用） ──
         plt.rcParams["font.sans-serif"] = [
-            "DejaVu Sans", "Noto Sans CJK TC", "WenQuanYi Micro Hei",
+            "DejaVu Sans", "Noto Sans CJK JP", "Noto Sans CJK TC",
+            "WenQuanYi Micro Hei",
         ]
         plt.rcParams["axes.unicode_minus"] = False
         self.fig = plt.figure(figsize=(self.fig_w, self.fig_h),
@@ -131,6 +138,8 @@ class BevPlayNode(Node):
             gp("topic_odom").get_parameter_value().string_value, self._cb_odom, 10)
         self.create_subscription(String,
             gp("topic_mode").get_parameter_value().string_value, self._cb_mode, 10)
+        self.create_subscription(PoseStamped, "/goal_pose", self._cb_goal, 10)
+        self.create_subscription(PointCloud2, "/velodyne_points", self._cb_pc, 5)
 
         self.pub_image = self.create_publisher(Image,
             gp("topic_image").get_parameter_value().string_value, 5)
@@ -181,6 +190,32 @@ class BevPlayNode(Node):
         with self._lock:
             self._mode_str = msg.data or "unknown"
 
+    def _cb_goal(self, msg: PoseStamped) -> None:
+        with self._lock:
+            self._goal_map = (msg.pose.position.x, msg.pose.position.y)
+
+    def _cb_pc(self, msg: PointCloud2) -> None:
+        try:
+            pts = np.array(list(pc2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True)))
+            if pts.shape[0] == 0:
+                return
+            x, y, z = pts[:, 0], pts[:, 1], pts[:, 2]
+            # z_filter: 過濾地面與高處（與 preprocessor 對齊）
+            mask = np.abs(z) < 0.5
+            if mask.sum() == 0:
+                return
+            x, y = x[mask], y[mask]
+            d = np.sqrt(x**2 + y**2)
+            idx = int(d.argmin())
+            nearest = float(d[idx])
+            ang = float(math.degrees(math.atan2(y[idx], x[idx])))
+            with self._lock:
+                self._raw_nearest = nearest
+                self._raw_nearest_ang = ang
+        except Exception:
+            pass
+
     # ── main tick ──
     def _tick(self) -> None:
         with self._lock:
@@ -192,6 +227,9 @@ class BevPlayNode(Node):
             xy = self._odom_xy
             trail = list(self._trail)
             mode = self._mode_str
+            goal_map = self._goal_map
+            raw_nearest = self._raw_nearest
+            raw_nearest_ang = self._raw_nearest_ang
             self._step += 1
             step = self._step
             sweep_age = time.monotonic() - self._sweep_t if self._sweep_t else float("inf")
@@ -199,14 +237,25 @@ class BevPlayNode(Node):
         if sweep is None:
             return
 
-        self._draw_bev(sweep, obs, yaw, xy, trail)
+        # goal_map → body frame（用 odom 近似，NDT 未收斂時仍有參考價值）
+        goal_body: tuple[float, float] | None = None
+        if goal_map is not None:
+            dx = goal_map[0] - xy[0]
+            dy = goal_map[1] - xy[1]
+            cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+            gx_body = cos_y * dx + sin_y * dy   # forward
+            gy_body = -sin_y * dx + cos_y * dy  # left
+            goal_body = (gx_body, gy_body)
+
+        self._draw_bev(sweep, obs, yaw, xy, trail, goal_body)
         self._draw_top_panel(step, cmd_v, cmd_w, sweep, obs, mode,
-                              yaw, sweep_age, odom_age)
+                              yaw, sweep_age, odom_age, goal_body,
+                              raw_nearest, raw_nearest_ang)
         msg = self._fig_to_image_msg()
         self.pub_image.publish(msg)
 
     # ── BEV plot ──
-    def _draw_bev(self, sweep_norm, obs_79, yaw, robot_xy, trail):
+    def _draw_bev(self, sweep_norm, obs_79, yaw, robot_xy, trail, goal_body=None):
         ax = self.ax
         ax.cla()
         ax.set_facecolor("#141414")
@@ -291,24 +340,39 @@ class BevPlayNode(Node):
             ax.add_collection(LineCollection(segs, colors=cc,
                                               linewidths=1.5, zorder=2))
 
-        # subgoal（從 obs[4:6] 取，body frame）
+        # subgoal 優先來自 obs_debug（policy 推論中），fallback 用 goal_pose 直接算
+        raw_gx = raw_gy = None
         if obs_79 is not None and obs_79.shape[0] >= 6:
-            gx, gy = float(obs_79[4]), float(obs_79[5])
-            gx_c = float(np.clip(gx, -self.r_max, self.r_max))
-            gy_c = float(np.clip(gy, -self.r_max, self.r_max))
+            raw_gx, raw_gy = float(obs_79[4]), float(obs_79[5])
+        elif goal_body is not None:
+            raw_gx, raw_gy = goal_body[0], goal_body[1]  # forward, left
+
+        if raw_gx is not None:
+            gx_c = float(np.clip(raw_gx, -self.r_max, self.r_max))
+            gy_c = float(np.clip(raw_gy, -self.r_max, self.r_max))
             if self.frame_mode == "world":
                 cos_y, sin_y = math.cos(yaw), math.sin(yaw)
                 goal_x = cos_y * gx_c - sin_y * gy_c
                 goal_y = sin_y * gx_c + cos_y * gy_c
             else:
-                goal_x, goal_y = gy_c, gx_c
+                goal_x, goal_y = gy_c, gx_c   # BEV: x=left, y=forward
+            dist_m = math.hypot(raw_gx, raw_gy)
             ax.arrow(0, 0, goal_x, goal_y, color="#ffd040", width=0.035,
                      head_width=0.45, length_includes_head=True, zorder=4)
             ax.scatter([goal_x], [goal_y], c=["#ffd040"], s=80, zorder=5)
+            # 距離標注
+            label_x = goal_x * 0.55
+            label_y = goal_y * 0.55
+            ax.text(label_x, label_y, f"{dist_m:.1f}m",
+                    color="#ffd040", fontsize=9, fontweight="bold",
+                    ha="center", va="center", zorder=6,
+                    bbox={"facecolor": "#1a1a1a", "edgecolor": "none",
+                          "alpha": 0.7, "boxstyle": "round,pad=0.2"})
 
     # ── 上方資料面板（三欄 grid，對齊 LiveBEVVisualizer._draw_top_panel） ──
     def _draw_top_panel(self, step, cmd_v, cmd_w, sweep, obs_79, mode,
-                         yaw, sweep_age, odom_age):
+                         yaw, sweep_age, odom_age, goal_body=None,
+                         raw_nearest=None, raw_nearest_ang=None):
         ax = self.text_ax
         ax.cla()
         ax.set_facecolor("#101214")
@@ -379,15 +443,23 @@ class BevPlayNode(Node):
         mid = int(((real >= 2.0) & (real < 5.0)).sum())
         gx = gy = float("nan")
         d_goal = float("nan")
+        goal_src = ""
         if obs_79 is not None and obs_79.shape[0] >= 6:
             gx, gy = float(obs_79[4]), float(obs_79[5])
             d_goal = math.hypot(gx, gy)
+            goal_src = "[obs]"
+        elif goal_body is not None:
+            gx, gy = goal_body[0], goal_body[1]
+            d_goal = math.hypot(gx, gy)
+            goal_src = "[pose]"
+        raw_str = (f"{raw_nearest:.2f}m@{raw_nearest_ang:+.0f}°"
+                   if raw_nearest is not None else "N/A")
         mid_lines = [
             f"Nearest: {near_d:.2f}m @ bin{near_idx}",
-            f"  angle: {near_ang:+.0f}°",
+            f"Raw min: {raw_str}",
             f"Mean   : {float(real.mean()):.2f}m",
             f"<2m/2~5: {lt2}/{n}  {mid}/{n}",
-            f"Goal xy: ({gx:+.2f},{gy:+.2f})" if not math.isnan(gx) else "Goal xy: N/A",
+            f"Goal xy: ({gx:+.2f},{gy:+.2f}){goal_src}" if not math.isnan(gx) else "Goal xy: N/A",
             f"Goal d : {d_goal:.2f}m" if not math.isnan(d_goal) else "Goal d : N/A",
         ]
         for y, line in zip(y_rows, mid_lines):

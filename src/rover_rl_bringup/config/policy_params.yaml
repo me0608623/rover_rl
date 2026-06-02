@@ -19,7 +19,7 @@ rover_rl_policy:
     topic_cmd_vel: "/input/nav_cmd_vel"
     topic_markers: "~/markers"
     topic_obs_debug: "~/obs_debug"
-    publish_obs_debug: false
+    publish_obs_debug: true
     publish_markers: true
 
     # --- QoS ---

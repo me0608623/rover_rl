@@ -23,6 +23,8 @@ setup(
             "bev_play = rover_rl_inference.bev_play_node:main",
             "ros_smoke_test = rover_rl_inference.ros_smoke_test:main",
             "export_policy = rover_rl_inference.export_policy:main",
+            "routing_to_path = rover_rl_inference.routing_to_path:main",
+            "routing_click_bridge = rover_rl_inference.routing_click_bridge:main",
         ],
     },
 )
