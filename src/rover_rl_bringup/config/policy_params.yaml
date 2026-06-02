@@ -41,10 +41,18 @@ rover_rl_policy:
 
     # --- Action limits（鎖在訓練分布內，不要因為底盤更強就放寬！） ---
     # 底盤能力: max_speed=1.5, acc_max=1.2, omega_max=1.2 — 但 policy 沒見過 > 訓練值
-    # 不要 extrapolate，保持訓練值
+    # 不要往上 extrapolate；往下調低（安全方向）可以。
     act_max_linear_velocity: 1.0
     act_max_linear_accel: 0.5
+    # 角速度保持訓練值 2.0；降速統一用 speed_rate（避免 double-penalty）
     act_max_angular_velocity: 2.0
+
+    # --- 全域速度縮放（spot_rl 時間膨脹，不離開訓練分布） ---
+    # 1.0=原速；0.5=半速（實體 v≤0.5m/s, ω≤1.0rad/s，接近舊 DWA）
+    # 動作上限 ×rate、感知速度/目標 ÷rate，policy 完全在訓練分布內。
+    # 可即時調：ros2 param set /rover_rl_policy speed_rate 0.5
+    # 首次上電建議 0.3~0.5，確認行為正常後再往 1.0 加。
+    speed_rate: 0.3
 
     # --- 控制週期 ---
     control_dt: 0.2                   # 5 Hz inference；訓練 dt 一致，勿改
@@ -63,8 +71,9 @@ rover_rl_policy:
 
     # --- mode ---
     # nav (跑導航) / idle (待命) / estop (急停) / manual (搖桿) / paused
-    # 首次啟動建議 idle，確認 cmd_vel 為 0、policy 推論正常後再切 nav
-    initial_mode: "idle"
+    # 預設 nav：開機即推論，但無 goal 時仍輸出 0；收到 goal 才動
+    # ⚠️ 搭配 speed_rate 低值（首次 0.3）較安全
+    initial_mode: "nav"
     base_frame: "base_footprint"
 
     # --- Goal / 定位（採 spot_rl + rover2_ws pattern） ---

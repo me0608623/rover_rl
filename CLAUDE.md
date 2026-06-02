@@ -595,6 +595,30 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
 **重要禁令**：車上 Claude **不要主動** 寫 `export_policy_onnx.py`，
 除非用戶明確要求並說明理由。
 
+## 速度/加速度參數對照：DWA（舊）vs RL（新）
+
+`deploy_full.launch.py` 用 RL policy 取代了舊的 DWA 局部規劃器。兩者速度設定差很多，
+解釋「為什麼換 RL 後車變快、轉彎手感不同」時參考此表。
+
+| 項目 | DWA（舊，已移除） | rover_rl RL（新） | 底盤實際上限 |
+|---|---|---|---|
+| 線速度 | 0.5 m/s | **1.0 m/s** | 1.5 m/s |
+| 角速度 | 0.5 rad/s | **2.0 rad/s** | **1.2 rad/s** |
+| 線加速度 | 5.0 m/s²（取樣用） | 0.5 m/s²（`act_max_linear_accel`） | 1.2 m/s² |
+| 角加速度 | 5.0 rad/s²（取樣用） | 3.0 rad/s²（`cmd_max_accel_angular` 防甩） | — |
+
+來源：
+- DWA：`campusrover_demo_launch.py:225-230`（`dwa_planner` node 參數）
+- RL：`policy_params.yaml`（`act_max_*` / `cmd_max_accel_*`）
+- 底盤：`driver_chgh.yaml`（`max_speed: 1.5` / `profile_omega_max: 1.2` / `acc_max: 1.2`）
+
+重點：
+1. **DWA 跑超保守**（0.5 / 0.5），遠低於底盤能力；學長調慢求穩。
+2. **RL 比 DWA 激進**：線速度 2 倍、角速度 4 倍（訓練分布就較快）。
+3. **角速度隱憂**：DWA 0.5 < 底盤 1.2 安全；但 **RL 2.0 > 底盤 1.2**，RL 會叫出底盤做不到的轉速
+   → 見下方 sim-to-real gap #2。DWA 沒此問題因為只到 0.5。
+4. DWA 的加速度 5.0 是「速度 pair 取樣用」，不是真的輸出 5.0 猛加速（速度本身卡在 0.5）。
+
 ## sim-to-real 已知 gap（按嚴重度排序）
 
 1. **LiDAR 高度 1.6m (訓練) vs 1.43m (實車)** — beam 角度落點不同
@@ -650,7 +674,38 @@ subscribe_once(topic="/rover_rl/lidar_sweep_72", timeout=2)
 
 # 確認 odom 頻率
 get_topic_details(topic="/odom")
+
+# 看 RealSense 彩色影像（先 subscribe 存圖，再 analyze）
+subscribe_once(topic="/camera/camera/color/image_raw",
+               msg_type="sensor_msgs/msg/Image", timeout=5, expects_image="true")
+analyze_previously_received_image()
 ```
+
+### RealSense 相機（開機自動啟動）
+
+主機 `192.168.3.13` 開機會**自動啟動** RealSense 相機，影像透過 zenoh 傳到全網。
+rover_rl 推論**不使用**此相機（policy 只吃 72-bin LiDAR sweep），相機純供
+人工/AI 視覺確認場景用。
+
+啟動指令（已設為開機自啟，列出供參考）：
+```bash
+ros2 launch realsense2_camera rs_launch.py \
+  enable_depth:=false rgb_camera.color_profile:=640,480,15
+```
+
+| Topic | Type | 說明 |
+|---|---|---|
+| `/camera/camera/color/image_raw` | `sensor_msgs/Image` | 640×480 rgb8 @ 15fps |
+| `/camera/camera/color/camera_info` | `sensor_msgs/CameraInfo` | 內參 |
+
+frame_id = `camera_color_optical_frame`。透過 ROS MCP 看畫面：
+```
+subscribe_once(topic="/camera/camera/color/image_raw",
+               msg_type="sensor_msgs/msg/Image", timeout=5, expects_image="true")
+analyze_previously_received_image()
+```
+
+⚠️ depth 預設關閉（`enable_depth:=false`）。若要點雲/深度需另開 launch 參數。
 
 ### 與 rover_rl 部署整合
 

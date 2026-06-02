@@ -357,7 +357,7 @@ def generate_launch_description():
         # ── args ──
         DeclareLaunchArgument("model_path", default_value="",
                               description="覆寫 yaml model_path"),
-        DeclareLaunchArgument("initial_mode", default_value="idle"),
+        DeclareLaunchArgument("initial_mode", default_value="nav"),
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument("preprocessor_params_file",
                               default_value=default_pre_params),

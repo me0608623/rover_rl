@@ -30,6 +30,7 @@ import numpy as np
 import rclpy
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path as NavPath
+from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import PointCloud2
@@ -70,6 +71,9 @@ class PolicyNode(Node):
             f"  模型: {self._model_path} (raw_obs={self.bundle.raw_obs_dim}, "
             f"hidden={self.bundle.hidden_dim})\n"
             f"  模式: {self.mode_mgr.mode.value} (require_ndt={self.require_ndt})\n"
+            f"  速度: speed_rate={self.speed_rate:.2f} "
+            f"(實體上限 v={self.act_params.max_linear_velocity*self.speed_rate:.2f}m/s "
+            f"ω={self.act_params.max_angular_velocity_action*self.speed_rate:.2f}rad/s)\n"
             f"  時鐘: inference {1/self.control_dt:.1f}Hz, cmd {self.cmd_rate_hz}Hz, "
             f"marker {self.marker_rate_hz}Hz"
         )
@@ -121,6 +125,9 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_linear_velocity", 1.0)
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
+        # 全域速度縮放（spot_rl 時間膨脹）：(0,1]，1.0=原速，0.5=半速
+        # 動作上限 ×rate，感知速度/目標 ÷rate → policy 留在訓練分布內
+        self.declare_parameter("speed_rate", 1.0)
         # goal / localization
         self.declare_parameter("goal_frame", "map")
         self.declare_parameter("base_frame", "base_footprint")
@@ -179,6 +186,7 @@ class PolicyNode(Node):
             max_angular_velocity_action=float(gp("act_max_angular_velocity").value),
             dt=self.control_dt,
         )
+        self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
         self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
@@ -290,6 +298,27 @@ class PolicyNode(Node):
         self.create_service(SetBool, "~/set_mode", self._srv_set_mode)
         self.create_service(Trigger, "~/load_model", self._srv_load_model)
         self.create_service(Trigger, "~/reset_hidden", self._srv_reset_hidden)
+        # 允許 ros2 param set /rover_rl_policy speed_rate 0.5 即時調整
+        self.add_on_set_parameters_callback(self._on_param_update)
+
+    def _clamp_rate(self, r: float) -> float:
+        """speed_rate 限制在 (0, 1]；超出範圍 clamp 並警告."""
+        clamped = float(np.clip(r, 0.05, 1.0))
+        if abs(clamped - r) > 1e-6:
+            self.get_logger().warn(
+                f"speed_rate={r} 超出 [0.05, 1.0]，clamp 成 {clamped}"
+            )
+        return clamped
+
+    def _on_param_update(self, params) -> SetParametersResult:
+        """即時更新 speed_rate（其他參數不在此處理）."""
+        for p in params:
+            if p.name == "speed_rate":
+                new_rate = self._clamp_rate(float(p.value))
+                old = self.speed_rate
+                self.speed_rate = new_rate
+                self.get_logger().info(f"speed_rate: {old:.2f} → {new_rate:.2f}")
+        return SetParametersResult(successful=True)
 
     # ──────────────────────────── Callbacks ────────────────────────────
 
@@ -513,18 +542,38 @@ class PolicyNode(Node):
             self.mode_mgr.set(Mode.ESTOP, reason="LiDAR < safety_estop")
             return self._set_target_stop("EMERGENCY: LiDAR 進入安全區")
 
-        # RL 推論
+        # 時間膨脹（spot_rl speed_rate）：rate<1 時把感知量放大 1/rate，
+        # 動作上限縮小 ×rate，policy 以為在原速世界 → 留在訓練分布內。
+        rate = self.speed_rate
+        inv = 1.0 / rate
+        # goal 放大後 clamp 距離上限（避免超出訓練 goal 範圍，對齊 spot 的 18m cap）
+        g_inflate_x, g_inflate_y = gx * inv, gy * inv
+        g_dist = math.hypot(g_inflate_x, g_inflate_y)
+        if g_dist > 18.0:
+            s = 18.0 / g_dist
+            g_inflate_x *= s
+            g_inflate_y *= s
+
+        # RL 推論（餵入「感知世界」的放大量）
         obs = build_obs_raw(
             self.bundle.raw_obs_dim,
-            last_accel=last_accel, linear_vel=v, angular_vel=w,
-            goal_body_x=gx, goal_body_y=gy,
+            last_accel=last_accel * inv, linear_vel=v * inv, angular_vel=w * inv,
+            goal_body_x=g_inflate_x, goal_body_y=g_inflate_y,
             lidar_sweep_72=sweep, elapsed_s=elapsed,
             params=self.obs_params,
         )
         logits = self.runner.step(obs)
+        # 動作端：上限 ×rate 縮回實體速度；current_vel 用真實 v 做積分
+        act_eff = (self.act_params if rate >= 0.999 else ActionParams(
+            num_bins=self.act_params.num_bins,
+            max_linear_velocity=self.act_params.max_linear_velocity * rate,
+            max_linear_accel=self.act_params.max_linear_accel * rate,
+            max_angular_velocity_action=self.act_params.max_angular_velocity_action * rate,
+            dt=self.act_params.dt,
+        ))
         cmd_v, cmd_w, accel = decode_logits_to_cmd(
             logits, current_linear_vel=v,
-            params=self.act_params, deterministic=self.deterministic,
+            params=act_eff, deterministic=self.deterministic,
         )
 
         with self._lock:
@@ -633,7 +682,7 @@ class PolicyNode(Node):
             f"[HB] mode={self.mode_mgr.mode.value} sweep_src={sweep_src} | "
             f"sweep_age={sweep_age:.2f}s pc_age={pc_age:.2f}s odom_age={odom_age:.2f}s "
             f"ndt={ndt_ok}(age={ndt_age:.1f}s,offset={off_str}) | "
-            f"target v={tgt_v:+.2f} w={tgt_w:+.2f}"
+            f"rate={self.speed_rate:.2f} target v={tgt_v:+.2f} w={tgt_w:+.2f}"
         )
 
 
