@@ -70,9 +70,18 @@ class PolicyRunner:
         self.hidden = torch.zeros(
             1, 1, bundle.hidden_dim, device=bundle.device, dtype=torch.float32
         )
+        # 診斷用 telemetry（不影響推論）
+        self.reset_count = 0
+        self.step_count = 0
 
     def reset(self) -> None:
         self.hidden.zero_()
+        self.reset_count += 1
+        self.step_count = 0
+
+    def hidden_norm(self) -> float:
+        """hidden state L2 norm；0=剛重置/待命，>0=episode 內累積記憶中。"""
+        return float(self.hidden.norm().item())
 
     @torch.no_grad()
     def step(self, obs_raw_np: np.ndarray) -> np.ndarray:
@@ -90,4 +99,5 @@ class PolicyRunner:
         self.hidden = new_hidden
         rl_input = torch.cat([obs79, preprocess], dim=-1)      # [1, 79+P]
         logits = b.policy(rl_input)                            # [1, 38]
+        self.step_count += 1
         return logits.squeeze(0).cpu().numpy()

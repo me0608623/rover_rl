@@ -21,6 +21,7 @@ Mode 切換：
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import threading
@@ -40,6 +41,7 @@ from visualization_msgs.msg import MarkerArray
 
 from .action_decoder import ActionParams, decode_logits_to_cmd
 from .cmd_filter import CmdFilter, CmdFilterParams
+from .latency import LagEstimator
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
 from .localization import MapOdomOffsetTracker, world_to_body
 from .markers import build_marker_array
@@ -141,6 +143,9 @@ class PolicyNode(Node):
         self.declare_parameter("cmd_alpha_angular", 0.5)
         self.declare_parameter("cmd_max_accel_linear", 1.0)
         self.declare_parameter("cmd_max_accel_angular", 3.0)
+        # 底盤實體上限（僅供診斷：判定 cmd 是否超出底盤能力，見 CLAUDE.md gap #2）
+        self.declare_parameter("chassis_v_max", 1.5)
+        self.declare_parameter("chassis_omega_max", 1.2)
         # initial mode
         self.declare_parameter("initial_mode", "nav")
 
@@ -242,6 +247,12 @@ class PolicyNode(Node):
         self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
         self.subgoals = SubgoalSelector(lookahead_m=self.path_lookahead)
         self.cmd_filter = CmdFilter(self.cmd_filter_params)
+        # 延遲估計（送出 cmd ↔ odom 實測），線速度/角速度各一
+        _cmd_dt = 1.0 / max(self.cmd_rate_hz, 1.0)
+        self.lag_v = LagEstimator(_cmd_dt)
+        self.lag_w = LagEstimator(_cmd_dt)
+        self.chassis_v_max = float(self.get_parameter("chassis_v_max").value)
+        self.chassis_omega_max = float(self.get_parameter("chassis_omega_max").value)
         try:
             initial = Mode.parse(self._initial_mode)
         except ValueError:
@@ -283,6 +294,8 @@ class PolicyNode(Node):
             self.create_publisher(Float32MultiArray, self.topic_obs_debug, 10)
             if self.publish_obs_debug else None
         )
+        # 供 TUI 儀表板訂閱的精簡狀態（JSON String），與 log 解耦
+        self.pub_status = self.create_publisher(String, "~/status", 10)
 
     def _init_timers(self) -> None:
         self.timer_infer = self.create_timer(self.control_dt, self._tick_inference)
@@ -292,6 +305,7 @@ class PolicyNode(Node):
                 1.0 / max(self.marker_rate_hz, 1.0), self._tick_marker,
             )
         self.timer_heartbeat = self.create_timer(2.0, self._tick_heartbeat)
+        self.timer_status = self.create_timer(0.2, self._publish_status)
         self._cmd_last_t = time.monotonic()
 
     def _init_services(self) -> None:
@@ -626,6 +640,12 @@ class PolicyNode(Node):
         msg.angular.z = out_w
         self.pub_cmd.publish(msg)
 
+        # 餵延遲估計：送出 cmd vs 底盤實測（odom twist）
+        with self._lock:
+            act_v, act_w = self._odom_v, self._odom_w
+        self.lag_v.push(out_v, act_v)
+        self.lag_w.push(out_w, act_w)
+
     # ──────────────────────────── Timer: markers (10 Hz) ────────────────────────────
 
     def _tick_marker(self) -> None:
@@ -659,6 +679,110 @@ class PolicyNode(Node):
         self.pub_markers.publish(marr)
 
     # ──────────────────────────── Heartbeat (0.5 Hz) ────────────────────────────
+
+    def _sweep_to_meters(self, sweep_norm) -> "np.ndarray | None":
+        """正規化 sweep [0,1] → 實際距離 (m)；1.0=無回波/>=r_max。"""
+        if sweep_norm is None or len(sweep_norm) == 0:
+            return None
+        r_robot = self.obs_params.robot_radius
+        return np.asarray(sweep_norm, dtype=np.float32) * (self.lidar_r_max - r_robot) + r_robot
+
+    def _publish_status(self) -> None:
+        """以 ~5 Hz 發布精簡狀態 JSON，供 status_tui 儀表板渲染（不影響推論）。"""
+        now = time.monotonic()
+        with self._lock:
+            # 用 _latest_sweep（topic 收到即有，idle 也更新），非僅推論時的 _last_sweep
+            sweep = self._latest_sweep
+            sweep_age = (now - self._latest_sweep_t
+                         if self._latest_sweep is not None else float("inf"))
+            odom_age = now - self._odom_t if self._odom_t else float("inf")
+            tgt_v = self._target_v
+            tgt_w = self._target_w
+            sweep_src = self._sweep_source
+            subgoal = self._last_subgoal_body
+            subgoal_src = self._last_subgoal_source
+            odom_x, odom_y = self._odom_xy
+            odom_yaw = self._odom_yaw
+            rl_v, rl_w = tgt_v, tgt_w
+            act_v, act_w = self._odom_v, self._odom_w
+            sent_v = self.cmd_filter._last_v
+            sent_w = self.cmd_filter._last_w
+
+        # sweep → 公尺；最近距離 + 四向扇區（bin: 36=前 54=左 18=右 0=後，每 bin 5°）
+        nearest_m = front_m = back_m = left_m = right_m = None
+        meters = self._sweep_to_meters(sweep)
+        if meters is not None and len(meters) == 72:
+            def _sec(idxs):
+                v = float(np.min(meters[idxs]))
+                return round(v, 2)
+            nearest_m = round(float(np.min(meters)), 2)
+            front_m = _sec(np.r_[28:45])
+            left_m = _sec(np.r_[46:63])
+            back_m = _sec(np.r_[64:72, 0:10])
+            right_m = _sec(np.r_[10:27])
+
+        # 機器人在 map frame 位姿（含來源：odom+offset / ndt_direct / odom_only）
+        rp = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
+
+        off = self.localizer.offset
+        yoff = self.localizer.yaw_offset
+        goal_dist = goal_ang = None
+        if subgoal is not None:
+            goal_dist = math.hypot(subgoal[0], subgoal[1])
+            goal_ang = math.degrees(math.atan2(subgoal[1], subgoal[0]))
+
+        # 延遲：取線/角通道中相關係數較高者回報
+        lag_v_s, corr_v = self.lag_v.estimate()
+        lag_w_s, corr_w = self.lag_w.estimate()
+        lag_ms = lag_corr = lag_ch = None
+        cand = [(corr_v, lag_v_s, "v"), (corr_w, lag_w_s, "w")]
+        cand = [c for c in cand if c[0] is not None]
+        if cand:
+            corr, lag_s, ch = max(cand, key=lambda c: c[0])
+            lag_ms = round(lag_s * 1000.0)
+            lag_corr = round(corr, 2)
+            lag_ch = ch
+
+        status = {
+            "mode": self.mode_mgr.mode.value,
+            "cmd_v": round(tgt_v, 3),
+            "cmd_w": round(tgt_w, 3),
+            "speed_rate": round(self.speed_rate, 2),
+            # 三層速度：RL 想要 → 送出底盤 → 底盤實測
+            "rl_v": round(rl_v, 3), "rl_w": round(rl_w, 3),
+            "sent_v": round(sent_v, 3), "sent_w": round(sent_w, 3),
+            "act_v": round(act_v, 3), "act_w": round(act_w, 3),
+            # cmd 是否超出底盤實體上限（飽和 → 底盤做不到）
+            "v_over": bool(abs(sent_v) > self.chassis_v_max * 0.99),
+            "w_over": bool(abs(sent_w) > self.chassis_omega_max * 0.99),
+            "chassis_v_max": self.chassis_v_max,
+            "chassis_w_max": self.chassis_omega_max,
+            # 延遲（送出 cmd ↔ 實測）
+            "lag_ms": lag_ms, "lag_corr": lag_corr, "lag_ch": lag_ch,
+            # RNN hidden state（episode 內記憶）
+            "rnn_norm": round(self.runner.hidden_norm(), 2),
+            "rnn_steps": self.runner.step_count,
+            "rnn_resets": self.runner.reset_count,
+            "lidar_age": round(sweep_age, 3) if sweep_age != float("inf") else None,
+            "lidar_src": sweep_src,
+            "nearest_m": nearest_m,
+            "front_m": front_m, "back_m": back_m, "left_m": left_m, "right_m": right_m,
+            "odom_age": round(odom_age, 3) if odom_age != float("inf") else None,
+            "ndt_age": round(self.localizer.ndt_age_s, 2),
+            "ndt_ok": bool(self.localizer.is_ndt_stable()),
+            "pose_x": round(rp.x, 2), "pose_y": round(rp.y, 2),
+            "pose_yaw_deg": round(math.degrees(rp.yaw), 1), "pose_src": rp.source,
+            "off_x": round(off[0], 2) if off else None,
+            "off_y": round(off[1], 2) if off else None,
+            "off_yaw_deg": round(math.degrees(yoff), 1) if yoff is not None else None,
+            "goal_dist": round(goal_dist, 2) if goal_dist is not None else None,
+            "goal_ang_deg": round(goal_ang, 1) if goal_ang is not None else None,
+            "goal_src": subgoal_src,
+            "model": os.path.basename(self._model_path) if self._model_path else None,
+        }
+        msg = String()
+        msg.data = json.dumps(status)
+        self.pub_status.publish(msg)
 
     def _tick_heartbeat(self) -> None:
         now = time.monotonic()

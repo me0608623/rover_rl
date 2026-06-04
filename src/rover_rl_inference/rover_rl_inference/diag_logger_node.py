@@ -72,6 +72,9 @@ CSV_FIELDS = [
     "policy_goal_bx", "policy_goal_by", "policy_goal_ang_deg",
     "policy_v_norm", "policy_w_norm", "obs_age",
     "sweep_min_m", "sweep_age",
+    # 三層速度 + 延遲（來自 /rover_rl_policy/status）
+    "rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
+    "v_over", "w_over", "lag_ms", "lag_corr", "lag_ch",
 ]
 
 
@@ -124,6 +127,7 @@ class DiagLoggerNode(Node):
         self.declare_parameter("topic_obs_debug", "/rover_rl_policy/obs_debug")
         self.declare_parameter("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("topic_record_ctrl", "/rover_rl/record")
+        self.declare_parameter("topic_status", "/rover_rl_policy/status")
         # 開錄時抓此節點的全部參數（speed_rate 等）寫進 sidecar + wandb config
         self.declare_parameter("policy_node_name", "rover_rl_policy")
         self.declare_parameter("lidar_r_max_m", 20.0)
@@ -150,6 +154,7 @@ class DiagLoggerNode(Node):
         self.topic_obs = sv("topic_obs_debug")
         self.topic_sweep = sv("topic_lidar_sweep")
         self.topic_ctrl = sv("topic_record_ctrl")
+        self.topic_status = sv("topic_status")
         self.policy_node_name = sv("policy_node_name")
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
@@ -169,6 +174,7 @@ class DiagLoggerNode(Node):
         self._cmd = None
         self._obs = None
         self._sweep_min = None
+        self._status = None        # dict（三層速度 + 延遲）
         # 實驗 / 檔案
         self._started = False
         self._fh = None
@@ -207,6 +213,7 @@ class DiagLoggerNode(Node):
         self.create_subscription(Float32MultiArray, self.topic_obs, self._cb_obs, 10)
         self.create_subscription(Float32MultiArray, self.topic_sweep, self._cb_sweep, be)
         self.create_subscription(String, self.topic_ctrl, self._cb_ctrl, 10)
+        self.create_subscription(String, self.topic_status, self._cb_status, 10)
 
     # ── 實驗開關 ──
     def start_experiment(self, label: str) -> None:
@@ -356,6 +363,12 @@ class DiagLoggerNode(Node):
         else:
             self.get_logger().warn(f"未知 record 指令: {msg.data!r}（用 start / stop）")
 
+    def _cb_status(self, msg: String) -> None:
+        try:
+            self._status = json.loads(msg.data)
+        except (ValueError, TypeError):
+            pass
+
     # ── callbacks ──
     def _cb_odom(self, msg: Odometry) -> None:
         p = msg.pose.pose.position
@@ -485,6 +498,16 @@ class DiagLoggerNode(Node):
             row["sweep_min_m"] = f"{sm:.3f}"
             row["sweep_age"] = f"{now - st:.2f}"
 
+        st = self._status
+        if st is not None:
+            for k in ("rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
+                      "lag_ms", "lag_corr", "lag_ch"):
+                v = st.get(k)
+                if v is not None:
+                    row[k] = v
+            row["v_over"] = int(bool(st.get("v_over")))
+            row["w_over"] = int(bool(st.get("w_over")))
+
         self._writer.writerow(row)
         self._n_rows += 1
         if self._n_rows % 20 == 0:
@@ -492,7 +515,7 @@ class DiagLoggerNode(Node):
 
         if self.wandb_run is not None:
             metrics = {k: float(v) for k, v in row.items()
-                       if v != "" and k not in ("goal_frame", "t_wall")}
+                       if v != "" and k not in ("goal_frame", "t_wall", "lag_ch")}
             self.wandb.log(metrics)
 
     # ── 摘要 ──

@@ -350,15 +350,19 @@ ros2 run tf2_ros tf2_echo map base_footprint
 `.bashrc` 已有現成 alias，包含完整 source 順序與環境設定：
 
 ```bash
-deploy_rl
-# 等同：
-# source /opt/ros/humble/setup.bash
-# source ~/rover2_ws/install/setup.bash
-# source ~/rover_rl/install/setup.bash
-# export ROS_DOMAIN_ID=55
-# export RMW_IMPLEMENTATION=rmw_zenoh_cpp
-# ros2 launch rover_rl_bringup deploy_full.launch.py
+deploy_rl            # 完整棧 + 同終端機前景顯示繁中 TUI 儀表板，按 q 離開即自動收棧
+deploy_rl initial_mode:=nav   # 參數原樣轉給 launch
+deploy_rl_raw        # 舊行為：純 launch、滾動 log、無 UI（需看完整即時 log 時用）
+deploy_rl_stop       # 停止整個棧
 ```
+
+`deploy_rl` → `bash ~/rover_rl/deploy_rl_ui.sh`，內部流程：
+1. source ROS/rover2_ws/rover_rl + `ROS_DOMAIN_ID=55` + `RMW=rmw_zenoh_cpp`
+2. `ros2 launch ... deploy_full.launch.py` 丟**背景**，stdout/stderr 導到 `~/rover_rl/logs/deploy_<時間>.log`（保持畫面乾淨）
+3. 等 `rover_rl_policy` 節點起來後，前景跑 `ros2 run rover_rl_inference status_tui`（curses 取得真實 TTY）
+4. 按 `q` 或 Ctrl+C → trap 自動呼叫 `rover_rl_stop.sh` 收掉整個棧
+
+**為何不把 TUI 放進 launch**：launch 子行程無 TTY，curses 會崩；故採「launch 背景 + TUI 前景」分離。
 
 ⚠️ 直接用這個 alias，不要手動拼環境指令。
 
@@ -497,6 +501,44 @@ ros2 run rover_rl_inference routing_click_bridge
   （`<實驗名>` 來自 start 時給的 label，經 `_safe_label()` 清特殊字元；不給就只有時間戳）
 - **Ctrl+C 後**: 自動印「診斷摘要 + CSV 完整路徑 + analyze_diag 指令」
 - **分析**: `ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag_<...>.csv`
+
+### status_tui（即時狀態儀表板，繁中 TUI）
+- **Executable**: `status_tui`
+- **職責**: 訂閱 policy_node 發布的精簡狀態（`/rover_rl_policy/status`, std_msgs/String 內含 JSON），
+  用 curses 畫成乾淨方框儀表板即時刷新。**純訂閱純渲染，不影響推論**。
+- **解決痛點**: `deploy_full` 一次拉起十幾個節點、log 全擠同一 terminal 難觀察 → 此節點獨立一個
+  terminal 跑，模式 / cmd_vel / LiDAR 最近距離 / 里程計 / NDT / goal 方向一目了然。
+- **顏色**: 綠=正常、黃=注意（idle/paused/NDT 未穩）、紅=危險（estop/逾時/障礙過近）。
+- **資料來源**: policy_node 以 5 Hz 發 `~/status`；TUI 收不到 >1.5s 顯示「等待 policy_node…」。
+- **預設啟動方式**：`deploy_rl` 已自動帶起（launch 背景化 + 此 TUI 前景，見「deploy_rl alias」）。
+- **單獨啟動**（接已在跑的棧）:
+  ```bash
+  source ~/rover_rl/install/setup.bash && source ~/rover_rl/setup_env.sh
+  ros2 run rover_rl_inference status_tui      # 按 q 離開
+  ```
+- **不放進 launch 檔**：launch 子行程無 TTY，curses 會崩；改由 `deploy_rl_ui.sh` 前景啟動。
+- **三層速度對比**：儀表板「速度v / 速度ω」列同框顯示
+  `想{RL意圖} 送{濾波後送底盤} 實{odom實測}`；角速度超出底盤 `chassis_omega_max`（預設 1.2）時
+  標 `⚠超1.2`（對應 gap #2）；底盤實測明顯跟不上送出值時轉黃（飽和/deadband/延遲）。
+- **延遲量測**：`latency.py` 的 `LagEstimator` 以滑窗正規化互相關估「送出 cmd → odom 實測」的
+  時間落差（線/角通道各一，取相關係數高者）。儀表板「延遲」列顯示 `XXXms (相關 r, 通道)`；
+  >200ms 轉黃、>400ms 或相關低轉紅（對應 gap #5 振盪風險）。站著不動訊號太平 → 顯示「需移動中」。
+- **RNN 狀態**：`PolicyRunner` 記 `reset_count/step_count` + `hidden_norm()`（hidden L2 範數）。
+  儀表板「RNN」列顯示 `‖h‖=X 本段步數 N 重置 M 次`；hidden 歸零（idle/剛 reset）→ 灰字「待命/已重置」。
+  每收新 goal/path、切模式、換模型都會 reset hidden（episode 記憶重來）。
+- **LV-DOT 動態障礙**：儀表板「動態」列**直接訂閱** `/onboard_detector/dynamic_bboxes`（MarkerArray，
+  與 policy 解耦，policy 推論不吃此資料、obs 障礙欄仍補 0）。顯示動態障礙框數；未啟動→灰、
+  >2s 無更新→黃「偵測器可能死」、0 個→綠。topic 可用 `topic_dynamic_bboxes` 參數改。
+
+### 速度/延遲離線分析（diag_logger + analyze_diag）
+- `diag_logger` 已加訂閱 `/rover_rl_policy/status`，CSV 多記 `rl_v/rl_w`（RL 意圖）、
+  `sent_v/sent_w`（送出）、`act_v/act_w`（實測）、`v_over/w_over`（飽和旗標）、`lag_ms/lag_corr`。
+- `analyze_diag` 多出兩段報告：
+  - **【速度三層對比】**：各通道 想要→送出→實測 平均值 + 底盤跟隨率（<60% 警示飽和/deadband）
+  - **【延遲】**：整段離線互相關估計（較穩）+ 即時 lag_ms 摘要，附 >200ms/>300ms 判讀
+  ```bash
+  ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag_<...>.csv
+  ```
 
 ## 故障排除清單
 

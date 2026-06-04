@@ -27,6 +27,7 @@ setup(
             "routing_click_bridge = rover_rl_inference.routing_click_bridge:main",
             "diag_logger = rover_rl_inference.diag_logger_node:main",
             "analyze_diag = rover_rl_inference.analyze_diag:main",
+            "status_tui = rover_rl_inference.status_tui_node:main",
         ],
     },
 )

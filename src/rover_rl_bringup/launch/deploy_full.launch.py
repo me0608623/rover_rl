@@ -354,6 +354,25 @@ def generate_launch_description():
         condition=IfCondition(LaunchConfiguration("enable_diag")),
     )
 
+    # ── Part 10: LV-DOT 動態障礙物偵測（LiDAR+depth 融合，發 map frame markers）──
+    lvdot_pkg = get_package_share_directory("onboard_detector")
+    lvdot_params = os.path.join(lvdot_pkg, "cfg", "detector_param.yaml")
+    lvdot_detector_node = Node(
+        package="onboard_detector",
+        executable="detector_node",
+        name="dynamic_detector",
+        output="screen",
+        parameters=[lvdot_params],
+        condition=IfCondition(LaunchConfiguration("enable_lvdot")),
+    )
+    lvdot_yolo_node = Node(
+        package="onboard_detector",
+        executable="yolov11_detector_node.py",
+        name="yolov11_detector_node",
+        output="screen",
+        condition=IfCondition(LaunchConfiguration("enable_lvdot_yolo")),
+    )
+
     # ── Banner ──
     banner = LogInfo(msg=(
         "================================\n"
@@ -370,6 +389,7 @@ def generate_launch_description():
         "    [7] lidar_preprocessor\n"
         "    [8] policy_node\n"
         "    [9] bev_play\n"
+        "    [10] LV-DOT 動態偵測 (/onboard_detector/*)\n"
         "  排除: DWA + AIT* (由 RL policy + routing 取代)\n"
         "================================"
     ))
@@ -396,6 +416,10 @@ def generate_launch_description():
                               description="診斷記錄同步上 wandb（run 名=diag_日期_時間）"),
         DeclareLaunchArgument("wandb_mode", default_value="offline",
                               description="wandb 模式：offline(實車建議，回頭 wandb sync)/online/disabled"),
+        DeclareLaunchArgument("enable_lvdot", default_value="true",
+                              description="LV-DOT 動態障礙物偵測（→ /onboard_detector/*）"),
+        DeclareLaunchArgument("enable_lvdot_yolo", default_value="false",
+                              description="LV-DOT YOLOv11 視覺輔助（需 ultralytics，預設關）"),
         DeclareLaunchArgument("map_file",
                               default_value="/home/aa/maps/4v3F.yaml"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -430,4 +454,8 @@ def generate_launch_description():
         policy_node,
         bev_play_node,
         diag_logger_node,
+
+        # LV-DOT 動態障礙物偵測
+        lvdot_detector_node,
+        lvdot_yolo_node,
     ])

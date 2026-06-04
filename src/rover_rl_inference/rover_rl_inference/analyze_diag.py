@@ -48,8 +48,9 @@ def _stats(xs):
     n = len(xs)
     mean = sum(xs) / n
     var = sum((x - mean) ** 2 for x in xs) / n
+    median = sorted(xs)[n // 2]
     return {"n": n, "mean": mean, "std": math.sqrt(var),
-            "min": min(xs), "max": max(xs)}
+            "min": min(xs), "max": max(xs), "median": median}
 
 
 def _print_params(csv_path: str) -> None:
@@ -78,6 +79,89 @@ def _print_params(csv_path: str) -> None:
         print(f"  (另有 {len(extra)} 項：{', '.join(extra[:8])}{' …' if len(extra) > 8 else ''})")
 
 
+def _xcorr_lag(t, sent, act, max_lag_s=1.0, min_std=0.04):
+    """離線互相關估 sent→act 延遲。回傳 (lag_s, corr) 或 (None, None)。"""
+    pairs = [(s, a) for s, a in zip(sent, act) if s is not None and a is not None]
+    if len(pairs) < 30:
+        return None, None
+    import statistics
+    s = [p[0] for p in pairs]
+    a = [p[1] for p in pairs]
+    ts = [x for x in t if x is not None]
+    dt = (ts[-1] - ts[0]) / max(len(ts) - 1, 1) if len(ts) >= 2 else 0.05
+    sd_s = statistics.pstdev(s)
+    sd_a = statistics.pstdev(a)
+    if sd_s < min_std or sd_a < min_std:
+        return None, None
+    ms, ma = statistics.fmean(s), statistics.fmean(a)
+    sn = [(x - ms) / sd_s for x in s]
+    an = [(x - ma) / sd_a for x in a]
+    n = len(sn)
+    max_k = max(int(max_lag_s / dt), 1)
+    best_k, best_c = 0, -2.0
+    for k in range(0, max_k + 1):
+        if n - k <= 5:
+            break
+        c = sum(sn[i] * an[i + k] for i in range(n - k)) / (n - k)
+        if c > best_c:
+            best_c, best_k = c, k
+    return best_k * dt, best_c
+
+
+def _print_speed_tracking(rl_w, sent_w, act_w, rl_v, sent_v, act_v) -> None:
+    print("【速度三層對比】RL想要 → 送出底盤 → 底盤實測")
+
+    def _avg_abs(xs):
+        v = [abs(x) for x in xs if x is not None]
+        return sum(v) / len(v) if v else None
+
+    for name, rl, sent, act, unit in (
+        ("ω", rl_w, sent_w, act_w, "rad/s"),
+        ("v", rl_v, sent_v, act_v, "m/s"),
+    ):
+        a_rl, a_sent, a_act = _avg_abs(rl), _avg_abs(sent), _avg_abs(act)
+        if a_sent is None or a_act is None:
+            continue
+        # 濾波損失：RL想要 vs 送出；底盤跟隨：送出 vs 實測
+        track = a_act / a_sent if a_sent > 1e-3 else float("nan")
+        line = (f"  |{name}| 想要={_o(a_rl)} 送出={a_sent:.3f} 實測={a_act:.3f} {unit}"
+                f"   底盤跟隨率={track:.0%}")
+        print(line)
+        if a_sent > 0.1 and track < 0.6:
+            print(f"    ⚠ 底盤實測僅達送出 {track:.0%} → 飽和/deadband/延遲（見 CLAUDE.md gap #2/#6）")
+
+
+def _print_latency(t, sent_w, act_w, sent_v, act_v, lag_ms, lag_corr) -> None:
+    print("【延遲（送出 cmd → 底盤實測）】")
+    # 1) 離線整段互相關（較穩）
+    best = None
+    for ch, sent, act in (("角速ω", sent_w, act_w), ("線速v", sent_v, act_v)):
+        lag_s, corr = _xcorr_lag(t, sent, act)
+        if corr is None:
+            continue
+        if best is None or corr > best[2]:
+            best = (ch, lag_s, corr)
+    if best is None:
+        print("  訊號太平穩（多在原地）→ 無法估延遲；請在移動中重錄一段")
+    else:
+        ch, lag_s, corr = best
+        ms = lag_s * 1000.0
+        verdict = ("✓ 可忽略" if ms <= 100 else
+                   "△ 注意（>200ms 易振盪）" if ms <= 300 else
+                   "⚠ 偏大，建議加大 cmd_alpha_linear 濾波或評估 cmd_delay 補償")
+        print(f"  整段互相關估計 = {ms:.0f} ms  (相關 {corr:.2f}, {ch}通道)  {verdict}")
+    # 2) 即時 lag_ms 欄位摘要（policy_node 滑窗估計）
+    live = [x for x in lag_ms if x is not None]
+    if live:
+        st = _stats(live)
+        print(f"  即時估計 lag_ms: 平均 {st['mean']:.0f} / 中位 {st['median']:.0f} / "
+              f"max {st['max']:.0f} ms（共 {len(live)} 筆）")
+
+
+def _o(x):
+    return f"{x:.3f}" if x is not None else "—"
+
+
 def analyze(path: str) -> None:
     rows = _load(path)
     if not rows:
@@ -91,6 +175,15 @@ def analyze(path: str) -> None:
     heading = _col(rows, "heading_err_deg")
     dist = _col(rows, "dist_to_goal")
     pol_ang = _col(rows, "policy_goal_ang_deg")
+    # 三層速度 + 延遲
+    rl_w = _col(rows, "rl_w")
+    sent_w = _col(rows, "sent_w")
+    act_w = _col(rows, "act_w")
+    rl_v = _col(rows, "rl_v")
+    sent_v = _col(rows, "sent_v")
+    act_v = _col(rows, "act_v")
+    lag_ms = _col(rows, "lag_ms")
+    lag_corr = _col(rows, "lag_corr")
 
     # Δω（相鄰列）
     dws = [b - a for a, b in zip(cmd_w, cmd_w[1:])
@@ -147,6 +240,10 @@ def analyze(path: str) -> None:
         consistent = "✓ 一致" if diff_st['mean'] < 15 else "✗ 不一致(疑 TF/座標問題)"
         print(f"  |heading - policy_goal_ang| 平均 = {diff_st['mean']:.1f}°  "
               f"{consistent}")
+    print("-" * 60)
+    _print_speed_tracking(rl_w, sent_w, act_w, rl_v, sent_v, act_v)
+    print("-" * 60)
+    _print_latency(t, sent_w, act_w, sent_v, act_v, lag_ms, lag_corr)
     print("=" * 60)
 
     _maybe_plot(path, t, cmd_w, cmd_v, odom_w, heading, dist, pol_ang)
