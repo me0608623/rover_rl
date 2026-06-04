@@ -8,16 +8,25 @@
   - markers                            : RViz MarkerArray debug
   - lidar_preprocess.lidar_sweep_72_real (+ motion compensation)
 
-Timer 結構：
+Timer 結構（採 spot_rl 多 timer pattern，刻意把推論與發布解耦）：
   - inference_timer (5 Hz):  RL 推論 → 更新 target cmd
+      推論週期鎖 5 Hz（dt=0.2s）是訓練值，動作分布綁在此頻率上，勿改。
   - cmd_timer (20 Hz):       low-pass/slew filter → 發 cmd_vel
-  - marker_timer (10 Hz):    發 RViz markers
+      cmd 要 20 Hz republish 是為了餵飽底盤 / cmd_vel mux 的 watchdog；
+      即使某次推論延遲，cmd timer 仍以 last_target + filter 持續出流不斷檔。
+  - marker_timer (10 Hz):    發 RViz markers（純除錯視覺，10 Hz 對人眼夠用又省 CPU）
   - heartbeat_timer (1 Hz):  log 狀態
 
 Mode 切換：
   - 訂閱 `~/mode` (std_msgs/String): "nav" / "idle" / "estop" / "manual" / "paused"
   - 服務 `~/set_mode` (std_srvs/SetBool): true=nav, false=idle
   - 服務 `~/load_model` (std_srvs/Trigger): 重載 model_path 指向的 .ts
+
+sim-to-real 核心對策（細節見 rover_rl/CLAUDE.md）：
+  - speed_rate 時間膨脹：rate<1 時把感知量放大 1/rate、動作上限縮 ×rate，
+    讓 policy 自以為仍在訓練的原速世界 → 不離開訓練分布。
+  - NDT 定位走 cached map→odom offset（非直接 TF lookup），NDT 短暫消失仍可跑。
+  - LiDAR / odom 皆有 timeout watchdog，逾時即強制 cmd=0（fail-safe）。
 """
 from __future__ import annotations
 
@@ -34,6 +43,8 @@ from nav_msgs.msg import Odometry, Path as NavPath
 from rcl_interfaces.msg import SetParametersResult
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.time import Time
+from tf2_ros import Buffer, TransformException, TransformListener
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Float32MultiArray, String
 from std_srvs.srv import SetBool, Trigger
@@ -43,7 +54,7 @@ from .action_decoder import ActionParams, decode_logits_to_cmd
 from .cmd_filter import CmdFilter, CmdFilterParams
 from .latency import LagEstimator
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
-from .localization import MapOdomOffsetTracker, world_to_body
+from .localization import MapOdomOffsetTracker, RobotPose, world_to_body
 from .markers import build_marker_array
 from .mode_manager import Mode, ModeManager
 from .model_runtime import PolicyRunner, load_bundle
@@ -52,12 +63,19 @@ from .subgoal_selector import SubgoalSelector
 
 
 def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
+    # 只取 yaw（平面機器人不需 roll/pitch），避免引入 tf_transformations 額外依賴
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 class PolicyNode(Node):
+    """RL 推論主節點：sweep → obs → RNN → cmd_vel，外加多 mode / subgoal / NDT 定位。
+
+    初始化順序刻意固定：先讀參數 → 載模型（失敗即早 raise，不啟空節點）→
+    建狀態與元件 → 再建 pub/sub 與 timer（確保 callback 觸發時依賴已就緒）。
+    """
+
     def __init__(self):
         super().__init__("rover_rl_policy")
         self._declare_params()
@@ -118,12 +136,16 @@ class PolicyNode(Node):
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("lidar_motion_compensation", True)
         # obs normalizer (與訓練端對齊)
+        # 這幾個 max_* 是 obs 正規化的分母，必須跟訓練端 obs_functions.py 完全一致；
+        # 不一致 → policy 看到的數值尺度錯位，車會原地震/亂走（sim-to-real mismatch）。
         self.declare_parameter("obs_max_acceleration", 1.0)
         self.declare_parameter("obs_max_linear_velocity", 1.0)
         self.declare_parameter("obs_max_angular_velocity", 1.5)
         self.declare_parameter("robot_radius_m", 0.35)
         self.declare_parameter("episode_horizon_s", 60.0)
         # action limits (鎖在訓練分布)
+        # 即使底盤實體更強也不要把這些往上開：policy 沒在更高速分布訓練過，
+        # extrapolate 會行為不可預測（見 CLAUDE.md「動作上限勿改」）。
         self.declare_parameter("act_max_linear_velocity", 1.0)
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
@@ -209,6 +231,7 @@ class PolicyNode(Node):
     # ──────────────────────────── 模型載入 ────────────────────────────
 
     def _load_model(self) -> None:
+        # 模型路徑無效就直接 raise：寧可啟動失敗，也不要起一個發不出 cmd 的空節點
         if not self._model_path or not os.path.isfile(self._model_path):
             raise RuntimeError(
                 f"model_path 無效: {self._model_path!r}。"
@@ -220,6 +243,8 @@ class PolicyNode(Node):
     # ──────────────────────────── 狀態與元件 ────────────────────────────
 
     def _init_state(self) -> None:
+        # 所有 sensor cache / target cmd 都跨 timer 與 callback 執行緒共享，
+        # rclpy callback 可能在不同 thread 觸發 → 一律用 self._lock 保護讀寫
         self._lock = threading.Lock()
         # sensor cache
         self._latest_sweep: np.ndarray | None = None
@@ -235,6 +260,8 @@ class PolicyNode(Node):
         self._last_accel = 0.0
         self._start_t = time.monotonic()
         # 上次 policy 推論的「目標 cmd」（給 cmd timer 取用）
+        # 推論(5Hz)與發布(20Hz)解耦的關鍵橋樑：inference 只寫這組目標值，
+        # cmd timer 讀它做 filter 後送出，兩端頻率互不阻塞
         self._target_v = 0.0
         self._target_w = 0.0
         self._target_set_t = 0.0
@@ -243,7 +270,12 @@ class PolicyNode(Node):
         # 上次 subgoal（給 marker 用）
         self._last_subgoal_body: tuple[float, float] | None = None
         self._last_subgoal_source: str | None = None
+        # map→odom 的 child frame（NDT 發布此段）；_cb_odom 會以實際 frame_id 更新
+        self.odom_frame = "odom"
         # 元件
+        # 註：localizer 現僅用於「NDT 是否活著且收斂」的判定（is_ndt_stable / ndt_age，
+        # 基於 /ndt_pose 訊息到達時間）。機器人 map 位姿改由 _robot_pose_in_map 走 TF 取得，
+        # 因為此部署的 ndt_localizer 發的 /ndt_pose 是 map→odom 變換、不是車姿（見下方註解）。
         self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
         self.subgoals = SubgoalSelector(lookahead_m=self.path_lookahead)
         self.cmd_filter = CmdFilter(self.cmd_filter_params)
@@ -263,6 +295,8 @@ class PolicyNode(Node):
     # ──────────────────────────── ROS 介面 ────────────────────────────
 
     def _init_pubsub(self) -> None:
+        # LiDAR 走 BEST_EFFORT + VOLATILE：感測資料寧可丟舊幀也不要塞滿佇列阻塞，
+        # 且大多數 LiDAR driver（velodyne）發布端就是 BEST_EFFORT，QoS 不相容會收不到
         sensor_qos = QoSProfile(
             reliability=(QoSReliabilityPolicy.BEST_EFFORT
                          if self.lidar_qos_be else QoSReliabilityPolicy.RELIABLE),
@@ -297,7 +331,15 @@ class PolicyNode(Node):
         # 供 TUI 儀表板訂閱的精簡狀態（JSON String），與 log 解耦
         self.pub_status = self.create_publisher(String, "~/status", 10)
 
+        # TF2：以 map→base_frame 取機器人真實 map 位姿（與 RViz 顯示同一條鏈）。
+        # 此部署的 ndt_localizer 發的 /ndt_pose 內容是 map→odom 變換、不是車姿，直接拿來
+        # 當車姿會差一個 odom→base（車離 odom 原點越遠差越多）。改由 tf2 正確合成
+        # map→odom(NDT) ∘ odom→base(底盤)。
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
     def _init_timers(self) -> None:
+        # 多 timer 分頻：推論(control_dt)/發布(cmd_rate)/marker/heartbeat/status 各跑各的
         self.timer_infer = self.create_timer(self.control_dt, self._tick_inference)
         self.timer_cmd = self.create_timer(1.0 / max(self.cmd_rate_hz, 1.0), self._tick_cmd)
         if self.publish_markers:
@@ -325,7 +367,11 @@ class PolicyNode(Node):
         return clamped
 
     def _on_param_update(self, params) -> SetParametersResult:
-        """即時更新 speed_rate（其他參數不在此處理）."""
+        """即時更新 speed_rate（其他參數不在此處理）.
+
+        只攔 speed_rate 是因為它是少數能在跑動中安全熱調的旋鈕（時間膨脹，不離分布）；
+        動作上限 / obs normalizer 改了會破壞 sim-to-real 對齊，故不在此開放熱改。
+        """
         for p in params:
             if p.name == "speed_rate":
                 new_rate = self._clamp_rate(float(p.value))
@@ -364,6 +410,8 @@ class PolicyNode(Node):
         q = msg.pose.pose.orientation
         tw = msg.twist.twist
         yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
+        if msg.header.frame_id:
+            self.odom_frame = msg.header.frame_id
         with self._lock:
             self._odom_xy = (p.x, p.y)
             self._odom_yaw = yaw
@@ -372,6 +420,8 @@ class PolicyNode(Node):
             self._odom_t = time.monotonic()
 
     def _cb_goal(self, msg: PoseStamped) -> None:
+        # 新目標 = 新 episode：reset RNN hidden（清掉上一段的記憶）與 cmd filter，
+        # 並重置 elapsed 計時（episode_horizon 從 0 起算），對齊訓練時每 episode 的初始狀態
         frame = msg.header.frame_id or self.goal_frame
         self.subgoals.set_single_goal(msg.pose.position.x, msg.pose.position.y, frame)
         self.runner.reset()
@@ -382,13 +432,14 @@ class PolicyNode(Node):
             f"收到 goal_pose frame={frame} ({msg.pose.position.x:.2f},{msg.pose.position.y:.2f})"
         )
 
-    def _cb_path(self, msg: Path) -> None:
+    def _cb_path(self, msg: NavPath) -> None:
         if not msg.poses:
             self.subgoals.clear_path()
             return
         frame = msg.header.frame_id or self.goal_frame
         pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
         self.subgoals.set_path(pts, frame)
+        # 一旦收到 path 就讓 path 蓋過單一 goal_pose（routing 規劃出的路徑優先於手點目標）
         self.subgoals.prefer_path = True
         self.runner.reset()
         self.cmd_filter.reset()
@@ -399,6 +450,11 @@ class PolicyNode(Node):
         )
 
     def _cb_ndt_pose(self, msg: PoseStamped) -> None:
+        # ⚠ 此部署的 ndt_localizer 發的 /ndt_pose 內容是 map→odom 變換、不是車在 map 的位姿
+        #   （實測 /ndt_pose == map→odom TF；真實車姿 = map→odom ∘ odom→base，差一個 odom→base）。
+        #   故這裡**不**拿它算車姿——車姿改由 _robot_pose_in_map 走 TF map→base 取得。
+        #   本 callback 只用「有持續收到 /ndt_pose」判定 NDT 還活著且收斂中（is_ndt_stable /
+        #   ndt_age，基於訊息到達的 monotonic 時間，跨機器時鐘不同步也可靠）。
         ndt_yaw = _yaw_from_quat(
             msg.pose.orientation.x, msg.pose.orientation.y,
             msg.pose.orientation.z, msg.pose.orientation.w,
@@ -406,12 +462,10 @@ class PolicyNode(Node):
         with self._lock:
             ox, oy = self._odom_xy
             oyaw = self._odom_yaw
-            speed = self._odom_v
         self.localizer.on_ndt_pose(
             msg.pose.position.x, msg.pose.position.y, ndt_yaw,
             ox, oy, oyaw,
         )
-        self.localizer.try_update_offset(robot_speed_mps=speed)
 
     def _cb_mode_topic(self, msg: String) -> None:
         try:
@@ -460,19 +514,54 @@ class PolicyNode(Node):
 
     def _on_mode_change(self, old: Mode, new: Mode, reason: str) -> None:
         self.get_logger().info(f"mode: {old.value} → {new.value} (reason: {reason})")
+        # 切到任何非行駛模式時立刻把 target 歸 0 並重置 filter，
+        # 避免切回 nav 時殘留舊 target 或 filter 慣性造成突跳
         if new in (Mode.IDLE, Mode.ESTOP, Mode.PAUSED):
             with self._lock:
                 self._target_v = 0.0
                 self._target_w = 0.0
             self.cmd_filter.reset()
 
+    # ──────────────────────────── 定位（TF map→base）────────────────────────────
+
+    def _robot_pose_in_map(self, odom_x: float, odom_y: float, odom_yaw: float) -> RobotPose:
+        """機器人在 map frame 的真實位姿，取自 TF map→base_frame（與 RViz 同一條鏈）.
+
+        為何不用 /ndt_pose：此 ndt_localizer 發的 /ndt_pose 是 map→odom 變換、非車姿，
+        當成車姿會差一個 odom→base（車離 odom 原點越遠差越多，曾導致 goal 方位/距離全歪）。
+        TF 鏈 map→odom(NDT) ∘ odom→base(底盤) 由 tf2 正確合成。查不到 TF 時退回純 odom。
+        用 Time()（最新可用）而非當下時刻：避免跨機器時鐘不同步造成 extrapolation 失敗。
+        """
+        try:
+            tf = self.tf_buffer.lookup_transform(self.goal_frame, self.base_frame, Time())
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            return RobotPose(
+                x=t.x, y=t.y,
+                yaw=_yaw_from_quat(q.x, q.y, q.z, q.w), source="tf",
+            )
+        except TransformException:
+            return RobotPose(x=odom_x, y=odom_y, yaw=odom_yaw, source="odom_only")
+
+    def _map_odom_from_tf(self) -> tuple[float, float, float] | None:
+        """回傳 map→odom 變換 (x, y, yaw)，供狀態顯示 NDT 修正量；查不到回 None."""
+        try:
+            tf = self.tf_buffer.lookup_transform(self.goal_frame, self.odom_frame, Time())
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            return t.x, t.y, _yaw_from_quat(q.x, q.y, q.z, q.w)
+        except TransformException:
+            return None
+
     # ──────────────────────────── Timer: 推論 (5 Hz) ────────────────────────────
 
     def _tick_inference(self) -> None:
+        # 非 active mode（idle/estop/manual/paused）完全不推論，省 CPU 也避免誤動
         if not self.mode_mgr.is_active():
             return
 
         now = time.monotonic()
+        # 先在鎖內快照所有共享狀態，後續重運算（推論）都在鎖外做，縮短臨界區
         with self._lock:
             sweep_pre = self._latest_sweep
             sweep_age = now - self._latest_sweep_t if sweep_pre is not None else float("inf")
@@ -487,6 +576,8 @@ class PolicyNode(Node):
             elapsed = now - self._start_t
 
         # 選 sweep 來源：preprocessor topic 首選；沒收到/過期 → fallback inline
+        # 獨立 preprocessor 節點（spot_rl pattern）發布的 sweep 較可驗證；
+        # 它掛了才退回自己從 raw PointCloud2 算（需 use_inline_preprocess=true）
         sweep_from_topic = sweep_pre is not None and sweep_age <= self.timeout_lidar_s
         if sweep_from_topic:
             sweep_active = sweep_pre
@@ -499,29 +590,37 @@ class PolicyNode(Node):
             if not self.use_inline_preprocess:
                 reason += "（且 use_inline_preprocess=false，需啟動 lidar_preprocessor_node）"
             return self._set_target_stop(reason)
+        # watchdog：odom 逾時 = 失去自身速度/位姿基準，立刻停車
         if odom_age > self.timeout_odom_s:
             return self._set_target_stop("Odom timeout")
+        # 沒目標就停（warn=False：待命狀態屬正常，不洗 log）
         if not self.subgoals.has_target():
             return self._set_target_stop("尚未收到 goal/path", warn=False)
 
-        # 機器人在 map frame 的位姿
-        robot_pose = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
-        if self.require_ndt and robot_pose.source == "odom_only":
-            return self._set_target_stop("require_ndt=true 但 NDT 未穩定")
+        # 機器人在 map frame 的位姿：走 TF map→base（map→odom 由 NDT 發、odom→base 由底盤發）
+        robot_pose = self._robot_pose_in_map(odom_x, odom_y, odom_yaw)
+        # require_ndt=true：沒有 map→base TF（NDT 未提供 map→odom）或 NDT 不穩定就不動
+        if self.require_ndt and (robot_pose.source != "tf"
+                                 or not self.localizer.is_ndt_stable()):
+            return self._set_target_stop("require_ndt=true 但 NDT/TF 未就緒")
 
         # 取得 sub-goal（lookahead 或 single）
         choice = self.subgoals.select(robot_pose.x, robot_pose.y)
         if choice is None:
             return self._set_target_stop("無法選定 subgoal")
 
-        # 若 subgoal 與 robot 在不同 frame：goal_frame=odom 強制用 odom_only pose
+        # frame 一致性保護：subgoal 在 odom frame 時，robot 位姿也必須用 odom 系，
+        # 否則 world_to_body 會把兩個不同座標系的點相減 → goal 方向算錯
         if choice.frame == "odom":
             robot_x, robot_y, robot_yaw_use = odom_x, odom_y, odom_yaw
         else:
             robot_x, robot_y, robot_yaw_use = robot_pose.x, robot_pose.y, robot_pose.yaw
 
+        # 把 goal 轉到 body frame（policy obs 用的是相對機器人的座標）
         gx, gy = world_to_body(choice.x, choice.y, robot_x, robot_y, robot_yaw_use)
         dist = math.hypot(gx, gy)
+        # path_lookahead 的 carrot 會一直往前滑，不該因「接近 carrot」就判定到達；
+        # 只有 single goal / path 終點等真正終點才用 goal_tolerance 判停
         if choice.source != "path_lookahead" and dist < self.goal_tolerance:
             return self._set_target_stop(
                 f"到達 {choice.source} (dist={dist:.2f})", warn=False,
@@ -530,6 +629,8 @@ class PolicyNode(Node):
         # LiDAR sweep 取得
         if sweep_active is None:
             # inline fallback：自己從 PointCloud2 處理
+            # motion compensation：掃描期間機器人在動，用 odom 速度×掃描齡補償點雲位移，
+            # 避免高速時 sweep 出現拖影；dt_scan clamp 在 0.15s 內防 stale 幀過度補償
             motion_comp = None
             if self.lidar_motion_comp:
                 dt_scan = max(min(pc_age, 0.15), 0.0)
@@ -551,7 +652,8 @@ class PolicyNode(Node):
             self._last_subgoal_body = (gx, gy)
             self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
 
-        # 緊急停車（在 normalize 前的 raw m）
+        # 硬性緊急停車：繞過 policy，只要任一 bin 距離 < safety_estop 立刻 ESTOP。
+        # 這是 policy 之外的最後一道安全網，不信任 policy 在極近距離的判斷。
         if self._too_close(sweep):
             self.mode_mgr.set(Mode.ESTOP, reason="LiDAR < safety_estop")
             return self._set_target_stop("EMERGENCY: LiDAR 進入安全區")
@@ -578,6 +680,8 @@ class PolicyNode(Node):
         )
         logits = self.runner.step(obs)
         # 動作端：上限 ×rate 縮回實體速度；current_vel 用真實 v 做積分
+        # （obs 端放大 1/rate、action 端縮小 ×rate 的不對稱，正是時間膨脹的本質：
+        #  policy 在「放大的感知世界」決策，輸出再縮回真實世界的慢速指令）
         act_eff = (self.act_params if rate >= 0.999 else ActionParams(
             num_bins=self.act_params.num_bins,
             max_linear_velocity=self.act_params.max_linear_velocity * rate,
@@ -609,6 +713,8 @@ class PolicyNode(Node):
             self.get_logger().warn(reason, throttle_duration_sec=2.0)
 
     def _too_close(self, sweep_norm: np.ndarray) -> bool:
+        # sweep 是正規化值 [0,1]，這裡把 safety 閾值（公尺）換算成同樣的正規化尺度再比，
+        # 避免每幀把整條 sweep 反正規化回公尺（省運算）
         denom = max(self.lidar_r_max - self.obs_params.robot_radius, 1e-6)
         thr_norm = (self.safety_estop_m - self.obs_params.robot_radius) / denom
         return bool((sweep_norm < thr_norm).any())
@@ -616,6 +722,7 @@ class PolicyNode(Node):
     # ──────────────────────────── Timer: cmd_vel 發布 (20 Hz) ────────────────────────────
 
     def _tick_cmd(self) -> None:
+        # manual 模式 should_publish_cmd()=False → 完全不發，把 cmd_vel topic 讓給搖桿
         if not self.mode_mgr.should_publish_cmd():
             return
         now = time.monotonic()
@@ -625,22 +732,26 @@ class PolicyNode(Node):
         with self._lock:
             tgt_v = self._target_v
             tgt_w = self._target_w
+        # idle/estop/paused 仍會發 cmd 但強制 0（持續宣告「我在控制且要停」給 mux）
         if self.mode_mgr.force_zero_cmd():
             tgt_v = 0.0
             tgt_w = 0.0
 
-        # Inference 過期保護：若 target 已 > 5 個 cmd_dt 沒更新 → 強制 0
+        # Inference 過期保護：cmd timer 跑得比推論快，若推論卡住（target 超過 5 個
+        # cmd_dt 沒更新）就強制 0，避免一直 republish 最後一個過時的 target 而衝出去
         if (self.mode_mgr.mode == Mode.NAV
                 and now - self._target_set_t > 5.0 / max(self.cmd_rate_hz, 1.0)):
             tgt_v, tgt_w = 0.0, 0.0
 
+        # low-pass + slew-rate 平滑：把 5Hz 離散動作的跳階磨平再以 20Hz 送出
         out_v, out_w = self.cmd_filter.step(tgt_v, tgt_w, dt)
         msg = Twist()
         msg.linear.x = out_v
         msg.angular.z = out_w
         self.pub_cmd.publish(msg)
 
-        # 餵延遲估計：送出 cmd vs 底盤實測（odom twist）
+        # 餵延遲估計：拿「送出的 cmd」對「底盤實測 odom twist」做互相關，
+        # 估 cmd→實際響應的死時間（rover_rl 無 cmd_delay 補償，靠這診斷振盪風險）
         with self._lock:
             act_v, act_w = self._odom_v, self._odom_w
         self.lag_v.push(out_v, act_v)
@@ -658,6 +769,8 @@ class PolicyNode(Node):
             out_v = self.cmd_filter._last_v
             out_w = self.cmd_filter._last_w
 
+        # 找最近障礙物 bin 並反算回 (角度, 公尺) 給 RViz 畫；純視覺，不影響推論。
+        # 反正規化：dist = norm × (r_max - r_robot) + r_robot；bin → 角度為 binning 的逆運算
         nearest = None
         if sweep is not None and sweep.size > 0:
             idx_min = int(np.argmin(sweep))
@@ -721,11 +834,10 @@ class PolicyNode(Node):
             back_m = _sec(np.r_[64:72, 0:10])
             right_m = _sec(np.r_[10:27])
 
-        # 機器人在 map frame 位姿（含來源：odom+offset / ndt_direct / odom_only）
-        rp = self.localizer.get_robot_pose_in_map(odom_x, odom_y, odom_yaw)
-
-        off = self.localizer.offset
-        yoff = self.localizer.yaw_offset
+        # 機器人在 map frame 位姿（走 TF map→base；來源 tf / odom_only）
+        rp = self._robot_pose_in_map(odom_x, odom_y, odom_yaw)
+        # NDT 修正量（map→odom），純供顯示
+        mo = self._map_odom_from_tf()
         goal_dist = goal_ang = None
         if subgoal is not None:
             goal_dist = math.hypot(subgoal[0], subgoal[1])
@@ -772,9 +884,9 @@ class PolicyNode(Node):
             "ndt_ok": bool(self.localizer.is_ndt_stable()),
             "pose_x": round(rp.x, 2), "pose_y": round(rp.y, 2),
             "pose_yaw_deg": round(math.degrees(rp.yaw), 1), "pose_src": rp.source,
-            "off_x": round(off[0], 2) if off else None,
-            "off_y": round(off[1], 2) if off else None,
-            "off_yaw_deg": round(math.degrees(yoff), 1) if yoff is not None else None,
+            "off_x": round(mo[0], 2) if mo else None,
+            "off_y": round(mo[1], 2) if mo else None,
+            "off_yaw_deg": round(math.degrees(mo[2]), 1) if mo else None,
             "goal_dist": round(goal_dist, 2) if goal_dist is not None else None,
             "goal_ang_deg": round(goal_ang, 1) if goal_ang is not None else None,
             "goal_src": subgoal_src,
@@ -798,8 +910,7 @@ class PolicyNode(Node):
         import math as _math
         ndt_age = self.localizer.ndt_age_s
         ndt_ok = self.localizer.is_ndt_stable()
-        off = self.localizer.offset
-        yoff = self.localizer.yaw_offset
+        mo = self._map_odom_from_tf()
 
         def _h(age, limit):   # 健康標記：新鮮=✓，逾時=⚠
             return "✓" if age < limit else "⚠"
@@ -812,8 +923,8 @@ class PolicyNode(Node):
         ]
         if sweep_src != "preprocessor_topic":
             health.insert(1, f"pc {_h(pc_age, 0.5)}{pc_age:.2f}s")
-        off_str = (f"({off[0]:+.2f},{off[1]:+.2f},{_math.degrees(yoff):+.1f}°)"
-                   if off and yoff is not None else "—")
+        off_str = (f"({mo[0]:+.2f},{mo[1]:+.2f},{_math.degrees(mo[2]):+.1f}°)"
+                   if mo else "—")
         self.get_logger().info(
             f"[HB] {self.mode_mgr.mode.value:<6} cmd v={tgt_v:+.2f} w={tgt_w:+.2f} "
             f"(rate {self.speed_rate:.2f}) │ " + "  ".join(health) +
@@ -829,6 +940,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # 關閉時不主動補發 0 cmd：mode 切離 nav 與 cmd timer 停轉後底盤端 watchdog
+        # 會在收不到 cmd 時自行停車；這裡只負責乾淨釋放 node 資源
         node.get_logger().info("⏹ policy_node 已停止（cmd_vel 已歸 0，安全關閉）")
         node.destroy_node()
         if rclpy.ok():

@@ -40,10 +40,18 @@ class Mode(Enum):
 
 
 class ModeManager:
-    """簡單狀態機 + 切換 callback hook."""
+    """簡單狀態機 + 切換 callback hook.
+
+    本身不碰 ROS，只持有當前 mode 並在切換時觸發 callback；
+    policy_node 透過 is_active / should_publish_cmd / force_zero_cmd
+    三個查詢方法決定「要不要推論、要不要發 cmd_vel、要不要強制歸零」。
+    把判斷邏輯收斂在這裡，避免散落在 node 各 callback 造成行為不一致。
+    """
 
     def __init__(self, initial: Mode = Mode.NAV, on_change=None):
         self._mode = initial
+        # on_change(old, new, reason)：切換時呼叫，供 node 做副作用
+        # （如重置 RNN hidden、改 status badge），ModeManager 本身不做。
         self._on_change = on_change
 
     @property
@@ -51,11 +59,13 @@ class ModeManager:
         return self._mode
 
     def set(self, new_mode: Mode, reason: str = "") -> bool:
+        # 同模式直接 no-op（回 False），避免重複觸發 on_change 把 RNN hidden 白白重置。
         if new_mode == self._mode:
             return False
         old = self._mode
         self._mode = new_mode
         if self._on_change is not None:
+            # callback 失敗不能讓 mode 切換半途中斷（安全狀態優先），故吞例外。
             try:
                 self._on_change(old, new_mode, reason)
             except Exception:
@@ -68,9 +78,14 @@ class ModeManager:
 
     def should_publish_cmd(self) -> bool:
         """rover_rl 是否該發 cmd_vel."""
-        # manual 模式讓外部接管；estop/idle 仍要發 0 以蓋過 stale cmd
+        # 關鍵設計：唯獨 manual 模式「讓出 topic」完全不發，讓搖桿/外部
+        # 節點獨占 cmd_vel topic（多發布者會在 mux 互搶）。
+        # estop/idle/paused 反而「要主動發 0」——因為若靜默，底盤可能沿用
+        # 上一筆 stale cmd 繼續動，主動發 0 才能確實覆蓋並煞停。
         return self._mode in (Mode.NAV, Mode.ESTOP, Mode.IDLE, Mode.PAUSED)
 
     def force_zero_cmd(self) -> bool:
         """是否強制 cmd=0（不論 policy 輸出什麼）."""
+        # 這三種模式都不跑推論（is_active=False），但仍會發 cmd（見上），
+        # 故需強制把內容壓成 0。nav 不在此列才會真正送出 policy 輸出。
         return self._mode in (Mode.ESTOP, Mode.IDLE, Mode.PAUSED)

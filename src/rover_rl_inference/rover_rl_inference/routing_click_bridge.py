@@ -26,9 +26,9 @@ class RoutingClickBridge(Node):
         building = self.get_parameter("building").get_parameter_value().string_value
         floor = self.get_parameter("floor").get_parameter_value().string_value
 
-        self._nodes: dict[str, tuple[float, float]] = {}  # name → (x, y)
-        self._origin: str | None = None
-        self._click_count = 0
+        self._nodes: dict[str, tuple[float, float]] = {}  # name → (x, y)，路由拓撲節點座標表
+        self._origin: str | None = None   # 已選起點（等第二點當終點），構成兩點選取狀態機
+        self._click_count = 0             # 點擊計數：奇數=選起點、偶數=選終點並觸發 routing
 
         # 訂閱 RViz Publish Point
         self.sub = self.create_subscription(
@@ -41,7 +41,8 @@ class RoutingClickBridge(Node):
         # 發布選點 marker
         self.marker_pub = self.create_publisher(MarkerArray, "/routing_click/markers", 10)
 
-        # 取得地圖節點座標
+        # 取得地圖節點座標：routing 用節點名（不是任意座標），故先抓拓撲節點表，
+        # 之後把點擊座標 snap 到最近的節點。用 timer 重試直到 service 上線且載入成功。
         self.route_info_client = self.create_client(ModuleInfo, "/get_route_info")
         self.create_timer(2.0, self._fetch_nodes)
         self._nodes_loaded = False
@@ -77,12 +78,15 @@ class RoutingClickBridge(Node):
             self.get_logger().error(f"get_route_info 失敗: {e}")
 
     def _nearest_node(self, x: float, y: float) -> str | None:
+        # RViz 點擊不會剛好落在拓撲節點上，snap 到歐氏距離最近的節點名供 routing 使用。
         if not self._nodes:
             return None
         return min(self._nodes, key=lambda n: math.hypot(
             self._nodes[n][0] - x, self._nodes[n][1] - y))
 
     def _on_click(self, msg: PointStamped):
+        # 兩點選取狀態機：第 1 次點擊存起點、第 2 次點擊存終點並自動呼叫 routing，
+        # 之後 reset 回到等起點狀態，方便連續規劃下一段路徑。
         if not self._nodes_loaded:
             self.get_logger().warn("節點地圖尚未載入，請稍後再試")
             return

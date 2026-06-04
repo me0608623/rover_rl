@@ -37,6 +37,8 @@ MODELS_PATH = REPO_ROOT / "scripts/reinforcement_learning/skrl/models/modular_rn
 
 
 def _load_training_models():
+    # 直接從訓練 repo 載入網路定義（不複製一份到部署端），確保部署用的 class
+    # 與訓練時 100% 相同；checkpoint 的 state_dict 才能正確 load 進來
     spec = importlib.util.spec_from_file_location("modular_rnn_models", MODELS_PATH)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot import training models from {MODELS_PATH}")
@@ -56,6 +58,9 @@ class PreprocessNormalizer(nn.Module):
     def __init__(self, mean: torch.Tensor, std: torch.Tensor,
                  policy_indices: list[int], clip: float = 5.0):
         super().__init__()
+        # 把訓練時的 obs_normalizer (mean/std) 與 slice 索引「bake」成 buffer 存進模型。
+        # 這是匯出的關鍵：部署端 ROS 節點只丟 raw obs 進來，正規化完全內含在 .ts，
+        # 不需要在部署端另外維護一份 mean/var（避免漏帶或數值不一致導致 cmd 爆走）
         self.register_buffer("obs_mean", mean.clone())
         self.register_buffer("obs_std", std.clone())
         self.register_buffer(
@@ -65,6 +70,7 @@ class PreprocessNormalizer(nn.Module):
         self.clip = float(clip)
 
     def forward(self, obs_raw: torch.Tensor) -> torch.Tensor:
+        # 標準化後 clip 到 ±5（與訓練端相同），再 index_select 抽出 policy 真正看的 79D
         normed = torch.clamp(
             (obs_raw - self.obs_mean) / (self.obs_std + 1e-8),
             -self.clip, self.clip,
@@ -73,6 +79,13 @@ class PreprocessNormalizer(nn.Module):
 
 
 class RNNStep(nn.Module):
+    """把訓練端 PreprocessRNN 拆成「單步」版本供部署用.
+
+    訓練時 RNN 吃整段序列；部署是每個 control tick 跑一步並把 hidden state
+    傳回給呼叫端自己保管（episode 內延續）。這裡只抽出需要的子模組重組 forward，
+    讓 hidden 變成顯式輸入/輸出，避免 TorchScript 內部 stateful 的麻煩。
+    """
+
     def __init__(self, rnn: nn.Module):
         super().__init__()
         self.fc_front = rnn.fc_front
@@ -82,7 +95,7 @@ class RNNStep(nn.Module):
 
     def forward(self, features: torch.Tensor, hidden: torch.Tensor):
         fc_out = self.fc_front(features)
-        rnn_in = fc_out.unsqueeze(0)
+        rnn_in = fc_out.unsqueeze(0)  # 補上 seq_len=1 維度餵 nn.RNN
         rnn_out, new_hidden = self.rnn(rnn_in, hidden)
         rnn_out = rnn_out.squeeze(0)
         if self.concat_rnn:
@@ -103,7 +116,12 @@ class PolicyOnly(nn.Module):
 
 class Bundle(nn.Module):
     """Self-contained policy bundle. Meta dims stored as registered buffers
-    so they survive torch.jit.script without type annotation pitfalls."""
+    so they survive torch.jit.script without type annotation pitfalls.
+
+    把 preprocess / extractor / rnn / policy 四段封成單一可儲存模型。
+    維度 meta（raw_obs_dim 等）刻意用 register_buffer 存成 tensor 而非 Python int 屬性：
+    torch.jit.script 對純 Python int 屬性的型別推斷常出錯，存成 buffer 可安全保留。
+    """
 
     def __init__(self, preprocess, extractor, rnn, policy, raw_obs_dim,
                  used_obs_dim, hidden_dim, preprocess_dim, total_logits):
@@ -127,9 +145,15 @@ class Bundle(nn.Module):
 
 
 def _autodetect(ckpt: dict, overrides: dict) -> dict:
+    """從 checkpoint 的 args 與 obs_normalizer 形狀自動推斷網路架構參數.
+
+    讓同一支匯出腳本能吃 79D 新架構與 139D 舊架構（見模組 docstring），
+    不必每個 model 手動指定維度；任何推斷可被 --override 旗標覆寫。
+    """
     args = ckpt.get("args", {}) or {}
     norm = ckpt.get("obs_normalizer", {}) or {}
     mean = norm.get("mean")
+    # 用 normalizer mean 的長度判定 raw obs 維度（這是區分 79D / 139D 架構的依據）
     raw_obs_dim = int(mean.numel()) if mean is not None and hasattr(mean, "numel") else 79
 
     cfg = {
@@ -145,6 +169,9 @@ def _autodetect(ckpt: dict, overrides: dict) -> dict:
     }
     cfg.update(overrides)
 
+    # 決定從 raw obs 抽哪些維度給 policy：
+    # 79D → 全取（恆等）；139D → 取前 78D + 第 138D，跳過中間 60D obstacle ground truth
+    # （該欄位 sim 才有、實車拿不到，部署時補 0，故匯出時也排除）
     if raw_obs_dim == 79:
         cfg["policy_indices"] = list(range(0, 79))
     elif raw_obs_dim == 139:
@@ -206,6 +233,8 @@ def export(args):
     rnn.load_state_dict(ckpt["preprocess_rnn"])
     policy_head.load_state_dict(ckpt["policy_head"])
 
+    # normalizer 存的是 var，需開根號還原 std。沒帶 normalizer 的 checkpoint 退化成恆等
+    # （mean=0,std=1）——這通常代表 obs 沒被正規化過，部署後極易 cmd 爆走，故印 WARN
     norm = ckpt.get("obs_normalizer", {})
     if norm and "mean" in norm:
         mean = norm["mean"].float().cpu()
@@ -224,6 +253,9 @@ def export(args):
     rnn_step = RNNStep(rnn.eval()).eval()
     pol = PolicyOnly(policy_head.eval()).eval()
 
+    # 各子模組先用 jit.trace（餵 dummy 輸入記錄計算圖），整體 Bundle 再用 jit.script。
+    # 採 trace+script 混合：子模組無控制流，trace 足夠且穩；外層 Bundle 用 script
+    # 保留 meta buffer 與明確的多輸出 forward 介面
     sample_raw = torch.zeros(1, cfg["raw_obs_dim"])
     sample_hidden = torch.zeros(1, 1, cfg["hidden_dim"])
     with torch.no_grad():
@@ -249,7 +281,8 @@ def export(args):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     scripted.save(str(out_path))
 
-    # Sanity
+    # Sanity：重新 load 存好的 .ts 跑一遍完整 pipeline，確認 logits 形狀=38（19×2 MultiDiscrete）。
+    # 在匯出端就抓出維度錯誤，避免上車才發現 .ts 壞掉
     reloaded = torch.jit.load(str(out_path))
     with torch.no_grad():
         o79 = reloaded.preprocess(sample_raw)

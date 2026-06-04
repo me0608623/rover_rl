@@ -55,7 +55,13 @@ class RobotPose:
 
 
 class MapOdomOffsetTracker:
-    """追蹤 map→odom offset，給 rover_rl policy_node 用."""
+    """追蹤 map→odom offset，給 rover_rl policy_node 用.
+
+    為何不直接呼叫 tf_buffer.transform()：NDT 更新慢（1-10 Hz），TF lookup 常拿到
+    stale 或失敗的結果。改成自己維護一份 cached offset，即使 NDT 暫時失聯仍能用
+    最後一次有效值繼續推算 robot pose（safer fallback），行為與 rover2_ws 既有
+    rl_policy_node 一致。
+    """
 
     def __init__(self, logger=None):
         self._logger = logger
@@ -79,8 +85,14 @@ class MapOdomOffsetTracker:
         ndt_x: float, ndt_y: float, ndt_yaw: float,
         odom_x_at_ndt: float, odom_y_at_ndt: float, odom_yaw_at_ndt: float,
     ) -> None:
-        """收到 /ndt_pose 時呼叫；odom_x/y/yaw 應為**當下**的 odom 位姿."""
+        """收到 /ndt_pose 時呼叫；odom_x/y/yaw 應為**當下**的 odom 位姿.
+
+        必須同步記錄收到當下的 odom，offset = ndt - odom 才對得上同一時刻；事後再
+        補 odom 會因機器人已移動而算錯 offset。
+        """
         now = time.monotonic()
+        # 收到頻率判定：距上次 > NDT_STABLE_AGE_S 視為「中斷後重新開始」，計數歸 1；
+        # 連續收到才累加，累積 >= NDT_STABLE_COUNT 才算 NDT 真正 settled（見 is_ndt_stable）。
         if self._last_ndt_recv_t == 0.0 or now - self._last_ndt_recv_t > NDT_STABLE_AGE_S:
             self._ndt_recv_count = 1
         else:
@@ -92,22 +104,30 @@ class MapOdomOffsetTracker:
         self._sync_odom_yaw = odom_yaw_at_ndt
 
     def is_ndt_stable(self) -> bool:
+        # 同時要求「近 1 秒內有收到（fresh）」與「累積次數夠（settled）」：
+        # NDT 只在 is_converged 時才發 /ndt_pose，能持續發代表定位已穩定收斂。
         if self._last_ndt_recv_t == 0.0:
             return False
         return (time.monotonic() - self._last_ndt_recv_t < NDT_STABLE_AGE_S
                 and self._ndt_recv_count >= NDT_STABLE_COUNT)
 
     def try_update_offset(self, robot_speed_mps: float) -> bool:
-        """嘗試更新 xy + yaw offset；回傳是否真的更新了."""
+        """嘗試更新 xy + yaw offset；回傳是否真的更新了.
+
+        多重閘門依序把關，任一不過就不更新（保留舊 offset）：
+        NDT 穩定 → 有同步資料 → 距上次更新已過冷卻時間 → 機器人靜止 → delta 合理。
+        """
         if not self.is_ndt_stable():
             return False
         if (self._sync_odom_xy is None or self._last_ndt_xy is None
                 or self._sync_odom_yaw is None or self._last_ndt_yaw is None):
             return False
         now = time.monotonic()
+        # 冷卻時間：已有 offset 就不必每幀重算，每 5 秒重抓一次即可（省力且避免抖動）。
         if (self._offset is not None
                 and now - self._last_offset_update_t < OFFSET_UPDATE_INTERVAL_S):
             return False
+        # 速度閘門：移動中 NDT 配準結果不可靠（motion blur / 配準延遲），只在靜止時取樣。
         if abs(robot_speed_mps) > SPEED_GATE_MPS:
             return False
 
@@ -122,6 +142,8 @@ class MapOdomOffsetTracker:
                 f"yaw={math.degrees(new_yaw):.1f}°"
             )
         else:
+            # delta 閘門：新舊 offset 落差過大通常是 NDT 跳到錯誤定位（jump），
+            # 寧可拒絕更新沿用舊 offset，也不要讓一次飄移污染 robot pose。
             xy_delta = math.hypot(new_xy[0] - self._offset[0], new_xy[1] - self._offset[1])
             if xy_delta > OFFSET_DELTA_REJECT_M:
                 self._log_warn(
@@ -152,7 +174,11 @@ class MapOdomOffsetTracker:
     def get_robot_pose_in_map(
         self, odom_x: float, odom_y: float, odom_yaw: float,
     ) -> RobotPose:
-        """計算機器人在 map frame 的位姿，依優先順序選擇來源."""
+        """計算機器人在 map frame 的位姿，依優先順序選擇來源.
+
+        優先序：cached offset（最穩，NDT 暫失也能跑）> NDT 直讀（有穩定但還沒 cache
+        到 offset 時的過渡）> 純 odom（NDT 從未穩定的 fallback，goal 亦假設在 odom frame）。
+        """
         if self._offset is not None:
             ox, oy = self._offset
             yaw = odom_yaw + (self._yaw_offset or 0.0)

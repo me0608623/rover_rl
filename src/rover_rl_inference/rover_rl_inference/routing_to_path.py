@@ -44,7 +44,9 @@ class RoutingToPathNode(Node):
         floor = self.get_parameter("floor").get_parameter_value().string_value
         topic_path = self.get_parameter("topic_global_path").get_parameter_value().string_value
 
-        # 發布 /global_path
+        # 發布 /global_path。routing 是 service-based 一次性回傳，但 policy_node 的
+        # SubgoalSelector 訂閱的是 topic；故把路徑緩存後 2Hz 持續 republish，
+        # 確保晚啟動或重連的訂閱者（RViz / policy_node）都拿得到最新路徑。
         self.pub_path = self.create_publisher(Path, topic_path, 5)
         self._last_path: Path | None = None
         # 2Hz 定期重發最後一條路徑，避免 TF 更新後 RViz 失去顯示
@@ -53,7 +55,9 @@ class RoutingToPathNode(Node):
         # 發布 working_floor 觸發 routing 載入
         self.pub_floor = self.create_publisher(WorkingFloor, "working_floor", 5)
 
-        # ReentrantCallbackGroup 允許 service callback 內部再 spin future
+        # ReentrantCallbackGroup：_handle_call 是 service callback，內部又要等
+        # generation_path 的 future 完成。預設 callback group 會死鎖（同 group 不能重入），
+        # 用 Reentrant + MultiThreadedExecutor 才能在 callback 內阻塞等待下游 service。
         self._cb_group = ReentrantCallbackGroup()
         self.routing_client = self.create_client(
             RoutingPath, "generation_path", callback_group=self._cb_group)
@@ -80,6 +84,8 @@ class RoutingToPathNode(Node):
             self.pub_path.publish(self._last_path)
 
     def _publish_floor(self):
+        # routing_engine 要先收到 working_floor 才會載入對應樓層的拓撲圖；
+        # 發一次就夠（cancel timer），重複發無益。
         msg = WorkingFloor()
         msg.building = self._building
         msg.floor = self._floor
@@ -94,6 +100,8 @@ class RoutingToPathNode(Node):
             response.routing = []
             return response
 
+        # 用 Event 把 async future 轉成同步等待：service handler 必須回傳 response，
+        # 不能 return future；故在此阻塞等下游 routing 完成（靠 Reentrant group 不死鎖）。
         event = threading.Event()
         result_holder: list = []
 
@@ -113,6 +121,8 @@ class RoutingToPathNode(Node):
             return response
 
         if result_holder and result_holder[0].routing:
+            # generation_path 回傳 Path[]（可能多段）；policy 只需單一連續路徑，
+            # 取第 0 條，存進 _last_path 供 2Hz republish 並立即發一次。
             result = result_holder[0]
             path = result.routing[0]
             self._last_path = path

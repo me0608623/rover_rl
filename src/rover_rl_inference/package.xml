@@ -14,6 +14,8 @@
   <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
+  <depend>onboard_detector</depend>  <!-- VO 安全層用 GetDynamicObstacles service -->
   <exec_depend>python3-matplotlib</exec_depend>
 
   <export>

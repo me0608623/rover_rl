@@ -42,6 +42,12 @@ from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
 
 
 class LidarPreprocessorNode(Node):
+    """獨立 LiDAR 前處理節點：/velodyne_points → 72-bin sweep + (可選) LaserScan.
+
+    與 policy 解耦的好處見模組 docstring。本節點只負責把點雲壓成 sweep 並發布，
+    sweep 公式全交給 lidar_preprocess.lidar_sweep_72_real（與訓練端對齊）。
+    """
+
     def __init__(self):
         super().__init__("rover_rl_lidar_preprocessor")
 
@@ -91,6 +97,8 @@ class LidarPreprocessorNode(Node):
         self._hb_last_t = time.monotonic()
 
         # ── QoS / sub / pub ──
+        # LiDAR driver 多半用 BEST_EFFORT 發 sensor data；訂閱端 QoS 不相容會收不到，
+        # 故預設 BEST_EFFORT 與 VLP-16 driver 對齊（可用 lidar_qos_best_effort 參數切換）
         sensor_qos = QoSProfile(
             reliability=(QoSReliabilityPolicy.BEST_EFFORT if self.qos_be
                          else QoSReliabilityPolicy.RELIABLE),
@@ -123,6 +131,8 @@ class LidarPreprocessorNode(Node):
         )
 
     def _cb_lidar(self, msg: PointCloud2) -> None:
+        # callback 只解點雲存最新一筆（不在這裡算 sweep），實際處理交給 timer 定速跑，
+        # 把 sweep 輸出頻率與 LiDAR 到達頻率解耦，避免 callback 阻塞影響收訊
         pts = pointcloud2_to_xyz(msg)
         with self._lock:
             self._latest_pc = pts
@@ -136,15 +146,18 @@ class LidarPreprocessorNode(Node):
             self._odom_w = tw.angular.z
 
     def _tick(self) -> None:
+        # 定速 timer：取最新點雲算 sweep 並發布。鎖內只快速複製狀態，計算放鎖外
         with self._lock:
             pts = self._latest_pc
             pc_age = time.monotonic() - self._latest_pc_t if pts is not None else float("inf")
             v = self._odom_v
             w = self._odom_w
+        # 點雲太舊(>0.5s) 視為 LiDAR 斷訊，不發 stale sweep（讓 consumer 自己 timeout）
         if pts is None or pc_age > 0.5:
             return
 
-        # motion compensation：估算掃描期間的位移
+        # motion compensation：用 odom 當下速度 × 估計掃描時長，估這段時間機器人位移量，
+        # 傳給 sweep 函式扣回畸變。dt_scan clamp 在 0.15s 上限避免點雲過舊時補償過頭
         motion_comp = None
         if self.motion_comp:
             dt_scan = min(pc_age, 0.15)
@@ -181,7 +194,8 @@ class LidarPreprocessorNode(Node):
             scan.time_increment = 0.0
             scan.range_min = self.r_min
             scan.range_max = self.r_max
-            # 反正規化回 metric 距離：(normalized) × (r_max - r_robot) + r_robot
+            # LaserScan 是給人/RViz 看的，需 metric 距離；把發給 policy 的正規化 sweep
+            # 反正規化回公尺：(normalized) × (r_max - r_robot) + r_robot
             denom = self.r_max - self.r_robot
             ranges_m = (sweep * denom + self.r_robot).astype(np.float32)
             scan.ranges = ranges_m.tolist()

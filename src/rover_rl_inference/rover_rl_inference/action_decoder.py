@@ -52,10 +52,12 @@ def decode_logits_to_cmd(
     if logits_38.shape != (38,):
         raise ValueError(f"logits shape {logits_38.shape} != (38,)")
 
+    # 38 logits = 兩個獨立的 19-way head（MultiDiscrete([19,19])）：前段 accel、後段 omega
     logits_a = logits_38[: params.num_bins]
     logits_w = logits_38[params.num_bins :]
 
     if deterministic:
+        # 部署預設 deterministic：各 head 取 argmax，去掉訓練時的 entropy 探索抖動
         idx_a = int(np.argmax(logits_a))
         idx_w = int(np.argmax(logits_w))
     else:
@@ -63,6 +65,7 @@ def decode_logits_to_cmd(
         idx_a = _sample_categorical(logits_a, rng)
         idx_w = _sample_categorical(logits_w, rng)
 
+    # 19 bins 中心對稱（center=9）：idx 映到 [-1,+1] 比例，9=不變、0=全負、18=全正
     center = (params.num_bins - 1) / 2.0
     ratio_a = (idx_a - center) / center
     ratio_w = (idx_w - center) / center
@@ -72,9 +75,12 @@ def decode_logits_to_cmd(
     v_max = params.max_linear_velocity
     dt = params.dt
 
+    # 動態加速邊界：除 ±a_max 外，再夾住「這一步最多能加/減多少才不超過 v_max」，
+    # 與訓練端 process_actions 完全一致，避免實車 next_v 飽和點與訓練不同
     a_hi = min(+a_max, (+v_max - v) / dt)
     a_lo = max(-a_max, (-v_max - v) / dt)
 
+    # ratio 正→朝上界加速、負→朝下界減速；兩側各自縮放確保 accel 落在 [a_lo, a_hi]
     if ratio_a >= 0.0:
         accel = ratio_a * a_hi
     else:
@@ -82,6 +88,7 @@ def decode_logits_to_cmd(
 
     accel = float(np.clip(accel, a_lo, a_hi))
     next_v = float(np.clip(v + accel * dt, -v_max, +v_max))
+    # omega 是直接速度映射（非積分加速），用 action ω_max=2.0（≠ obs normalizer 1.5）
     cmd_w = float(np.clip(ratio_w * params.max_angular_velocity_action,
                           -params.max_angular_velocity_action,
                           +params.max_angular_velocity_action))

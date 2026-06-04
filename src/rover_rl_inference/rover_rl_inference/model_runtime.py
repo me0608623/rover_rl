@@ -75,6 +75,8 @@ class PolicyRunner:
         self.step_count = 0
 
     def reset(self) -> None:
+        # 收到新 goal/path、切 mode、換模型時呼叫：清掉 RNN 對「上一段 episode」的
+        # 記憶，否則殘留 hidden 會讓 policy 帶著舊情境的動量做新任務（行為錯亂）。
         self.hidden.zero_()
         self.reset_count += 1
         self.step_count = 0
@@ -93,10 +95,12 @@ class PolicyRunner:
                 f"— bundle expects raw_obs_dim={b.raw_obs_dim}"
             )
         raw = torch.from_numpy(obs_raw_np.astype(np.float32)).unsqueeze(0).to(b.device)
-        obs79 = b.preprocess(raw)                              # [1, 79]
+        obs79 = b.preprocess(raw)                              # [1, 79]（含 normalize + 139→79 slice）
         feat = b.extractor(obs79)                              # [1, 96]
+        # RNN 吃上一步的 hidden 並回傳新的；逐步覆寫以在整段 episode 內延續時序記憶
         preprocess, new_hidden = b.rnn(feat, self.hidden)      # [1, P], [1, 1, H]
         self.hidden = new_hidden
+        # policy head 同時看「當下 obs79」與「RNN 摘要 preprocess」，故 cat 後再餵
         rl_input = torch.cat([obs79, preprocess], dim=-1)      # [1, 79+P]
         logits = b.policy(rl_input)                            # [1, 38]
         self.step_count += 1

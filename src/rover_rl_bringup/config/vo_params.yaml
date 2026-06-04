@@ -1,0 +1,46 @@
+vo_safety_node:
+  ros__parameters:
+    # --- Topics / service ---
+    # policy_node 改發到 cmd_vel_desired，VO 處理後才送進 mux 的 /input/nav_cmd_vel
+    topic_cmd_in: "/rover_rl/cmd_vel_desired"
+    topic_cmd_out: "/input/nav_cmd_vel"
+    topic_odom: "/odom"
+    service_obstacles: "onboard_detector/get_dynamic_obstacles"   # LV-DOT 動態障礙 service
+
+    # --- 看門狗（fail-safe）---
+    timeout_desired_s: 0.5      # RL cmd 逾時 → 發 0
+    timeout_odom_s: 0.3         # odom 逾時 → 發 0
+    timeout_obstacles_s: 1.0    # 障礙快取逾時 → 視為無障礙（靜態仍由 RL sweep 擋）
+
+    # --- 頻率 ---
+    ctrl_rate_hz: 20.0          # 控制輸出（= dynamic window 可達時間 ctrl_dt 來源）
+    obstacle_poll_hz: 15.0      # 輪詢 LV-DOT service
+
+    # --- 輸出硬上限（對齊底盤真實能力）---
+    v_max: 1.0
+    v_min: -1.0
+    w_max: 1.2                  # ★底盤真實上限；順便壓掉 RL 可能叫出的 2.0（sim-to-real gap #2）
+    accel_v: 1.2               # 對齊底盤 acc_max（候選窗 + 輸出 slew 共用）
+    accel_w: 3.0
+    window_time: 1.0           # 候選視窗可達時間(s)，與控制週期解耦讓 VO 能選繞行解；
+                               # 太小→只會減速/停車，太大→候選過於樂觀。1.0 為起點
+
+    # --- 取樣解析度（候選數 = n_v × n_w，越大越精細但越吃 CPU）---
+    n_v: 7
+    n_w: 15
+
+    # --- 軌跡 rollout（碰撞預測）---
+    horizon: 2.0               # s，往前預測多久；振盪時可調小
+    sim_dt: 0.1                # s，rollout 步長
+
+    # --- 安全幾何 ---
+    r_robot: 0.35              # 與訓練/底盤一致
+    margin: 0.10              # 額外安全餘裕；首次部署可調大到 0.2~0.3 更保守
+    obstacle_radius_max: 1.5  # bbox 換算半徑上限，防超大誤框把整條路擋死
+
+    # --- 成本權重（越大越貼近 RL 該通道意圖）---
+    w_v: 1.0
+    w_w: 0.3
+
+    # --- 啟動距離（障礙進入此範圍才跑 VO）---
+    engage_range: 6.0

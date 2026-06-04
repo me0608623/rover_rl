@@ -22,12 +22,14 @@ from dataclasses import dataclass
 import numpy as np
 
 
+# 這些常數必須與訓練端 ObservationsCfgVLP16 完全一致；任一不符都會造成
+# obs 分布偏移（normalizer 是用訓練統計 bake 進去的），policy 行為立刻失準。
 @dataclass(frozen=True)
 class ObsParams:
-    max_acceleration: float = 1.0
-    max_linear_velocity: float = 1.0
-    max_angular_velocity_obs: float = 1.5
-    robot_radius: float = 0.35
+    max_acceleration: float = 1.0          # obs[0] 正規化分母（≠ action 的 act_max_linear_accel=0.5）
+    max_linear_velocity: float = 1.0       # obs[1] 正規化分母
+    max_angular_velocity_obs: float = 1.5  # obs[2] 正規化分母；刻意 ≠ action ω_max=2.0，勿混用
+    robot_radius: float = 0.35             # obs[3] 常數欄；同 sweep 正規化用的 r_robot
     lidar_num_bins: int = 72
     episode_horizon_s: float = 60.0  # time_remaining 分母（訓練 episode 長度）
 
@@ -47,6 +49,7 @@ def build_obs_79d(
             f"lidar_sweep_72 shape {lidar_sweep_72.shape} != ({params.lidar_num_bins},)"
         )
 
+    # ego 三項都正規化到 [-1, 1]：訓練時 obs 即此範圍，clip 防實車瞬時超標污染分布
     ego_a = np.clip(last_accel / max(params.max_acceleration, 1e-6), -1.0, 1.0)
     ego_v = np.clip(linear_vel / max(params.max_linear_velocity, 1e-6), -1.0, 1.0)
     ego_w = np.clip(angular_vel / max(params.max_angular_velocity_obs, 1e-6), -1.0, 1.0)
@@ -96,6 +99,9 @@ def build_obs_raw(
     if raw_obs_dim == 79:
         return o79
     if raw_obs_dim == 139:
+        # 139D layout 把 60D 障礙物欄插在 LiDAR 與 time 之間，因此不能直接接 o79，
+        # 要把 o79 的 time 欄搬到 index 138；中間 [78:138] 維持 0（實車無 ground-truth
+        # 障礙物），normalizer 會依訓練統計轉換這些 0，再由 bundle 內建切片丟掉。
         out = np.zeros(139, dtype=np.float32)
         out[0:78] = o79[0:78]      # ego + goal + LiDAR
         # out[78:138] = 0           # obstacles ground-truth unavailable
@@ -111,7 +117,11 @@ def world_goal_to_body(
     robot_world_y: float,
     robot_world_yaw: float,
 ) -> tuple[float, float]:
-    """world frame goal → body frame (x_fwd, y_left)."""
+    """world frame goal → body frame (x_fwd, y_left).
+
+    訓練的 goal obs 是 body frame（前 x、左 y），故部署必須把 world goal 用
+    -yaw 旋轉回機器人本體座標；少這步 policy 會以為 goal 永遠在固定方位。
+    """
     dx = goal_world_x - robot_world_x
     dy = goal_world_y - robot_world_y
     c = math.cos(-robot_world_yaw)

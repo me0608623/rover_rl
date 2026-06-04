@@ -54,17 +54,29 @@ from std_msgs.msg import Float32MultiArray, String
 import sensor_msgs_py.point_cloud2 as pc2
 
 import matplotlib
+# 車上無顯示器（headless），必須在 import pyplot 前強制切 Agg backend，
+# 否則 matplotlib 會嘗試開 GUI 視窗而在無 X server 環境直接 crash。
+# Agg 純記憶體 render，畫完用 _fig_to_image_msg 轉成 ROS Image 發出去。
 matplotlib.use("Agg", force=True)
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
 
 def _yaw_from_quat(qx, qy, qz, qw):
+    # 從四元數只取 yaw（繞 z 軸）；BEV 是俯視圖，roll/pitch 用不到。
     return math.atan2(2.0 * (qw * qz + qx * qy),
                       1.0 - 2.0 * (qy * qy + qz * qz))
 
 
 class BevPlayNode(Node):
+    """純可視化節點：訂閱感測/動作 topic，畫極座標 BEV 圖發成 Image。
+
+    policy 推論完全不依賴本節點輸出，純 debug 用途——上電前肉眼確認
+    LiDAR 看得到牆/障礙物，排查 sensor 異常時比 raw PointCloud2 直覺。
+    所有 callback 寫入共用狀態（_lock 保護），由 timer 以 rate_hz 統一
+    讀快照繪圖，避免每筆訊息都重畫造成 CPU 浪費。
+    """
+
     def __init__(self):
         super().__init__("rover_rl_bev_play")
 
@@ -114,6 +126,8 @@ class BevPlayNode(Node):
         self._raw_nearest_ang: float | None = None
 
         # ── matplotlib figure（重用） ──
+        # 整個生命週期只建一次 figure / axes，每幀只 cla() 重畫內容，
+        # 不重建物件——重建 figure 在 5Hz 下會嚴重吃 CPU 並洩漏記憶體。
         plt.rcParams["font.sans-serif"] = [
             "DejaVu Sans", "Noto Sans CJK JP", "Noto Sans CJK TC",
             "WenQuanYi Micro Hei",
@@ -128,6 +142,8 @@ class BevPlayNode(Node):
         self.fig.patch.set_facecolor("#141414")
 
         # ── 訂閱 / 發布 ──
+        # 除 sweep 外其餘皆為「可選」：缺 obs/cmd/odom 仍能畫，只是面板顯示 N/A。
+        # sweep 才是 BEV 主體，_tick 在 sweep is None 時直接 return 不出圖。
         self.create_subscription(Float32MultiArray,
             gp("topic_sweep").get_parameter_value().string_value, self._cb_sweep, 10)
         self.create_subscription(Float32MultiArray,
@@ -178,7 +194,8 @@ class BevPlayNode(Node):
             self._odom_xy = (p.x, p.y)
             self._odom_yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
             self._odom_t = time.monotonic()
-            # trail
+            # trail：累積 odom 軌跡點。單步跳躍 > 2m 視為定位 reset（NDT 重定位
+            # 或 odom 跳變），舊軌跡已失去意義 → 清空避免畫出橫跨地圖的假線。
             if self._trail:
                 last = self._trail[-1]
                 d2 = (p.x - last[0]) ** 2 + (p.y - last[1]) ** 2
@@ -195,6 +212,9 @@ class BevPlayNode(Node):
             self._goal_map = (msg.pose.position.x, msg.pose.position.y)
 
     def _cb_pc(self, msg: PointCloud2) -> None:
+        # 直接從原始點雲算「最近障礙距離」，不經 preprocessor 的 r_min(0.9m) 過濾，
+        # 所以面板上 Raw min 能看到比 sweep Nearest 更近的回波——用來判斷
+        # preprocessor 是否把近距離障礙誤濾掉（debug sim-to-real 盲區用）。
         try:
             pts = np.array(list(pc2.read_points(
                 msg, field_names=("x", "y", "z"), skip_nans=True)))
@@ -218,6 +238,8 @@ class BevPlayNode(Node):
 
     # ── main tick ──
     def _tick(self) -> None:
+        # 先在鎖內把所有共用狀態複製成本地快照，後續耗時的繪圖在鎖外進行，
+        # 避免長時間持鎖擋住高頻 callback（sweep/odom）。
         with self._lock:
             sweep = self._sweep
             obs = self._obs_79
@@ -237,7 +259,9 @@ class BevPlayNode(Node):
         if sweep is None:
             return
 
-        # goal_map → body frame（用 odom 近似，NDT 未收斂時仍有參考價值）
+        # goal_map → body frame：把 map 座標的 goal 轉到機器人座標系。
+        # 用 odom 位姿近似（非 NDT），NDT 未收斂時座標雖有漂移但方向仍可參考。
+        # 公式為旋轉 R(-yaw)·(goal-robot)：gx_body=前方分量, gy_body=左側分量。
         goal_body: tuple[float, float] | None = None
         if goal_map is not None:
             dx = goal_map[0] - xy[0]
@@ -276,7 +300,9 @@ class BevPlayNode(Node):
             ax.add_patch(plt.Circle((0, 0), r_m, fill=False,
                                      color="#4a4a4a", linewidth=0.8))
 
-        # sweep → metric
+        # sweep → metric：sweep 是正規化 [0,1]，反算回實際公尺距離。
+        # 公式須與 preprocessor 正規化完全互逆 (d-r_robot)/(r_max-r_robot)，
+        # 否則畫出來的距離環會對不上真實障礙位置。
         denom = self.r_max - self.r_robot
         real_dist = sweep_norm * denom + self.r_robot
         n_bins = sweep_norm.shape[0]
@@ -284,6 +310,8 @@ class BevPlayNode(Node):
         angles = np.radians(-180.0 + np.arange(n_bins) * (360.0 / n_bins))
         x_forward = real_dist * np.cos(angles)
         y_left = real_dist * np.sin(angles)
+        # body 模式：螢幕固定「前方朝上」(x=左右, y=前後)，符合駕駛直覺；
+        # world 模式：依 yaw 旋轉回世界座標，看絕對朝向。
         if self.frame_mode == "world":
             cos_y, sin_y = math.cos(yaw), math.sin(yaw)
             plot_x = cos_y * x_forward - sin_y * y_left
@@ -294,7 +322,8 @@ class BevPlayNode(Node):
 
         # 折線
         ax.plot(plot_x, plot_y, color="#7fbf7f", linewidth=1.2, alpha=0.8)
-        # 點：綠/橙/紅/灰
+        # 點顏色依距離分級，一眼看出危險區：綠=安全(>5m)、橙=注意(<5m)、
+        # 紅=危險(<2m)、灰=貼近 r_max 視為無回波（空曠/超量程）。
         colors = np.full(real_dist.shape, "#50dc50", dtype=object)
         colors[real_dist < 5.0] = "#ffa500"
         colors[real_dist < 2.0] = "#ff3030"
@@ -340,7 +369,9 @@ class BevPlayNode(Node):
             ax.add_collection(LineCollection(segs, colors=cc,
                                               linewidths=1.5, zorder=2))
 
-        # subgoal 優先來自 obs_debug（policy 推論中），fallback 用 goal_pose 直接算
+        # subgoal 來源優先序：obs_debug（policy 實際看到的 goal，最貼近推論真相）
+        # > goal_pose 直接幾何換算（policy 沒在跑或無 obs 時的 fallback）。
+        # 顯示 policy 眼中的 goal 比顯示原始 goal 更能反映「車為何這樣走」。
         raw_gx = raw_gy = None
         if obs_79 is not None and obs_79.shape[0] >= 6:
             raw_gx, raw_gy = float(obs_79[4]), float(obs_79[5])
@@ -381,7 +412,9 @@ class BevPlayNode(Node):
         for x in (0.33, 0.66):
             ax.axvline(x, ymin=0.08, ymax=0.82, color="#272b30", linewidth=0.8)
 
-        # Status badge（右上）
+        # Status badge（右上）：顏色直接對應 ModeManager 的 5 種 mode，
+        # 讓看圖的人立刻知道車現在是 RL 控制中(綠)、急停(紅)、搖桿接管(橙)
+        # 還是待命/暫停(灰)，與 cmd_vel 行為一致（見 mode_manager.py）。
         if mode == "nav":
             badge_color, badge_text = "#1f8f3a", " [ RL Control: nav ] "
         elif mode == "estop":
@@ -485,8 +518,11 @@ class BevPlayNode(Node):
                     ha="left", va="center")
 
     def _fig_to_image_msg(self) -> Image:
+        # 把 Agg 後端畫好的 figure 緩衝區直接轉成 sensor_msgs/Image。
         self.fig.canvas.draw()
         width, height = self.fig.canvas.get_width_height()
+        # tostring_rgb 在新版 matplotlib 已移除，fallback 用 buffer_rgba 取前 3
+        # 通道丟掉 alpha，兼容新舊版本避免換機部署時 crash。
         try:
             buf = np.frombuffer(self.fig.canvas.tostring_rgb(), dtype=np.uint8)
             rgb = buf.reshape(height, width, 3)

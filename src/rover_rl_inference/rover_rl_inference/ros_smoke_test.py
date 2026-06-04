@@ -42,6 +42,8 @@ class SmokeTest(Node):
         self.dt = float(gp("control_dt").value)
         self.publish_twist = bool(gp("publish_twist").value)
 
+        # LiDAR 用 BEST_EFFORT：感測器資料量大且高頻，丟幀比塞滿佇列更安全；
+        # 須與 VLP-16 driver 的 publisher QoS 相容，否則訂閱不到任何點雲
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,

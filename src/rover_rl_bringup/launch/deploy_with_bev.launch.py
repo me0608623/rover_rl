@@ -29,28 +29,30 @@ from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
     DeclareLaunchArgument,
-    GroupAction,
+    GroupAction,           # 把多個 action 包成一組（此處用來包 BEV 節點）
     IncludeLaunchDescription,
-    LogInfo,
-    OpaqueFunction,
+    LogInfo,               # 啟動時印 banner 訊息
+    OpaqueFunction,        # 延遲執行函式，可在啟動時讀取參數實際值再決定節點設定
 )
-from launch.conditions import IfCondition
+from launch.conditions import IfCondition   # 依 bool 參數決定節點是否啟動
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+    # 預設參數檔路徑（policy 與 lidar preprocessor 各一份 yaml）
     pkg_share = get_package_share_directory("rover_rl_bringup")
     default_params = os.path.join(pkg_share, "config", "policy_params.yaml")
     default_pre_params = os.path.join(pkg_share, "config",
                                        "lidar_preprocessor_params.yaml")
 
-    params_file = LaunchConfiguration("params_file")
-    preprocessor_params_file = LaunchConfiguration("preprocessor_params_file")
-    model_path = LaunchConfiguration("model_path")
-    enable_bev = LaunchConfiguration("enable_bev")
-    enable_preprocessor = LaunchConfiguration("enable_preprocessor")
+    # 啟動參數代理（啟動時才解析）
+    params_file = LaunchConfiguration("params_file")                      # policy yaml
+    preprocessor_params_file = LaunchConfiguration("preprocessor_params_file")  # 前處理 yaml
+    model_path = LaunchConfiguration("model_path")                        # 覆寫模型路徑
+    enable_bev = LaunchConfiguration("enable_bev")                        # 是否開 BEV
+    enable_preprocessor = LaunchConfiguration("enable_preprocessor")      # 是否開前處理
     log_level = LaunchConfiguration("log_level")
 
     # ── 0. LiDAR preprocessor node（先處理再給 RL） ────────────────────────
@@ -66,9 +68,12 @@ def generate_launch_description():
     )
 
     # ── 1. Policy node（用 OpaqueFunction 避免空字串覆蓋 yaml model_path）────
+    # OpaqueFunction 會在啟動階段被呼叫，此時才能用 .perform() 取得參數真值。
+    # 關鍵差異：只有當 model_path 非空時才加入覆寫 dict；空字串就完全不覆寫，
+    # 讓 yaml 內的 model_path 生效（避免被空字串蓋掉）。
     def make_policy_node(context, *args, **kwargs):
         mp = LaunchConfiguration("model_path").perform(context)
-        extra = [{"model_path": mp}] if mp else []
+        extra = [{"model_path": mp}] if mp else []   # 空字串 → 不覆寫
         return [Node(
             package="rover_rl_inference",
             executable="policy_node",
@@ -98,6 +103,7 @@ def generate_launch_description():
         arguments=["--ros-args", "--log-level", log_level],
         condition=IfCondition(enable_bev),
     )
+    # 用 GroupAction 包起來（目前僅一個節點，保留分組以利日後擴充/命名空間）
     bev_group = GroupAction([bev_play_node])
 
     # ── 3. Banner ─────────────────────────────────────────────────────────
@@ -110,6 +116,8 @@ def generate_launch_description():
         "================================"
     ))
 
+    # 組裝啟動描述：先宣告所有可覆寫參數，再依序加入節點
+    # （preprocessor → policy → bev，符合資料流先後順序）
     return LaunchDescription([
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument(

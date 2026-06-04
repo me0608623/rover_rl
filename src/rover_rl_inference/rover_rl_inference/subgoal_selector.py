@@ -56,6 +56,8 @@ class SubgoalSelector:
 
     def select(self, robot_x: float, robot_y: float) -> SubgoalChoice | None:
         """機器人位置在 robot frame 對應的 path/goal frame。回傳當前 sub-goal."""
+        # prefer_path（收到 path 時設 True）→ planner 路徑蓋過手動 single goal；
+        # 否則只在沒有 single goal 時才退回吃 path
         prefer_path = self.prefer_path or self._single_xy is None
         if prefer_path and self._path_xy:
             return self._select_from_path(robot_x, robot_y)
@@ -78,7 +80,10 @@ class SubgoalSelector:
                 best_d = d
                 nearest_i = i
 
-        # 2) 從最近點往前找 lookahead 距離 carrot
+        # 2) 從最近點往前找第一個距離 >= lookahead 的點當 carrot：
+        #    給 policy 一個「夠遠、在路徑上」的瞬時目標，避免直奔終點抄近路撞牆，
+        #    也避免目標太近導致原地抖動（pure-pursuit 的核心）。從 nearest_i 起算
+        #    保證 carrot 永遠在前方、不會倒退選到已走過的 waypoint。
         for i in range(nearest_i, len(self._path_xy)):
             px, py = self._path_xy[i]
             if math.hypot(px - rx, py - ry) >= self.lookahead_m:

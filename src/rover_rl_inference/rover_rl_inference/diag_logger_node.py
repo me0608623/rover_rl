@@ -48,6 +48,8 @@ from std_msgs.msg import Float32MultiArray, String
 
 def _pv_to_py(pv):
     """rcl_interfaces ParameterValue → python（避免版本差異，手動轉）."""
+    # pv.type 是整數列舉，按 rcl_interfaces ParameterType 對應取出正確欄位；
+    # 不同 ROS 版本的 helper 介面有差異，故這裡直接查表轉，最穩
     t = pv.type
     return {
         1: lambda: pv.bool_value,
@@ -61,34 +63,39 @@ def _pv_to_py(pv):
         9: lambda: list(pv.string_array_value),
     }.get(t, lambda: None)()
 
+# CSV 欄位順序（DictWriter 依此寫表頭）；analyze_diag 依賴這些欄名，勿隨意改名。
+# *_age 欄記「該筆快取距現在幾秒」，事後可判斷某感測是否在掉訊。
 CSV_FIELDS = [
-    "t_wall", "t_rel",
-    "goal_seq", "has_goal",
-    "odom_x", "odom_y", "odom_yaw_deg", "odom_v", "odom_w",
-    "ndt_x", "ndt_y", "ndt_yaw_deg", "ndt_age",
+    "t_wall", "t_rel",                                       # 牆鐘時間 / 相對開錄秒數
+    "goal_seq", "has_goal",                                  # 第幾個 goal / 當下是否有 goal
+    "odom_x", "odom_y", "odom_yaw_deg", "odom_v", "odom_w",  # 里程計位姿與實測速度
+    "ndt_x", "ndt_y", "ndt_yaw_deg", "ndt_age",             # NDT map-frame 定位（ground truth）
     "goal_x", "goal_y", "goal_frame",
-    "dist_to_goal", "heading_err_deg",
-    "cmd_v", "cmd_w", "cmd_age",
-    "policy_goal_bx", "policy_goal_by", "policy_goal_ang_deg",
+    "dist_to_goal", "heading_err_deg",                       # 衍生：到 goal 距離 / 車頭朝向誤差
+    "cmd_v", "cmd_w", "cmd_age",                             # 實際發出的 cmd_vel
+    "policy_goal_bx", "policy_goal_by", "policy_goal_ang_deg",  # policy obs 內的 goal body 方向
     "policy_v_norm", "policy_w_norm", "obs_age",
-    "sweep_min_m", "sweep_age",
-    # 三層速度 + 延遲（來自 /rover_rl_policy/status）
+    "sweep_min_m", "sweep_age",                              # 72-bin sweep 還原成公尺後的最近障礙
+    # 三層速度 + 延遲（來自 /rover_rl_policy/status）：rl=RL意圖, sent=濾波後送出, act=odom實測
     "rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
-    "v_over", "w_over", "lag_ms", "lag_corr", "lag_ch",
+    "v_over", "w_over", "lag_ms", "lag_corr", "lag_ch",      # 飽和旗標 / 延遲估計值
 ]
 
 
 def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
+    # 只取 yaw（繞 z）：機器人在平面上移動，roll/pitch 不需要
     siny_cosp = 2.0 * (qw * qz + qx * qy)
     cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
     return math.atan2(siny_cosp, cosy_cosp)
 
 
 def _wrap_pi(a: float) -> float:
+    # 角度差包回 (-π, π]，避免 heading_err 出現 ±360° 的假大值
     return math.atan2(math.sin(a), math.cos(a))
 
 
 def _safe_label(s: str) -> str:
+    # 實驗名會直接拿來當資料夾/檔名，清掉空白與特殊字元防路徑注入/非法檔名，截 48 字
     s = s.strip().replace(" ", "_")
     return re.sub(r"[^0-9A-Za-z_\-]", "", s)[:48]
 
@@ -103,8 +110,8 @@ class DiagLoggerNode(Node):
         self.timer = self.create_timer(1.0 / max(self.rate_hz, 1.0), self._tick)
 
         if not self.require_start:
-            self.start_experiment("")        # 舊行為：啟動即待錄
-            ready = "已開錄（收到 goal 後寫列）"
+            self.start_experiment("")        # 啟動即待命（收到第一個 goal 才建資料夾）
+            ready = "待命中 — 收到第一個 goal 自動建資料夾開錄"
         else:
             ready = ("待命中 — 在另一終端送 start 才開錄：\n"
                      "    ros2 topic pub --once /rover_rl/record std_msgs/String "
@@ -118,7 +125,7 @@ class DiagLoggerNode(Node):
     # ── params ──
     def _declare_params(self) -> None:
         self.declare_parameter("rate_hz", 20.0)
-        self.declare_parameter("log_dir", os.path.expanduser("~/rover_rl/logs"))
+        self.declare_parameter("log_dir", os.path.expanduser("~/rover_rl/logs/diag"))
         self.declare_parameter("topic_odom", "/odom")
         self.declare_parameter("topic_ndt_pose", "/ndt_pose")
         self.declare_parameter("topic_goal_pose", "/goal_pose")
@@ -177,8 +184,11 @@ class DiagLoggerNode(Node):
         self._status = None        # dict（三層速度 + 延遲）
         # 實驗 / 檔案
         self._started = False
+        self._armed = False        # 已待命但尚未建資料夾（等第一個 goal）
+        self._exp_label = ""
         self._fh = None
         self._writer = None
+        self.run_dir = None
         self.csv_path = None
         self.wandb_run = None
         # policy 參數擷取（用底層 rcl_interfaces service client）
@@ -201,6 +211,7 @@ class DiagLoggerNode(Node):
         self._heading_n = 0
 
     def _init_pubsub(self) -> None:
+        # sweep 是高頻 sensor 流，用 BEST_EFFORT 匹配 preprocessor 端 QoS（RELIABLE 會對不上收不到）
         be = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST, depth=5,
@@ -217,27 +228,39 @@ class DiagLoggerNode(Node):
 
     # ── 實驗開關 ──
     def start_experiment(self, label: str) -> None:
-        if self._started:
+        # 一個「實驗」= 一個獨立資料夾 + 一份 CSV(+wandb run)；重新 start 先收掉上一個
+        if self._started or self._armed:
             self.stop_experiment()      # 先收掉上一個
-        os.makedirs(self.log_dir, exist_ok=True)
+        self._exp_label = label
+        self._reset_run_stats()
+        self._goal_seq = 0
+        self._goal = None
+        if self.log_only_with_goal:
+            # 待命：收到第一個 goal 才建資料夾 + 開檔（避免沒走 goal 留空資料夾）
+            self._armed = True
+            self.get_logger().info("▶ 待命中 — 收到第一個 goal 才建立紀錄資料夾")
+        else:
+            self._open_run_files(label)   # 不挑 goal → 立即開檔
+
+    def _open_run_files(self, label: str) -> None:
+        """真正建立 run 資料夾並開 CSV（由 start 或第一個 goal 觸發）."""
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         lab = _safe_label(label)
         name = f"diag_{stamp}" + (f"_{lab}" if lab else "")
-        self.csv_path = os.path.join(self.log_dir, name + ".csv")
+        # 每次實驗開一個獨立資料夾（以日期時間[_實驗名]命名），
+        # 該次所有檔案（CSV / params.json / 未來其他）都放裡面
+        self.run_dir = os.path.join(self.log_dir, name)
+        os.makedirs(self.run_dir, exist_ok=True)
+        self.csv_path = os.path.join(self.run_dir, name + ".csv")
         self._fh = open(self.csv_path, "w", newline="")
         self._writer = csv.DictWriter(self._fh, fieldnames=CSV_FIELDS)
         self._writer.writeheader()
         self._fh.flush()
-        self._reset_run_stats()
-        self._goal_seq = 0
-        self._goal = None
         self._t0 = time.monotonic()
         self._init_wandb(name)
+        self._armed = False
         self._started = True
-        self.get_logger().info(
-            f"▶ 開始實驗 '{name}' → {self.csv_path}"
-            + ("（指定 goal 後開始寫資料）" if self.log_only_with_goal else "")
-        )
+        self.get_logger().info(f"▶ 開始實驗 '{name}' → {self.csv_path}")
         self._schedule_param_capture()
 
     # ── 擷取 policy_node 參數（speed_rate 等）→ sidecar json + wandb config ──
@@ -250,6 +273,7 @@ class DiagLoggerNode(Node):
         self._params_timer = self.create_timer(1.0, self._try_capture_params)
 
     def _try_capture_params(self) -> None:
+        # policy_node 可能比 diag_logger 晚起，故用 1Hz timer 輪詢 service，最多重試 15 次
         self._params_attempts += 1
         if self._params_attempts > 15:
             self.get_logger().warn(
@@ -285,7 +309,8 @@ class DiagLoggerNode(Node):
             return
         params = {n: _pv_to_py(v) for n, v in zip(names, values)}
         self._policy_params = params
-        # sidecar json（與 CSV 同名 _params.json）
+        # sidecar json（與 CSV 同名 _params.json）：論文重現性 + 把當下 speed_rate/cmd_alpha
+        # 等參數和這次晃動資料綁在一起，事後才能對照「這組參數造成的行為」
         meta = {
             "csv": os.path.basename(self._params_csv_path or ""),
             "policy_node": self.policy_node_name,
@@ -331,6 +356,10 @@ class DiagLoggerNode(Node):
             self.wandb_run = None
 
     def stop_experiment(self) -> None:
+        if self._armed and not self._started:
+            self._armed = False
+            self.get_logger().info("⏹ 取消待命（未收到 goal，無資料夾/紀錄產生）")
+            return
         if not self._started:
             return
         self._print_summary()
@@ -389,6 +418,8 @@ class DiagLoggerNode(Node):
         frame = msg.header.frame_id or "map"
         self._goal = (msg.pose.position.x, msg.pose.position.y, frame)
         self._goal_seq += 1
+        if self._armed:
+            self._open_run_files(self._exp_label)   # 第一個 goal → 建資料夾開錄
         if self._started:
             self.get_logger().info(
                 f"[goal #{self._goal_seq}] ({msg.pose.position.x:.2f},"
@@ -402,6 +433,8 @@ class DiagLoggerNode(Node):
         frame = msg.header.frame_id or "map"
         self._goal = (last.x, last.y, frame)
         self._goal_seq += 1
+        if self._armed:
+            self._open_run_files(self._exp_label)   # 第一個 path → 建資料夾開錄
         if self._started:
             self.get_logger().info(
                 f"[path #{self._goal_seq}] {len(msg.poses)} pts, 終點 "
@@ -418,6 +451,7 @@ class DiagLoggerNode(Node):
     def _cb_sweep(self, msg: Float32MultiArray) -> None:
         if not msg.data:
             return
+        # sweep 是正規化 [0,1]，這裡用與訓練/preprocessor 相同公式還原成公尺，取最近一格 = 最近障礙
         m = min(msg.data)
         dist_m = m * (self.r_max - self.r_robot) + self.r_robot
         self._sweep_min = (dist_m, time.monotonic())
@@ -452,8 +486,9 @@ class DiagLoggerNode(Node):
             row["ndt_y"] = f"{ny:.3f}"
             row["ndt_yaw_deg"] = f"{math.degrees(nyaw):.2f}"
             row["ndt_age"] = f"{now - nt:.2f}"
-            robot_x, robot_y, robot_yaw = nx, ny, nyaw
+            robot_x, robot_y, robot_yaw = nx, ny, nyaw   # 優先用 NDT(map frame) 算 dist/heading
 
+        # NDT 還沒來時退回 odom，至少 dist/heading 有個近似值（odom 會漂但短時間可用）
         if robot_x is None and self._odom is not None:
             robot_x, robot_y, robot_yaw = self._odom[0], self._odom[1], self._odom[2]
 
@@ -463,6 +498,8 @@ class DiagLoggerNode(Node):
             row["goal_y"] = f"{gy:.3f}"
             row["goal_frame"] = gframe
             if robot_x is not None:
+                # heading_err = 「指向 goal 的方向」減「車頭實際朝向」（NDT ground truth）；
+                # 應與 policy_goal_ang_deg 一致，不一致代表定位/TF/座標出問題
                 dx, dy = gx - robot_x, gy - robot_y
                 dist = math.hypot(dx, dy)
                 heading_err = _wrap_pi(math.atan2(dy, dx) - robot_yaw)
@@ -485,7 +522,7 @@ class DiagLoggerNode(Node):
 
         if self._obs is not None:
             obs, obt = self._obs
-            bx, by = obs[4], obs[5]
+            bx, by = obs[4], obs[5]      # 79D obs 固定佈局：[4],[5] = goal 在 body frame 的 x,y
             row["policy_goal_bx"] = f"{bx:.3f}"
             row["policy_goal_by"] = f"{by:.3f}"
             row["policy_goal_ang_deg"] = f"{math.degrees(math.atan2(by, bx)):.2f}"
@@ -511,15 +548,18 @@ class DiagLoggerNode(Node):
         self._writer.writerow(row)
         self._n_rows += 1
         if self._n_rows % 20 == 0:
-            self._fh.flush()
+            self._fh.flush()          # 每秒(20Hz)落盤一次，意外斷電也保住大部分資料
 
         if self.wandb_run is not None:
+            # 同步到 wandb：只送可轉 float 的數值欄，排除字串欄(goal_frame/lag_ch)與
+            # 牆鐘時間(t_wall，數值太大會壓壞圖表 x 軸)
             metrics = {k: float(v) for k, v in row.items()
                        if v != "" and k not in ("goal_frame", "t_wall", "lag_ch")}
             self.wandb.log(metrics)
 
     # ── 摘要 ──
     def _print_summary(self) -> None:
+        # Δω RMS = 相鄰兩次 cmd 角速度差的均方根，是「角速度晃動」的核心量化指標（越大越抖）
         dw_std = math.sqrt(self._dw_sq / self._dw_n) if self._dw_n > 0 else 0.0
         cmd_w_abs = self._cmd_w_abs_sum / max(self._dw_n + 1, 1)
         head_abs = self._heading_abs_sum / max(self._heading_n, 1)

@@ -220,18 +220,25 @@ base_link ─(URDF static)─ base_footprint / velodyne_link / imu_link
 | odom → base_link | rover driver | campusrover_base launch |
 | base_link → child | URDF | robot_state_publisher |
 
-**rover_rl policy_node 採 spot_rl + rover2_ws 驗證過的 pattern**：
-- 訂閱 `/ndt_pose`（NDT 只在 is_converged=True 時發）
-- 用「近 1 秒收到且累積 ≥ 5 次」判定 NDT 穩定
-- 機器人靜止 + NDT 穩定時 cache `map→odom` offset（每 5 秒重算，delta > 0.3m 拒絕）
-- 即時計算：`robot_in_map = odom_xy + cached_offset`
-- 手動算 body-frame goal：`goal_body = R(-yaw) · (goal_map - robot_map)`
-- Fallback：NDT 未穩定 → 用 odom_only 來源（`require_ndt: false` 時允許）
+**⚠ 重要修正（2026-06-04）：本機 NDT 的 `/ndt_pose` 是 `map→odom` 變換、不是車姿。**
+這顆 `ndt_ws` 的 `ndt_localizer` 發的 `/ndt_pose` 內容 == `map→odom` TF（實測），
+真實車姿 = `map→odom ∘ odom→base`，差一個 `odom→base`。早期把 `/ndt_pose` 當車姿 →
+車離 odom 原點越遠、goal 方位/距離越歪（曾出現點正前方 3.5m 卻算成 7.3m/-113°）。
 
-**為何不直接用 `tf_buffer.transform(PoseStamped, target)`**？
-- NDT 更新頻率低（1-10 Hz），TF lookup 可能 stale 或失敗
-- cached offset 即使 NDT 暫時消失仍能跑（safer fallback）
-- 跟 rover2_ws 既有 rl_policy_node 同 pattern，行為一致
+**現行 pattern（policy_node `_robot_pose_in_map`）**：
+- 車姿走 **TF `map→base_footprint`**（`tf2_buffer.lookup_transform(goal_frame, base_frame, Time())`，
+  用 Time() 取最新可用、避免跨機時鐘不同步）—— 與 RViz 同一條鏈，由 tf2 正確合成 map→odom∘odom→base。
+- `/ndt_pose` 僅用於 **NDT 活性判定**（is_ndt_stable / ndt_age，基於訊息到達 monotonic 時間，跨機可靠）。
+- body-frame goal：`goal_body = R(-yaw) · (goal_map - robot_map)`（robot_map 來自上面 TF）。
+- Fallback：TF 查不到 → odom_only 來源（`require_ndt: false` 時允許）。
+- status/HB 的 `off_x/off_y/off_yaw` = 真實 `map→odom` TF；`pose_src` 正常為 `"tf"`。
+
+驗證：`pose_src` 應為 `tf`、`pose_x/y` 與 `ros2 run tf2_ros tf2_echo map base_footprint` 一致；
+點正前方 goal → `goal_ang_deg ≈ 0`。
+
+（舊註：`localization.MapOdomOffsetTracker` 的 cached-offset 車姿計算現已停用、改走 TF；
+其 `offset` 套用未旋轉 odom 位移的潛在 bug 也因此繞過。若日後換成「/ndt_pose 真的是車姿」的
+NDT，再評估是否回退。）
 
 ### 啟動順序
 
@@ -350,21 +357,24 @@ ros2 run tf2_ros tf2_echo map base_footprint
 `.bashrc` 已有現成 alias，包含完整 source 順序與環境設定：
 
 ```bash
-deploy_rl            # 完整棧 + 同終端機前景顯示繁中 TUI 儀表板，按 q 離開即自動收棧
-deploy_rl initial_mode:=nav   # 參數原樣轉給 launch
-deploy_rl_raw        # 舊行為：純 launch、滾動 log、無 UI（需看完整即時 log 時用）
+deploy_rl            # 純 ros2 launch（前景滾動 log）。任何 shell 皆可，含 Claude 非互動環境
+deploy_rl initial_mode:=nav     # 參數原樣轉給 launch
+deploy_rl_shell      # 互動式：完整棧背景 + 前景繁中 TUI 儀表板（需真實 TTY，給人用）
+deploy_rl_shell initial_mode:=nav
 deploy_rl_stop       # 停止整個棧
 ```
 
-`deploy_rl` → `bash ~/rover_rl/deploy_rl_ui.sh`，內部流程：
-1. source ROS/rover2_ws/rover_rl + `ROS_DOMAIN_ID=55` + `RMW=rmw_zenoh_cpp`
-2. `ros2 launch ... deploy_full.launch.py` 丟**背景**，stdout/stderr 導到 `~/rover_rl/logs/deploy_<時間>.log`（保持畫面乾淨）
-3. 等 `rover_rl_policy` 節點起來後，前景跑 `ros2 run rover_rl_inference status_tui`（curses 取得真實 TTY）
-4. 按 `q` 或 Ctrl+C → trap 自動呼叫 `rover_rl_stop.sh` 收掉整個棧
+**兩者分工（重要）**：
+- `deploy_rl` = 純 `ros2 launch deploy_full`，前景滾動 log。**Claude / 非互動 shell 用這個**（curses 在 pipe 會卡死，故 deploy_rl 不含 TUI）。Claude 要看狀態改用 `ros2 topic echo /rover_rl_policy/status`（JSON）。
+- `deploy_rl_shell` → `bash ~/rover_rl/deploy_rl_shell.sh`（**給人在真實終端機用**）：
+  1. **TTY 守門**：偵測非互動（`! -t 0/1`）→ 友善退出不硬跑 curses
+  2. `ros2 launch deploy_full` 丟**背景**，log 導到 `~/rover_rl/logs/deploy_<時間>.log`
+  3. 等 `rover_rl_policy` 起來 → 前景跑 `status_tui`（curses 取得真實 TTY）
+  4. 按 `q` 或 Ctrl+C → trap（`trap - EXIT INT TERM` 先解除自身避免重入，**不用 `''` 遮蔽訊號**）呼叫 `rover_rl_stop.sh` 收棧
 
-**為何不把 TUI 放進 launch**：launch 子行程無 TTY，curses 會崩；故採「launch 背景 + TUI 前景」分離。
+**為何不把 TUI 放進 launch**：launch 子行程無 TTY，curses 會崩；故採「launch 背景 + TUI 前景」分離，且只在 `deploy_rl_shell` 提供。
 
-⚠️ 直接用這個 alias，不要手動拼環境指令。
+⚠️ 直接用 alias，不要手動拼環境指令。
 
 ### Zenoh Router 必須先運行
 
@@ -496,11 +506,17 @@ ros2 run rover_rl_inference routing_click_bridge
 ### diag_logger（診斷記錄）
 - **Executable**: `diag_logger`
 - **職責**: 被動訂閱 odom/ndt/goal/cmd_vel/obs，逐列寫 CSV（不影響推論），供事後分析晃動/不朝 goal
-- **CSV 存檔位置**: `~/rover_rl/logs/`（`log_dir` 參數預設，`deploy_full.launch.py` 亦設同值）
-- **檔名規則**: `diag_<YYYYMMDD>_<HHMMSS>[_<實驗名>].csv`
-  （`<實驗名>` 來自 start 時給的 label，經 `_safe_label()` 清特殊字元；不給就只有時間戳）
+- **⭐ 資料存放位置（用戶委託分析時，第一個來這裡找）**: `~/rover_rl/logs/diag/`
+  - **每次實驗一個獨立資料夾**：`~/rover_rl/logs/diag/diag_<YYYYMMDD>_<HHMMSS>[_<實驗名>]/`
+  - 該次所有檔案都在裡面：
+    - `diag_<時間>.csv` — 20Hz 時間序列（goal/位置/cmd_vel/三層速度/延遲…）
+    - `diag_<時間>_params.json` — 當下 policy_node 全部參數（speed_rate / cmd_alpha 等，重現性用）
+  - 找最新一次測試 = `ls -td ~/rover_rl/logs/diag/*/ | head -1`
+- **何時建資料夾**: deploy 啟動後**待命**，**收到第一個 goal/path 才建資料夾開錄**（沒走 goal 不留空資料夾）。
+  `<實驗名>` 來自 record start 的 label（`_safe_label()` 清特殊字元；不給就只有時間戳）
+- **舊紀錄（2026-06-04 之前）**: 平鋪在 `~/rover_rl/logs/diag/` 根目錄（未分 run 資料夾）
 - **Ctrl+C 後**: 自動印「診斷摘要 + CSV 完整路徑 + analyze_diag 指令」
-- **分析**: `ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag_<...>.csv`
+- **分析**: `ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag/diag_<時間>/diag_<時間>.csv`
 
 ### status_tui（即時狀態儀表板，繁中 TUI）
 - **Executable**: `status_tui`
@@ -510,13 +526,15 @@ ros2 run rover_rl_inference routing_click_bridge
   terminal 跑，模式 / cmd_vel / LiDAR 最近距離 / 里程計 / NDT / goal 方向一目了然。
 - **顏色**: 綠=正常、黃=注意（idle/paused/NDT 未穩）、紅=危險（estop/逾時/障礙過近）。
 - **資料來源**: policy_node 以 5 Hz 發 `~/status`；TUI 收不到 >1.5s 顯示「等待 policy_node…」。
-- **預設啟動方式**：`deploy_rl` 已自動帶起（launch 背景化 + 此 TUI 前景，見「deploy_rl alias」）。
-- **單獨啟動**（接已在跑的棧）:
+- **互動式啟動**：`deploy_rl_shell`（**人用**，背景 launch + 此 TUI 前景，見「deploy_rl alias」）。
+  `deploy_rl`（Claude/非互動用）**不含** TUI。
+- **單獨啟動**（接已在跑的棧，需真實終端機）:
   ```bash
   source ~/rover_rl/install/setup.bash && source ~/rover_rl/setup_env.sh
   ros2 run rover_rl_inference status_tui      # 按 q 離開
   ```
-- **不放進 launch 檔**：launch 子行程無 TTY，curses 會崩；改由 `deploy_rl_ui.sh` 前景啟動。
+- **不放進 launch 檔 / 不放進 deploy_rl**：launch 子行程與非互動 shell 無 TTY，curses 會卡死/亂碼；
+  故 curses TUI 僅由 `deploy_rl_shell.sh`（含 TTY 守門）前景啟動。
 - **三層速度對比**：儀表板「速度v / 速度ω」列同框顯示
   `想{RL意圖} 送{濾波後送底盤} 實{odom實測}`；角速度超出底盤 `chassis_omega_max`（預設 1.2）時
   標 `⚠超1.2`（對應 gap #2）；底盤實測明顯跟不上送出值時轉黃（飽和/deadband/延遲）。
@@ -537,7 +555,8 @@ ros2 run rover_rl_inference routing_click_bridge
   - **【速度三層對比】**：各通道 想要→送出→實測 平均值 + 底盤跟隨率（<60% 警示飽和/deadband）
   - **【延遲】**：整段離線互相關估計（較穩）+ 即時 lag_ms 摘要，附 >200ms/>300ms 判讀
   ```bash
-  ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag_<...>.csv
+  # 資料在 ~/rover_rl/logs/diag/diag_<時間>/ 下；分析最新一次：
+  ros2 run rover_rl_inference analyze_diag "$(ls -td ~/rover_rl/logs/diag/*/ | head -1)"/*.csv
   ```
 
 ## 故障排除清單
@@ -549,6 +568,7 @@ ros2 run rover_rl_inference routing_click_bridge
 | 永遠輸出 0 cmd | log 看 `lidar timeout` 或 `odom timeout` | LiDAR/odom 訊號中斷；檢查 hz |
 | sweep_src=inline_fallback | preprocessor 節點死了 | `ros2 topic hz /rover_rl/lidar_sweep_72`；重啟 preprocessor |
 | Goal 永遠收不到 | `goal_frame` 設錯 | 改 `goal_frame: odom`（沒 map）或 `map`（有 NDT/AMCL） |
+| goal 方位/距離全歪（點正前方卻算成遠處側後方） | `/ndt_pose` 是 map→odom 非車姿，被當車姿用 | 已修：車姿改走 TF `map→base_footprint`（見上方 NDT 段）。確認 `pose_src=tf`、`pose_x/y` 與 `tf2_echo map base_footprint` 一致 |
 | routing_click_bridge 找不到節點 | 地圖節點未啟 | 先確認 `/get_route_info` service 存在 |
 | 跑起來但車原地震 | normalizer 期望 139D 你給 79D（或反） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照 |
 | cmd 振幅異常大 | normalizer mean/var 沒 bake 進 model | 重新 export_policy.py（必須帶有 obs_normalizer 的 checkpoint） |

@@ -39,6 +39,12 @@ MODE_LABEL = {
 
 
 class StatusTuiNode(Node):
+    """純訂閱端：把收到的狀態暫存在記憶體，渲染層用 snapshot() 取最新一份。
+
+    用 _lock 是因為 rclpy.spin() 跑在背景執行緒（見 main），與 curses 渲染
+    執行緒並行讀寫 self._status，需互斥避免讀到半更新的 dict。
+    """
+
     def __init__(self) -> None:
         super().__init__("rover_rl_status_tui")
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
@@ -65,7 +71,8 @@ class StatusTuiNode(Node):
             self._last_t = time.monotonic()
 
     def _cb_dyn(self, msg: MarkerArray) -> None:
-        # 計 action==ADD(0) 的標記數 ≈ 動態障礙數
+        # LV-DOT 偵測器用 MarkerArray 表示每個動態障礙框；marker.action==ADD(0)
+        # 才是當前 frame 有效的框（DELETE/DELETEALL 不算），故只數 action==0。
         n = sum(1 for m in msg.markers if m.action == 0)
         with self._lock:
             self._lvdot_n = n
@@ -106,6 +113,9 @@ class Dashboard:
         return curses.color_pair(pair) if curses.has_colors() else 0
 
     def run(self, stdscr) -> None:
+        # 由 curses.wrapper 呼叫，stdscr 是已初始化的真實終端機畫面。
+        # nodelay+timeout：getch 非阻塞、最多等 150ms，讓迴圈能定時重繪
+        # 而不會卡在等鍵盤輸入（否則畫面不會自動刷新）。
         curses.curs_set(0)
         stdscr.nodelay(True)
         stdscr.timeout(150)
@@ -130,6 +140,8 @@ class Dashboard:
     def _render(self, stdscr) -> None:
         status, last_t, lvdot_n, lvdot_t = self.node.snapshot()
         now = time.monotonic()
+        # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
+        # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
         age = now - last_t if last_t else float("inf")
         lvdot_age = now - lvdot_t if lvdot_t else float("inf")
         stale = age > 1.5
@@ -181,7 +193,11 @@ class Dashboard:
 
     @staticmethod
     def _track_pair(sent, act) -> int:
-        """送出 vs 實測 跟隨度顏色：底盤明顯跟不上→黃。"""
+        """送出 vs 實測 跟隨度顏色：底盤明顯跟不上→黃。
+
+        |sent|<0.2 時數值太小、比值不可靠（含原地）→ 不評斷直接給灰。
+        實測只達送出 6 成以下代表飽和/deadband/延遲（gap #2/#6），標黃提醒。
+        """
         if sent is None or act is None or abs(sent) < 0.2:
             return 5
         ratio = abs(act) / max(abs(sent), 1e-3)
@@ -204,6 +220,8 @@ class Dashboard:
 
     @staticmethod
     def _dist_pair(m) -> int:
+        # 最近障礙距離的健康度門檻：<0.6m 已近碰撞風險(紅)，0.6~1.2m 需注意(黃)，
+        # 其餘安全(綠)。門檻對應車身半徑 0.35m + 安全餘裕。
         if m is None:
             return 5
         if m < 0.6:
@@ -214,6 +232,8 @@ class Dashboard:
 
     def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf")
                     ) -> list[tuple[str, str, int, bool]]:
+        # 把 status JSON 整理成儀表板每一列 (標籤, 數值字串, 顏色pair, 粗體)。
+        # 渲染層只負責畫，所有「該紅該黃」的健康度判斷都集中在這裡。
         mode = s.get("mode", "?")
         mode_pair = {"nav": 1, "idle": 2, "paused": 2,
                      "manual": 4, "estop": 3}.get(mode, 5)
@@ -329,13 +349,18 @@ class Dashboard:
 
 
 def main(args=None) -> None:
+    # 設 locale 讓 curses 正確處理 UTF-8 中文寬字元，否則邊框/中文會錯位。
     locale.setlocale(locale.LC_ALL, "")
     rclpy.init(args=args)
     node = StatusTuiNode()
+    # ROS spin 與 curses 渲染不能共用同一執行緒（兩者都是阻塞迴圈），
+    # 故 spin 丟背景 daemon thread，主執行緒交給 curses。
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
     dash = Dashboard(node)
     try:
+        # curses.wrapper 負責 initscr/endwin 與例外時還原終端機；需真實 TTY，
+        # 在 pipe / 非互動 shell 會崩潰，故此節點只由 deploy_rl_shell 前景啟動。
         curses.wrapper(dash.run)
     except KeyboardInterrupt:
         pass

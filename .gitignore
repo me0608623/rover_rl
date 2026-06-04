@@ -23,6 +23,9 @@ models/*.pt
 logs/
 wandb/
 
+# rosbag（離線測試感測器錄製，大檔不入庫）
+src/bag/
+
 # OS
 .DS_Store
 Thumbs.db

@@ -42,6 +42,8 @@ def _col(rows, key):
 
 
 def _stats(xs):
+    # 通用統計摘要（忽略 None）。注意 median 用 sorted[n//2] 是簡化版（偶數筆
+    # 取偏上位數而非平均兩中值），對診斷判讀夠用、不需精確中位數。
     xs = [x for x in xs if x is not None]
     if not xs:
         return None
@@ -80,7 +82,15 @@ def _print_params(csv_path: str) -> None:
 
 
 def _xcorr_lag(t, sent, act, max_lag_s=1.0, min_std=0.04):
-    """離線互相關估 sent→act 延遲。回傳 (lag_s, corr) 或 (None, None)。"""
+    """離線互相關估 sent→act 延遲。回傳 (lag_s, corr) 或 (None, None)。
+
+    原理：把「送出 cmd」往後平移 k 格再和「實測」逐點相乘求平均（即正規化
+    互相關），讓兩條訊號最對齊的位移量 k×dt 就是底盤的反應延遲。先各自減均值
+    除標準差做 z-score 正規化，使相關值落在 [-1,1]、與訊號振幅無關。
+
+    若訊號太平穩（std < min_std，多半是站著沒動）相關沒有意義，回 None 要求
+    使用者在移動中重錄。
+    """
     pairs = [(s, a) for s, a in zip(sent, act) if s is not None and a is not None]
     if len(pairs) < 30:
         return None, None
@@ -88,6 +98,7 @@ def _xcorr_lag(t, sent, act, max_lag_s=1.0, min_std=0.04):
     s = [p[0] for p in pairs]
     a = [p[1] for p in pairs]
     ts = [x for x in t if x is not None]
+    # 由時間欄推平均取樣間隔 dt，把「平移幾格」換算回秒；缺時間欄退回 0.05s(20Hz)。
     dt = (ts[-1] - ts[0]) / max(len(ts) - 1, 1) if len(ts) >= 2 else 0.05
     sd_s = statistics.pstdev(s)
     sd_a = statistics.pstdev(a)
@@ -97,6 +108,8 @@ def _xcorr_lag(t, sent, act, max_lag_s=1.0, min_std=0.04):
     sn = [(x - ms) / sd_s for x in s]
     an = [(x - ma) / sd_a for x in a]
     n = len(sn)
+    # 只搜尋 0 ~ max_lag_s 的正向延遲（實測不可能領先送出）；逐個 k 算相關，
+    # 取相關最高者為估計延遲。n-k<=5 時樣本太少不可信，提早結束。
     max_k = max(int(max_lag_s / dt), 1)
     best_k, best_c = 0, -2.0
     for k in range(0, max_k + 1):
@@ -109,6 +122,8 @@ def _xcorr_lag(t, sent, act, max_lag_s=1.0, min_std=0.04):
 
 
 def _print_speed_tracking(rl_w, sent_w, act_w, rl_v, sent_v, act_v) -> None:
+    # 三層拆解定位問題出在哪：RL想要→送出 之間的落差是濾波器(low-pass/slew)造成，
+    # 送出→實測 之間的落差是底盤端(飽和/deadband/延遲)造成。
     print("【速度三層對比】RL想要 → 送出底盤 → 底盤實測")
 
     def _avg_abs(xs):
@@ -168,6 +183,10 @@ def analyze(path: str) -> None:
         print(f"[!] {path} 沒有資料列")
         return
 
+    # 以下逐欄抽出 diag_logger 寫入的時間序列（缺值為 None）：
+    # t_rel=相對時間秒；cmd_*=最終 cmd_vel；odom_w=實測角速；
+    # heading_err_deg=NDT 真實朝向誤差；dist_to_goal=與目標距離；
+    # policy_goal_ang_deg=policy 自己算的目標方位（拿來和 heading 比對檢查 TF）。
     t = _col(rows, "t_rel")
     cmd_w = _col(rows, "cmd_w")
     cmd_v = _col(rows, "cmd_v")
@@ -185,7 +204,8 @@ def analyze(path: str) -> None:
     lag_ms = _col(rows, "lag_ms")
     lag_corr = _col(rows, "lag_corr")
 
-    # Δω（相鄰列）
+    # Δω（相鄰列）：相鄰兩筆角速度的差分，std 越大代表 cmd_w 抖動越劇烈＝晃動。
+    # 用差分而非 ω 本身，是因為穩定大轉彎的 ω 也很大但不算「晃」。
     dws = [b - a for a, b in zip(cmd_w, cmd_w[1:])
            if a is not None and b is not None]
     dw_st = _stats(dws)
@@ -194,12 +214,14 @@ def analyze(path: str) -> None:
     di_st = _stats(dist)
     pol_st = _stats([abs(x) for x in pol_ang if x is not None])
 
-    # heading 與 policy_goal_ang 一致性（檢查定位/TF）
+    # heading 與 policy_goal_ang 一致性（檢查定位/TF）：兩者理應接近，差很大
+    # 代表 policy 看到的目標方向和 NDT 真實方向不一致 → TF/座標轉換有問題。
     diff = [abs(h - p) for h, p in zip(heading, pol_ang)
             if h is not None and p is not None]
     diff_st = _stats(diff)
 
-    # 朝 goal 前進？distance 趨勢（頭 20% vs 尾 20%）
+    # 朝 goal 前進？比較頭 20% 與尾 20% 的平均距離，看整體是靠近還是變遠，
+    # 取區段平均而非單點首尾以抑制定位噪聲。
     dvals = [d for d in dist if d is not None]
     trend = None
     if len(dvals) >= 10:
