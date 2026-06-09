@@ -490,6 +490,14 @@ policy_node 已具備 watchdog（LiDAR/odom timeout 自動發 0），但首次�
 - **職責**: campusrover_routing `generation_path` service → `/global_path` topic 橋接
 - **呼叫方式**: `ros2 service call /rover_rl/routing_call campusrover_msgs/srv/RoutingPath "{origin: 'c1', destination: ['e0']}"`
 - **效果**: 結果自動 2Hz republish 到 `/global_path` → policy_node 的 SubgoalSelector 接收
+- **具名站序（2026-06-09 加入，地鐵式儀表板用）**: 額外抓 `/get_route_info`（ModuleInfo）拿
+  拓撲節點表（name→xy），把 `/global_path` 的 waypoint snap 到最近具名節點（門檻 `station_snap_m`
+  預設 1.5m、去重相鄰同名）→ 推出**有序站名 + 各站起始 waypoint index**，2Hz 發到
+  `/rover_rl/route_stations`（std_msgs/String JSON `{stations, wp_idx, n_wp}`）。
+  - RoutingPath response 本身**不含站名**（只有 `nav_msgs/Path[]` 純 pose），站名/座標來自 get_route_info。
+  - status_tui 用 policy 發的 `path_i`（同一條 path 的 index）對 `wp_idx` 求目前在第幾站，
+    **不做 frame 轉換**（path_i 與 wp_idx 同屬 path 索引空間）。節點表未載入 → stations 空 → TUI
+    自動退回幾何進度條。
 
 ### routing_click_bridge
 - **Executable**: `routing_click_bridge`
@@ -514,6 +522,21 @@ ros2 run rover_rl_inference routing_click_bridge
   - 找最新一次測試 = `ls -td ~/rover_rl/logs/diag/*/ | head -1`
 - **何時建資料夾**: deploy 啟動後**待命**，**收到第一個 goal/path 才建資料夾開錄**（沒走 goal 不留空資料夾）。
   `<實驗名>` 來自 record start 的 label（`_safe_label()` 清特殊字元；不給就只有時間戳）
+- **⭐ 一個 goal/path = 一段獨立紀錄（2026-06-09 加入 auto-stop + auto-rearm）**:
+  - **到終點自動停**: robot 到 goal `auto_stop_goal_tol`（0.6m）內連續 `auto_stop_goal_ticks`（10 tick=0.5s）
+    → 印摘要、關 CSV、`wandb.finish()`、發 `/rover_rl/diag_event` 的 `goal_reached`。
+  - **方式 B（routing path）**: 取 `poses[-1]`（終點）當停止判據；中途 waypoint 不停，只在**最後一點**停。
+  - **自動 re-arm（`auto_rearm`，預設 True）**: 停完自動回待命，**下一個 goal/path 進來開全新一段**
+    （新資料夾 + 新 CSV + 新 wandb run）。多 goal 連續操作完全自動，不必手動 record start。
+  - **每段一個 wandb run**（`enable_wandb` 預設 True、`wandb_mode` 預設 **online**），run 名=資料夾名。
+  - **stale path 防護**: `routing_to_path` 是 2Hz 無限 republish，故 ①進行中同終點只刷新座標不重置
+    auto-stop tick（否則永遠停不了）②re-arm 後用 `_last_done_goal` + `goal_change_eps_m`（0.8m）擋掉
+    「剛完成終點」的殘留發布，避免原地秒重開迴圈。新 routing（終點 >0.8m 變化）才算新一段。
+  - 手動 `record stop` 是明確停止，**不** re-arm。
+- **⚙ 設定真值**: `src/rover_rl_bringup/config/diag_logger_params.yaml`（auto_rearm / goal_change_eps_m /
+  auto_stop_* / wandb 等都在此）。deploy_full 載入它；改 yaml 後重 build bringup 即生效。
+  `require_start` / `enable_wandb` / `wandb_mode` / `auto_rearm` / `goal_change_eps_m` 五個也可用
+  CLI arg 現場熱調（留空走 yaml，有給才覆寫）：`deploy_rl auto_rearm:=false goal_change_eps_m:=1.5`。
 - **舊紀錄（2026-06-04 之前）**: 平鋪在 `~/rover_rl/logs/diag/` 根目錄（未分 run 資料夾）
 - **Ctrl+C 後**: 自動印「診斷摘要 + CSV 完整路徑 + analyze_diag 指令」
 - **分析**: `ros2 run rover_rl_inference analyze_diag ~/rover_rl/logs/diag/diag_<時間>/diag_<時間>.csv`
@@ -535,6 +558,15 @@ ros2 run rover_rl_inference routing_click_bridge
   ```
 - **不放進 launch 檔 / 不放進 deploy_rl**：launch 子行程與非互動 shell 無 TTY，curses 會卡死/亂碼；
   故 curses TUI 僅由 `deploy_rl_shell.sh`（含 TTY 守門）前景啟動。
+- **導航型態 + 地鐵式路線（2026-06-09 加入）**：「導航」列標示目前是
+  `路徑導航 (routing)`（方式 B，RViz Publish Point 兩點觸發 routing）或 `單一 goal 導航`
+  （方式 A，RViz 2D Goal Pose）或 `待命（無目標）`。資料來自 status JSON 的 `nav_type`
+  （由 policy 的 subgoal source 推導：`path_*`→path、`goal_pose`→single）。
+  - **路徑導航時多一列「路線」地鐵式進度條**：
+    - 有具名站序（訂閱到 `/rover_rl/route_stations`）→ 畫站名線 `c1 - c3 - e0`，目前站綠色粗體，
+      站太多時以 `…` 視窗化；目前站由 `path_i` 對 `wp_idx` 求得。「導航」列同步顯示 `c3 (第 2/3 站)`。
+    - 無站序（routing 節點表沒載入/手發 path）→ 退回幾何進度條 `起[==O-->--]終 12/47`，
+      `O`=目前最近 waypoint、`>`=lookahead carrot。
 - **三層速度對比**：儀表板「速度v / 速度ω」列同框顯示
   `想{RL意圖} 送{濾波後送底盤} 實{odom實測}`；角速度超出底盤 `chassis_omega_max`（預設 1.2）時
   標 `⚠超1.2`（對應 gap #2）；底盤實測明顯跟不上送出值時轉黃（飽和/deadband/延遲）。

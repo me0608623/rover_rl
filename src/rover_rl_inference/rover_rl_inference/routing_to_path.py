@@ -19,6 +19,8 @@ campusrover_routing 的 generation_path service 回傳 nav_msgs/Path[]，
 """
 from __future__ import annotations
 
+import json
+import math
 import threading
 
 import rclpy
@@ -26,7 +28,8 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import Path
-from campusrover_msgs.srv import RoutingPath
+from std_msgs.msg import String
+from campusrover_msgs.srv import RoutingPath, ModuleInfo
 from campusrover_msgs.msg import WorkingFloor
 
 
@@ -37,19 +40,37 @@ class RoutingToPathNode(Node):
         self.declare_parameter("building", "itc")
         self.declare_parameter("floor", "3")
         self.declare_parameter("topic_global_path", "/global_path")
+        self.declare_parameter("topic_route_stations", "/rover_rl/route_stations")
         self.declare_parameter("default_origin", "c1")
         self.declare_parameter("default_destination", ["e0"])
+        # waypoint snap 到具名節點的距離門檻（公尺）；超過視為「不在任一站」
+        self.declare_parameter("station_snap_m", 1.5)
 
         building = self.get_parameter("building").get_parameter_value().string_value
         floor = self.get_parameter("floor").get_parameter_value().string_value
         topic_path = self.get_parameter("topic_global_path").get_parameter_value().string_value
+        topic_stations = self.get_parameter(
+            "topic_route_stations").get_parameter_value().string_value
+        self._snap_m = float(self.get_parameter("station_snap_m").value)
 
         # 發布 /global_path。routing 是 service-based 一次性回傳，但 policy_node 的
         # SubgoalSelector 訂閱的是 topic；故把路徑緩存後 2Hz 持續 republish，
         # 確保晚啟動或重連的訂閱者（RViz / policy_node）都拿得到最新路徑。
         self.pub_path = self.create_publisher(Path, topic_path, 5)
         self._last_path: Path | None = None
-        # 2Hz 定期重發最後一條路徑，避免 TF 更新後 RViz 失去顯示
+
+        # 具名站序（地鐵式儀表板用）：把路徑 snap 到拓撲節點 → 有序站名 + 各站 waypoint index。
+        # 用 waypoint index 而非座標，讓 status_tui 直接拿 policy 發的 path_i 對應目前在第幾站，
+        # 完全避開 node/path frame 不一致的轉換問題。
+        self.pub_stations = self.create_publisher(String, topic_stations, 5)
+        self._last_stations: dict | None = None
+        # 路由拓撲節點座標表（name → (x,y)），由 /get_route_info 載入，snap 用
+        self._nodes: dict[str, tuple[float, float]] = {}
+        self._nodes_loaded = False
+        self.route_info_client = self.create_client(ModuleInfo, "/get_route_info")
+        self.create_timer(2.0, self._fetch_nodes)
+
+        # 2Hz 定期重發最後一條路徑 + 站序，避免晚啟動的訂閱者（RViz / TUI）漏接
         self.create_timer(0.5, self._repub_path)
 
         # 發布 working_floor 觸發 routing 載入
@@ -82,6 +103,65 @@ class RoutingToPathNode(Node):
     def _repub_path(self):
         if self._last_path is not None:
             self.pub_path.publish(self._last_path)
+        if self._last_stations is not None:
+            msg = String()
+            msg.data = json.dumps(self._last_stations)
+            self.pub_stations.publish(msg)
+
+    def _fetch_nodes(self):
+        # routing 用具名節點（c1/e0…），先抓拓撲節點表把路徑 snap 成站序。
+        # timer 重試直到 /get_route_info 上線且載入成功。
+        if self._nodes_loaded:
+            return
+        if not self.route_info_client.wait_for_service(timeout_sec=0.1):
+            return
+        req = ModuleInfo.Request()
+        req.building = self._building
+        req.floor = self._floor
+        future = self.route_info_client.call_async(req)
+        future.add_done_callback(self._on_route_info)
+
+    def _on_route_info(self, future):
+        try:
+            resp = future.result()
+            for node in resp.node:
+                self._nodes[node.name] = (node.pose.position.x, node.pose.position.y)
+            self._nodes_loaded = True
+            self.get_logger().info(f"載入 {len(self._nodes)} 個路由節點（站序用）")
+            # 節點表晚於路徑載入時，補算一次站序
+            if self._last_path is not None:
+                self._last_stations = self._derive_stations(self._last_path)
+        except Exception as e:
+            self.get_logger().error(f"get_route_info 失敗: {e}")
+
+    def _derive_stations(self, path: Path) -> dict:
+        """把路徑 waypoint snap 到最近具名節點 → 有序站名 + 各站起始 waypoint index.
+
+        作法：逐 waypoint 找最近節點，距離 <= snap 門檻才算「在該站」；連續同名只記
+        第一個 index（去重相鄰重複）。回傳 {stations, wp_idx, n_wp}。
+        n_wp 讓 TUI 知道總點數，wp_idx 對應 policy 的 path_i 求目前在第幾站。
+        """
+        n_wp = len(path.poses)
+        if not self._nodes or n_wp == 0:
+            return {"stations": [], "wp_idx": [], "n_wp": n_wp}
+        seq: list[tuple[int, str]] = []
+        for i, ps in enumerate(path.poses):
+            name, d = self._nearest_node(ps.pose.position.x, ps.pose.position.y)
+            if name is None or d > self._snap_m:
+                continue
+            if seq and seq[-1][1] == name:
+                continue  # 去重相鄰同名
+            seq.append((i, name))
+        return {"stations": [n for _, n in seq],
+                "wp_idx": [i for i, _ in seq], "n_wp": n_wp}
+
+    def _nearest_node(self, x: float, y: float) -> tuple[str | None, float]:
+        if not self._nodes:
+            return None, float("inf")
+        name = min(self._nodes, key=lambda n: math.hypot(
+            self._nodes[n][0] - x, self._nodes[n][1] - y))
+        nx, ny = self._nodes[name]
+        return name, math.hypot(nx - x, ny - y)
 
     def _publish_floor(self):
         # routing_engine 要先收到 working_floor 才會載入對應樓層的拓撲圖；
@@ -127,9 +207,14 @@ class RoutingToPathNode(Node):
             path = result.routing[0]
             self._last_path = path
             self.pub_path.publish(path)
+            # 推導具名站序並發布（節點表未載入時 stations 為空，TUI 自動退回幾何進度條）
+            self._last_stations = self._derive_stations(path)
+            self.pub_stations.publish(
+                String(data=json.dumps(self._last_stations)))
             self.get_logger().info(
                 f"路徑已發布到 /global_path: {len(path.poses)} poses, "
-                f"origin={request.origin} → dest={request.destination}"
+                f"origin={request.origin} → dest={request.destination}, "
+                f"站序={self._last_stations['stations']}"
             )
             response.routing = result.routing
         else:

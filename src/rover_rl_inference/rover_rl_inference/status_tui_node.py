@@ -50,10 +50,13 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
         self.declare_parameter("topic_dynamic_bboxes", "/onboard_detector/dynamic_bboxes")
         self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
+        self.declare_parameter("topic_route_stations", "/rover_rl/route_stations")
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
         topic_dyn = self.get_parameter(
             "topic_dynamic_bboxes").get_parameter_value().string_value
         topic_diag = self.get_parameter("topic_diag_event").get_parameter_value().string_value
+        topic_stations = self.get_parameter(
+            "topic_route_stations").get_parameter_value().string_value
         self._lock = threading.Lock()
         self._status: dict | None = None
         self._last_t = 0.0
@@ -61,9 +64,12 @@ class StatusTuiNode(Node):
         self._lvdot_t = 0.0
         self._diag_event: dict | None = None  # goal_reached 等事件
         self._diag_event_t = 0.0
+        self._stations: dict | None = None    # routing 具名站序 {stations, wp_idx, n_wp}
+        self._stations_t = 0.0
         self.create_subscription(String, topic, self._cb_status, 10)
         self.create_subscription(MarkerArray, topic_dyn, self._cb_dyn, 10)
         self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
+        self.create_subscription(String, topic_stations, self._cb_stations, 10)
         self._topic = topic
 
     def _cb_status(self, msg: String) -> None:
@@ -92,10 +98,20 @@ class StatusTuiNode(Node):
             self._diag_event = data
             self._diag_event_t = time.monotonic()
 
-    def snapshot(self) -> tuple[dict | None, float, int | None, float, dict | None, float]:
+    def _cb_stations(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._stations = data
+            self._stations_t = time.monotonic()
+
+    def snapshot(self) -> tuple:
         with self._lock:
             return (self._status, self._last_t, self._lvdot_n, self._lvdot_t,
-                    self._diag_event, self._diag_event_t)
+                    self._diag_event, self._diag_event_t,
+                    self._stations, self._stations_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -152,8 +168,31 @@ class Dashboard:
             w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         return w
 
+    @staticmethod
+    def _current_station(stations: dict | None, path_i) -> tuple[list, int] | None:
+        """由 path_i（policy 發的最近 waypoint index）對應目前在第幾站.
+
+        stations.wp_idx[k] = 第 k 站的起始 waypoint index；目前站 = 最後一個
+        wp_idx <= path_i 的站。回傳 (站名list, 目前index)；資料不足回傳 None。
+        """
+        if not stations:
+            return None
+        names = stations.get("stations") or []
+        wp = stations.get("wp_idx") or []
+        if len(names) < 2 or len(wp) != len(names):
+            return None
+        cur = 0
+        if path_i is not None:
+            for k, widx in enumerate(wp):
+                if widx <= path_i:
+                    cur = k
+                else:
+                    break
+        return names, max(0, min(cur, len(names) - 1))
+
     def _render(self, stdscr) -> None:
-        status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t = self.node.snapshot()
+        (status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t,
+         stations, stations_t) = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
@@ -166,21 +205,29 @@ class Dashboard:
         box_w = min(max(52, w - 2), 70)
 
         # 先依狀態決定列數與是否畫地鐵式進度條（路徑導航才畫）→ 才能算框高
+        station_info = None
+        show_route = show_subway = False
         if status is not None and not stale:
-            rows = self._build_rows(status, lvdot_n, lvdot_age)
+            is_path = status.get("nav_type") == "path"
             pn = status.get("path_n")
-            show_subway = (status.get("nav_type") == "path" and pn and pn >= 2
+            stations_fresh = stations_t and (now - stations_t) < 5.0
+            if is_path and stations_fresh:
+                station_info = self._current_station(stations, status.get("path_i"))
+            rows = self._build_rows(status, lvdot_n, lvdot_age, station_info)
+            # 有具名站序 → 畫站名地鐵線；否則退回幾何進度條（起→O→終）
+            show_route = station_info is not None
+            show_subway = (not show_route and is_path and pn and pn >= 2
                            and status.get("path_i") is not None)
         else:
             rows = []
-            show_subway = False
 
         n = len(rows)
-        subway_y = 1 + n + 1            # rows 後空一列再畫進度條
-        box_h = (subway_y + 2) if show_subway else max(18, n + 3)
-        # 框高超出終端機 → 先犧牲進度條再縮；仍放不下才提示放大
-        if show_subway and h < box_h + 1:
-            show_subway = False
+        line_y = 1 + n + 1             # rows 後空一列再畫站線/進度條
+        show_line = show_route or show_subway
+        box_h = (line_y + 2) if show_line else max(18, n + 3)
+        # 框高超出終端機 → 先犧牲站線再縮；仍放不下才提示放大
+        if show_line and h < box_h + 1:
+            show_route = show_subway = show_line = False
             box_h = max(18, n + 3)
         if h < box_h + 1 or w < box_w:
             stdscr.addstr(0, 0, "終端機視窗太小，請放大…")
@@ -212,8 +259,10 @@ class Dashboard:
                 v = v[:-1]
             win.addstr(y, val_col, v, attr)
 
-        if show_subway:
-            self._draw_subway(win, subway_y, box_w, status)
+        if show_route:
+            self._draw_route_stations(win, line_y, box_w, *station_info)
+        elif show_subway:
+            self._draw_subway(win, line_y, box_w, status)
 
         foot = f" 更新 {age:.1f}s 前 · 按 q 離開 "
         win.addstr(box_h - 1, 2, foot, self._c(5))
@@ -302,6 +351,52 @@ class Dashboard:
         win.addstr(y, bar_x + bar_w, "]終", self._c(5))
         win.addstr(y, bar_x + bar_w + 3, count_txt, self._c(4))
 
+    def _draw_route_stations(self, win, y: int, box_w: int,
+                             names: list, cur: int) -> None:
+        """地鐵路線式具名站線：c1 - c3 - e0，目前站綠色粗體；過寬時以 … 視窗化."""
+        win.addstr(y, 2, "路線", self._c(5))
+        x0 = 11
+        avail = box_w - x0 - 2
+        n = len(names)
+        sep = " - "
+        sep_w = len(sep)
+
+        def span_w(lo: int, hi: int) -> int:
+            w = sum(self._disp_w(names[i]) for i in range(lo, hi + 1))
+            w += sep_w * (hi - lo)
+            if lo > 0:
+                w += 2   # 前置「… 」
+            if hi < n - 1:
+                w += 2   # 後置「 …」
+            return w
+
+        # 以目前站為中心，左右貪婪擴張到塞不下為止（視窗化避免站太多爆寬）
+        lo = hi = max(0, min(cur, n - 1))
+        while True:
+            grew = False
+            if lo > 0 and span_w(lo - 1, hi) <= avail:
+                lo -= 1
+                grew = True
+            if hi < n - 1 and span_w(lo, hi + 1) <= avail:
+                hi += 1
+                grew = True
+            if not grew:
+                break
+
+        x = x0
+        if lo > 0:
+            win.addstr(y, x, "… ", self._c(5))
+            x += 2
+        for i in range(lo, hi + 1):
+            attr = (self._c(1) | curses.A_BOLD) if i == cur else self._c(5)
+            win.addstr(y, x, names[i], attr)
+            x += self._disp_w(names[i])
+            if i < hi:
+                win.addstr(y, x, sep, self._c(5))
+                x += sep_w
+        if hi < n - 1:
+            win.addstr(y, x, " …", self._c(5))
+
     @staticmethod
     def _track_pair(sent, act) -> int:
         """送出 vs 實測 跟隨度顏色：底盤明顯跟不上→黃。
@@ -341,8 +436,8 @@ class Dashboard:
             return 2   # 黃：注意
         return 1       # 綠
 
-    def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf")
-                    ) -> list[tuple[str, str, int, bool]]:
+    def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf"),
+                    station_info=None) -> list[tuple[str, str, int, bool]]:
         # 把 status JSON 整理成儀表板每一列 (標籤, 數值字串, 顏色pair, 粗體)。
         # 渲染層只負責畫，所有「該紅該黃」的健康度判斷都集中在這裡。
         mode = s.get("mode", "?")
@@ -410,9 +505,14 @@ class Dashboard:
         # 導航型態：方式 B（routing 多 waypoint）vs 方式 A（單一 goal_pose）
         nav_type = s.get("nav_type")
         if nav_type == "path":
-            pi, pn = s.get("path_i"), s.get("path_n")
-            nav_txt = ("路徑導航 (routing)" if pi is None or not pn
-                       else f"路徑導航 (routing) · 第 {pi + 1}/{pn} 點")
+            if station_info is not None:
+                names, cur = station_info
+                nav_txt = (f"路徑導航 (routing) · {names[cur]} "
+                           f"(第 {cur + 1}/{len(names)} 站)")
+            else:
+                pi, pn = s.get("path_i"), s.get("path_n")
+                nav_txt = ("路徑導航 (routing)" if pi is None or not pn
+                           else f"路徑導航 (routing) · 第 {pi + 1}/{pn} 點")
             nav_pair = 4
         elif nav_type == "single":
             nav_txt, nav_pair = "單一 goal 導航", 4
