@@ -180,6 +180,15 @@ class PolicyNode(Node):
         # 的車姿，打斷極限環。0.0=關閉（預設，行為完全不變）。
         # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2
         self.declare_parameter("cmd_delay_comp_s", 0.0)
+        # 補償總開關：false=完全關閉（不論 cmd_delay_comp_s 設多少）。
+        # 讓你保留調好的秒數、用這個開關決定開不開，不必每次改回 0。
+        # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_enable true
+        self.declare_parameter("cmd_delay_comp_enable", False)
+        # 預測用的速度來源：
+        #   "measured"  = odom 實測速度（本身在震盪 → 可能把震盪回授進 obs，火上加油）
+        #   "commanded" = 上一拍 policy 命令速度（Smith-predictor 思路，不耦合 odom 震盪）
+        # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_src commanded
+        self.declare_parameter("cmd_delay_comp_src", "measured")
         # 底盤實體上限（僅供診斷：判定 cmd 是否超出底盤能力，見 CLAUDE.md gap #2）
         self.declare_parameter("chassis_v_max", 1.5)
         self.declare_parameter("chassis_omega_max", 1.2)
@@ -230,6 +239,10 @@ class PolicyNode(Node):
         )
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
         self.cmd_delay_comp_s = self._clamp_comp(float(gp("cmd_delay_comp_s").value))
+        self.cmd_delay_comp_enable = bool(gp("cmd_delay_comp_enable").value)
+        self.cmd_delay_comp_src = self._clamp_src(
+            gp("cmd_delay_comp_src").get_parameter_value().string_value
+        )
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
         self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
@@ -395,6 +408,15 @@ class PolicyNode(Node):
             )
         return clamped
 
+    def _clamp_src(self, s: str) -> str:
+        """cmd_delay_comp_src 只接受 measured / commanded；其他值警告並退回 measured."""
+        if s not in ("measured", "commanded"):
+            self.get_logger().warn(
+                f"cmd_delay_comp_src={s!r} 非法（僅 measured/commanded），退回 measured"
+            )
+            return "measured"
+        return s
+
     def _on_param_update(self, params) -> SetParametersResult:
         """即時更新 speed_rate / cmd_delay_comp_s（其他參數不在此處理）.
 
@@ -415,6 +437,21 @@ class PolicyNode(Node):
                 self.get_logger().info(
                     f"cmd_delay_comp_s: {old_comp:.2f} → {new_comp:.2f}s"
                 )
+            elif p.name == "cmd_delay_comp_enable":
+                new_en = bool(p.value)
+                old_en = self.cmd_delay_comp_enable
+                self.cmd_delay_comp_enable = new_en
+                self.get_logger().info(
+                    f"cmd_delay_comp_enable: {old_en} → {new_en} "
+                    f"(comp_s={self.cmd_delay_comp_s:.2f}, src={self.cmd_delay_comp_src})"
+                )
+            elif p.name == "cmd_delay_comp_src":
+                new_src = self._clamp_src(
+                    p.value if isinstance(p.value, str) else str(p.value)
+                )
+                old_src = self.cmd_delay_comp_src
+                self.cmd_delay_comp_src = new_src
+                self.get_logger().info(f"cmd_delay_comp_src: {old_src} → {new_src}")
         return SetParametersResult(successful=True)
 
     # ──────────────────────────── Callbacks ────────────────────────────
@@ -626,6 +663,9 @@ class PolicyNode(Node):
             v = self._odom_v
             w = self._odom_w
             last_accel = self._last_accel
+            # 上一拍 policy 命令速度（cmd_delay_comp_src=commanded 時用來預測，避免耦合 odom 震盪）
+            last_cmd_v = self._target_v
+            last_cmd_w = self._target_w
             elapsed = now - self._start_t
 
         # 選 sweep 來源：preprocessor topic 首選；沒收到/過期 → fallback inline
@@ -673,9 +713,14 @@ class PolicyNode(Node):
         # 對舊朝向誤差過度修正 → 0.42Hz 舞龍舞獅極限環。推論前用測得速度把車姿往前推
         # cmd_delay_comp_s 秒，讓下方 goal_body 對齊「動作生效時」的車姿，打斷極限環。
         # comp=0 時為 no-op（行為不變）。注意只動 goal_body 視角，velocity obs 仍用實測值。
-        if self.cmd_delay_comp_s > 0.0:
+        if self.cmd_delay_comp_enable and self.cmd_delay_comp_s > 0.0:
+            # 預測用速度：commanded=上一拍命令（不耦合 odom 震盪）；measured=odom 實測
+            if self.cmd_delay_comp_src == "commanded":
+                pred_v, pred_w = last_cmd_v, last_cmd_w
+            else:
+                pred_v, pred_w = v, w
             robot_x, robot_y, robot_yaw_use = self._predict_pose_forward(
-                robot_x, robot_y, robot_yaw_use, v, w, self.cmd_delay_comp_s,
+                robot_x, robot_y, robot_yaw_use, pred_v, pred_w, self.cmd_delay_comp_s,
             )
 
         # 把 goal 轉到 body frame（policy obs 用的是相對機器人的座標）
@@ -930,6 +975,8 @@ class PolicyNode(Node):
             "cmd_w": round(tgt_w, 3),
             "speed_rate": round(self.speed_rate, 2),
             "cmd_delay_comp_s": round(self.cmd_delay_comp_s, 2),
+            "cmd_delay_comp_enable": self.cmd_delay_comp_enable,
+            "cmd_delay_comp_src": self.cmd_delay_comp_src,
             # 三層速度：RL 想要 → 送出底盤 → 底盤實測
             "rl_v": round(rl_v, 3), "rl_w": round(rl_w, 3),
             "sent_v": round(sent_v, 3), "sent_w": round(sent_w, 3),
