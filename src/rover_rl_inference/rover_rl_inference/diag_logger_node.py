@@ -135,12 +135,23 @@ class DiagLoggerNode(Node):
         self.declare_parameter("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("topic_record_ctrl", "/rover_rl/record")
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
+        self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
         # 開錄時抓此節點的全部參數（speed_rate 等）寫進 sidecar + wandb config
         self.declare_parameter("policy_node_name", "rover_rl_policy")
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("robot_radius_m", 0.35)
         # false(預設)=啟動即待錄，發 goal 即開始；true=需送 record start 才開錄
         self.declare_parameter("require_start", False)
+        # 到達 goal 自動停止：距離低於此值連續 N tick → stop_experiment
+        self.declare_parameter("auto_stop_goal_tol", 0.6)
+        self.declare_parameter("auto_stop_goal_ticks", 10)   # 20Hz × 10 = 0.5s
+        # 到 goal 自動停後是否自動 re-arm（下一個 goal/path 進來開新一段紀錄）
+        self.declare_parameter("auto_rearm", True)
+        # 判定「新目標 vs 同目標重複發布」的位移門檻（公尺）。
+        # 用途①：path 由 routing_to_path 2Hz republish 同一條 → 終點不變則不重置 close_ticks、不 ++seq
+        #         （否則 auto-stop 的連續 tick 計數會被 2Hz 回呼一直歸零，終點停觸發不了）
+        # 用途②：re-arm 後舊 path 仍 2Hz 殘留 → 終點與「剛完成的 goal」相同則忽略，避免原地秒重開迴圈
+        self.declare_parameter("goal_change_eps_m", 0.8)
         # 只在有 goal 時寫列（省空間）；false=start 後一直寫
         self.declare_parameter("log_only_with_goal", True)
         self.declare_parameter("enable_wandb", False)
@@ -162,10 +173,15 @@ class DiagLoggerNode(Node):
         self.topic_sweep = sv("topic_lidar_sweep")
         self.topic_ctrl = sv("topic_record_ctrl")
         self.topic_status = sv("topic_status")
+        self.topic_diag_event = sv("topic_diag_event")
         self.policy_node_name = sv("policy_node_name")
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
         self.require_start = bool(gp("require_start").value)
+        self.auto_stop_goal_tol = float(gp("auto_stop_goal_tol").value)
+        self.auto_stop_goal_ticks = int(gp("auto_stop_goal_ticks").value)
+        self.auto_rearm = bool(gp("auto_rearm").value)
+        self.goal_change_eps_m = float(gp("goal_change_eps_m").value)
         self.log_only_with_goal = bool(gp("log_only_with_goal").value)
         self.enable_wandb = bool(gp("enable_wandb").value)
         self.wandb_project = sv("wandb_project")
@@ -178,10 +194,13 @@ class DiagLoggerNode(Node):
         self._ndt = None           # (x, y, yaw, t)
         self._goal = None          # (x, y, frame)
         self._goal_seq = 0
+        self._last_done_goal = None  # (x, y) 剛 auto-stop 完成的終點，用來擋 stale path 殘留發布
         self._cmd = None
         self._obs = None
         self._sweep_min = None
         self._status = None        # dict（三層速度 + 延遲）
+        self._goal_close_ticks = 0  # dist_to_goal < tol 連續 tick 計數
+        self._all_csv_paths = []   # 本次 session 建立的所有 CSV（finalize 時全部列出）
         # 實驗 / 檔案
         self._started = False
         self._armed = False        # 已待命但尚未建資料夾（等第一個 goal）
@@ -225,6 +244,7 @@ class DiagLoggerNode(Node):
         self.create_subscription(Float32MultiArray, self.topic_sweep, self._cb_sweep, be)
         self.create_subscription(String, self.topic_ctrl, self._cb_ctrl, 10)
         self.create_subscription(String, self.topic_status, self._cb_status, 10)
+        self._pub_event = self.create_publisher(String, self.topic_diag_event, 10)
 
     # ── 實驗開關 ──
     def start_experiment(self, label: str) -> None:
@@ -235,6 +255,7 @@ class DiagLoggerNode(Node):
         self._reset_run_stats()
         self._goal_seq = 0
         self._goal = None
+        self._last_done_goal = None
         if self.log_only_with_goal:
             # 待命：收到第一個 goal 才建資料夾 + 開檔（避免沒走 goal 留空資料夾）
             self._armed = True
@@ -252,6 +273,7 @@ class DiagLoggerNode(Node):
         self.run_dir = os.path.join(self.log_dir, name)
         os.makedirs(self.run_dir, exist_ok=True)
         self.csv_path = os.path.join(self.run_dir, name + ".csv")
+        self._all_csv_paths.append(self.csv_path)
         self._fh = open(self.csv_path, "w", newline="")
         self._writer = csv.DictWriter(self._fh, fieldnames=CSV_FIELDS)
         self._writer.writeheader()
@@ -375,6 +397,17 @@ class DiagLoggerNode(Node):
             self.wandb_run = None
         self._started = False
 
+    def _rearm(self) -> None:
+        """auto-stop 後重新待命：清掉上一段狀態，等下一個 goal/path 自動開新一段。"""
+        self._reset_run_stats()
+        self._goal_seq = 0
+        self._goal = None
+        self._goal_close_ticks = 0
+        self._armed = True
+        self.get_logger().info(
+            "▶ 已重新待命 — 下一個 goal/path 進來自動開新一段紀錄（auto_rearm）"
+        )
+
     def _cb_ctrl(self, msg: String) -> None:
         parts = msg.data.strip().split(None, 1)
         if not parts:
@@ -416,30 +449,54 @@ class DiagLoggerNode(Node):
 
     def _cb_goal(self, msg: PoseStamped) -> None:
         frame = msg.header.frame_id or "map"
-        self._goal = (msg.pose.position.x, msg.pose.position.y, frame)
-        self._goal_seq += 1
-        if self._armed:
-            self._open_run_files(self._exp_label)   # 第一個 goal → 建資料夾開錄
-        if self._started:
-            self.get_logger().info(
-                f"[goal #{self._goal_seq}] ({msg.pose.position.x:.2f},"
-                f"{msg.pose.position.y:.2f}) frame={frame}"
-            )
+        self._handle_target(msg.pose.position.x, msg.pose.position.y, frame, "goal", "")
 
     def _cb_path(self, msg: NavPath) -> None:
         if not msg.poses:
             return
         last = msg.poses[-1].pose.position
         frame = msg.header.frame_id or "map"
-        self._goal = (last.x, last.y, frame)
-        self._goal_seq += 1
-        if self._armed:
-            self._open_run_files(self._exp_label)   # 第一個 path → 建資料夾開錄
+        # path 的「目標」= 終點（poses[-1]）；中途 waypoint 由 policy 的 SubgoalSelector 處理，
+        # diag 只關心「到終點才停」
+        self._handle_target(last.x, last.y, frame, "path", f" {len(msg.poses)} pts")
+
+    @staticmethod
+    def _xy_dist(a, b) -> float:
+        return math.hypot(a[0] - b[0], a[1] - b[1])
+
+    def _handle_target(self, x: float, y: float, frame: str, kind: str, extra: str) -> None:
+        """goal_pose / global_path 的共用入口：判斷是新目標還是同目標重複發布，
+        並在 armed / started / 已停 三種狀態下做對的事。"""
+        new_xy = (x, y)
         if self._started:
+            # 進行中：path 2Hz republish 同終點 → 只刷新座標，不重置 close_ticks、不 ++seq
+            # （否則 auto-stop 連續 tick 永遠被歸零，終點停觸發不了）
+            if self._goal is not None and self._xy_dist(new_xy, self._goal[:2]) <= self.goal_change_eps_m:
+                self._goal = (x, y, frame)
+                return
+            # 終點明顯改變（中途重新路由）→ 視為同一段內換目標
+            self._goal = (x, y, frame)
+            self._goal_seq += 1
+            self._goal_close_ticks = 0
             self.get_logger().info(
-                f"[path #{self._goal_seq}] {len(msg.poses)} pts, 終點 "
-                f"({last.x:.2f},{last.y:.2f}) frame={frame}"
+                f"[{kind} #{self._goal_seq}] 換新目標 ({x:.2f},{y:.2f}) frame={frame}{extra}"
             )
+            return
+        if self._armed:
+            # 待命中：忽略「剛 auto-stop 完成的同一終點」殘留發布（stale path 2Hz），避免秒重開迴圈
+            if (self._last_done_goal is not None
+                    and self._xy_dist(new_xy, self._last_done_goal) <= self.goal_change_eps_m):
+                return
+            self._reset_run_stats()
+            self._goal = (x, y, frame)
+            self._goal_seq = 1
+            self._goal_close_ticks = 0
+            self._open_run_files(self._exp_label)   # 第一個 goal/path → 建資料夾開新一段紀錄
+            self.get_logger().info(
+                f"[{kind} #1] ({x:.2f},{y:.2f}) frame={frame}{extra} → 開始新一段紀錄"
+            )
+            return
+        # 既非 started 也非 armed（auto_rearm=false 已停）→ 不再記錄，忽略
 
     def _cb_cmd(self, msg: Twist) -> None:
         self._cmd = (msg.linear.x, msg.angular.z, time.monotonic())
@@ -508,6 +565,30 @@ class DiagLoggerNode(Node):
                 self._heading_abs_sum += abs(math.degrees(heading_err))
                 self._heading_n += 1
 
+                # 到達 goal 自動停止：連續 N tick 距離 < tolerance → stop_experiment
+                if self.auto_stop_goal_tol > 0 and dist < self.auto_stop_goal_tol:
+                    self._goal_close_ticks += 1
+                    if self._goal_close_ticks >= self.auto_stop_goal_ticks:
+                        csv = self.csv_path or ""
+                        self.get_logger().info(
+                            f"🏁 到達 goal（dist={dist:.2f}m < {self.auto_stop_goal_tol}m"
+                            f" 連續 {self._goal_close_ticks} tick）→ 自動停止紀錄\n"
+                            f"  完整 log 保存於：{csv}"
+                        )
+                        # 發 event 給 TUI / 外部監聽
+                        ev = String()
+                        ev.data = json.dumps({"event": "goal_reached",
+                                              "dist": round(dist, 2), "csv": csv})
+                        self._pub_event.publish(ev)
+                        self.stop_experiment()
+                        if self.auto_rearm:
+                            # 記住剛完成的終點 → 擋掉 stale path 殘留發布；再待命等下一個 goal/path
+                            self._last_done_goal = (gx, gy)
+                            self._rearm()
+                        return
+                else:
+                    self._goal_close_ticks = 0
+
         if self._cmd is not None:
             cv, cw, ct = self._cmd
             row["cmd_v"] = f"{cv:.3f}"
@@ -574,6 +655,11 @@ class DiagLoggerNode(Node):
 
     def finalize(self) -> None:
         self.stop_experiment()
+        if self._all_csv_paths:
+            paths = "\n".join(f"  • {p}" for p in self._all_csv_paths)
+            self.get_logger().info(
+                f"本次 session 全部診斷 log：\n{paths}"
+            )
 
 
 def main(args=None):

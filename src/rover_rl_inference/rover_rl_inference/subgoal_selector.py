@@ -34,6 +34,13 @@ class SubgoalSelector:
         self._single_frame: str = ""
         # path 來源優先還是 single goal 優先？預設 single_goal 優先（user manual goal 蓋過 planner）
         self.prefer_path: bool = False
+        # 上次 path 選取的索引（給儀表板畫地鐵式進度條用）：
+        # nearest = 車目前在 path 上最近的 waypoint；carrot = 往前 lookahead 的瞬時目標
+        self.last_nearest_i: int = -1
+        self.last_carrot_i: int = -1
+
+    def path_len(self) -> int:
+        return len(self._path_xy)
 
     def set_path(self, points: list[tuple[float, float]], frame: str) -> None:
         self._path_xy = list(points)
@@ -42,6 +49,8 @@ class SubgoalSelector:
     def clear_path(self) -> None:
         self._path_xy = []
         self._path_frame = ""
+        self.last_nearest_i = -1
+        self.last_carrot_i = -1
 
     def set_single_goal(self, x: float, y: float, frame: str) -> None:
         self._single_xy = (x, y)
@@ -79,6 +88,7 @@ class SubgoalSelector:
             if d < best_d:
                 best_d = d
                 nearest_i = i
+        self.last_nearest_i = nearest_i
 
         # 2) 從最近點往前找第一個距離 >= lookahead 的點當 carrot：
         #    給 policy 一個「夠遠、在路徑上」的瞬時目標，避免直奔終點抄近路撞牆，
@@ -87,11 +97,13 @@ class SubgoalSelector:
         for i in range(nearest_i, len(self._path_xy)):
             px, py = self._path_xy[i]
             if math.hypot(px - rx, py - ry) >= self.lookahead_m:
+                self.last_carrot_i = i
                 return SubgoalChoice(
                     x=px, y=py, frame=self._path_frame,
                     source="path_lookahead", index=i,
                 )
         # 3) 走到底還沒達 lookahead → 取最後一點（final goal）
+        self.last_carrot_i = len(self._path_xy) - 1
         px, py = self._path_xy[-1]
         return SubgoalChoice(
             x=px, y=py, frame=self._path_frame,

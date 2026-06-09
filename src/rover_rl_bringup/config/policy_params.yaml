@@ -69,6 +69,14 @@ rover_rl_policy:
     cmd_max_accel_linear: 1.0         # m/s² slew limit
     cmd_max_accel_angular: 3.0        # rad/s² slew limit
 
+    # --- cmd_delay 補償 (gap #5) ---
+    # 底盤 cmd→實測有死時間（實測 ω 通道互相關 ~0.2s = 1 控制步）。policy 看到舊車姿、
+    # 對舊朝向誤差過度修正 → 0.42Hz「舞龍舞獅」極限環。推論前用測得速度把車姿往前推這麼多
+    # 秒再算 goal_body，讓 obs 對齊「動作生效時」的車姿 → 打斷極限環。
+    # 0.0=關閉（行為不變）；實測死時間 ~0.2s，建議從 0.2 起，過大反而會領先過頭。
+    # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2
+    cmd_delay_comp_s: 0.0
+
     # --- mode ---
     # nav (跑導航) / idle (待命) / estop (急停) / manual (搖桿) / paused
     # 預設 nav：開機即推論，但無 goal 時仍輸出 0；收到 goal 才動

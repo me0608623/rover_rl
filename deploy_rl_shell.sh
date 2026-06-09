@@ -38,13 +38,19 @@ cleanup() {
     echo "[deploy_rl_shell] 停止 rover_rl 棧…"
     bash ~/rover_rl_stop.sh >/dev/null 2>&1
     echo "[deploy_rl_shell] 完整 log 保存於：$LOG"
+    # 列出本次 session 建立的診斷 CSV（比 $LOG 更新的檔案 = 這次產生的）
+    DIAG_CSVS=$(find ~/rover_rl/logs/diag/ -name "*.csv" -newer "$LOG" 2>/dev/null | sort)
+    if [ -n "$DIAG_CSVS" ]; then
+        echo "[deploy_rl_shell] 本次診斷記錄："
+        echo "$DIAG_CSVS" | while read -r f; do echo "  • $f"; done
+    fi
 }
 trap cleanup EXIT INT TERM
 
 echo "[deploy_rl_shell] 啟動 RL 棧（不含 NDT/LV-DOT，log → $LOG）…"
 # 預設 enable_ndt:=false enable_lvdot:=false → 只啟 RL 那層；NDT/LV-DOT 用 ndt + lv-dot alias 分開啟。
 # 放在 "$@" 前面：user 傳的同名參數在後面會覆寫（ros2 launch 重複參數取最後值）。
-ros2 launch rover_rl_bringup deploy_full.launch.py enable_ndt:=false enable_lvdot:=false "$@" >"$LOG" 2>&1 &
+ros2 launch rover_rl_bringup deploy_full.launch.py enable_ndt:=false enable_lvdot:=false rviz:=false "$@" >"$LOG" 2>&1 &
 LAUNCH_PID=$!
 
 echo -n "[deploy_rl_shell] 等待 policy_node 啟動"

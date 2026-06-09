@@ -696,7 +696,11 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
 2. **訓練 ω_max=2.0 vs 底盤 1.2** — 全力轉時實際比 policy 預期慢 40%（見 `driver_chgh.yaml: profile_omega_max: 1.2`）
 3. **wheel 不對稱 1.9%** — odom drift 1%/m
 4. **訓練 T 走廊 vs 實車任意場景** — 泛化性未驗證
-5. **無 cmd_delay 補償** — spot_rl 有 `cmd_delay_time=1.0s` 的死時間補償（`fast_info_calculate()`：基於預測的延遲位姿更新 obs 中的速度和目標座標）。rover_rl 沒有此機制；若底盤響應 latency 明顯（>0.2s），policy 可能振盪。初步觀察若有振盪，考慮加大 `cmd_alpha_linear` 濾波。
+5. **cmd_delay 補償（2026-06-08 已實作）** — 實車實測：goal-following 時車頭 0.42Hz「舞龍舞獅」振盪。
+   根因 = 底盤 cmd→實測死時間（diag 互相關，**ω 通道 ~0.2s = 1 控制步**；註：v 通道因等速直行訊號太平、互相關全平坦，所報 600ms 是假象，勿信）+ 5Hz 控制步 → policy 對 1 步前的舊車姿過度修正 → 延遲驅動極限環。
+   實驗證明 `speed_rate` 降速**只治標**（0.3→0.2 擺幅僅 −20%、頻率不變）。
+   **解法（已加）**：`policy_node` 新增 `cmd_delay_comp_s` 參數（預設 0.0=關）。>0 時推論前用 odom 測得速度把車姿往前積分這麼多秒、重算 goal_body，讓 obs 對齊「動作生效時」的車姿（仿 spot_rl `fast_info_calculate`，但只動 goal_body 視角、不動 velocity obs/網路/動作上限；用測得速度非命令速度，因 ω 跟隨率僅 ~12%、用命令會過補）。
+   可熱調：`ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2`；status JSON 有 `cmd_delay_comp_s` 可驗證。建議從 0.2 起、過大會領先過頭。
 6. **底盤 deadband 未知** — spot_rl 強制最小移動速度 `minimum_will_move_speed=0.14 m/s`（避免 policy 輸出微小速度但馬達不動）。rover_rl deadband 僅 0.02 m/s。若實車觀察到 policy 有輸出但輪子靜止，需量測實際底盤死區並調高 `cmd_alpha_linear` 或在 action_decoder 加 floor。
 
 ## 與 PC 端的溝通介面

@@ -69,6 +69,15 @@ def _yaw_from_quat(qx: float, qy: float, qz: float, qw: float) -> float:
     return math.atan2(siny_cosp, cosy_cosp)
 
 
+def _nav_type(subgoal_src: str | None) -> str | None:
+    # subgoal_src 形如 "path_lookahead/tf" / "path_final/tf" / "goal_pose/tf"
+    # path_* → routing 路徑導航；goal_pose → 單一 goal 導航；None → 無目標
+    if not subgoal_src:
+        return None
+    base = subgoal_src.split("/")[0]
+    return "path" if base.startswith("path") else "single"
+
+
 class PolicyNode(Node):
     """RL 推論主節點：sweep → obs → RNN → cmd_vel，外加多 mode / subgoal / NDT 定位。
 
@@ -165,6 +174,12 @@ class PolicyNode(Node):
         self.declare_parameter("cmd_alpha_angular", 0.5)
         self.declare_parameter("cmd_max_accel_linear", 1.0)
         self.declare_parameter("cmd_max_accel_angular", 3.0)
+        # cmd_delay 補償（gap #5）：底盤 cmd→實測有死時間（實測 ω 通道互相關 ~0.2s=1 控制步）。
+        # policy 看到的是舊車姿、對舊朝向誤差過度修正 → 形成 0.42Hz 舞龍舞獅極限環。
+        # 推論前用 odom 測得速度把車姿往前積分這麼多秒再算 goal_body，讓 obs 對齊「動作生效時」
+        # 的車姿，打斷極限環。0.0=關閉（預設，行為完全不變）。
+        # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2
+        self.declare_parameter("cmd_delay_comp_s", 0.0)
         # 底盤實體上限（僅供診斷：判定 cmd 是否超出底盤能力，見 CLAUDE.md gap #2）
         self.declare_parameter("chassis_v_max", 1.5)
         self.declare_parameter("chassis_omega_max", 1.2)
@@ -214,6 +229,7 @@ class PolicyNode(Node):
             dt=self.control_dt,
         )
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
+        self.cmd_delay_comp_s = self._clamp_comp(float(gp("cmd_delay_comp_s").value))
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
         self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
@@ -270,6 +286,10 @@ class PolicyNode(Node):
         # 上次 subgoal（給 marker 用）
         self._last_subgoal_body: tuple[float, float] | None = None
         self._last_subgoal_source: str | None = None
+        # path 進度（給儀表板地鐵式進度條）：總點數 / 目前最近點 / lookahead carrot 點
+        self._nav_path_n = 0
+        self._nav_path_i = -1
+        self._nav_path_carrot = -1
         # map→odom 的 child frame（NDT 發布此段）；_cb_odom 會以實際 frame_id 更新
         self.odom_frame = "odom"
         # 元件
@@ -366,10 +386,20 @@ class PolicyNode(Node):
             )
         return clamped
 
-    def _on_param_update(self, params) -> SetParametersResult:
-        """即時更新 speed_rate（其他參數不在此處理）.
+    def _clamp_comp(self, t: float) -> float:
+        """cmd_delay_comp_s 限制在 [0, 1.0]s；超出 clamp 並警告（死時間不可能 >1s）."""
+        clamped = float(np.clip(t, 0.0, 1.0))
+        if abs(clamped - t) > 1e-6:
+            self.get_logger().warn(
+                f"cmd_delay_comp_s={t} 超出 [0, 1.0]，clamp 成 {clamped}"
+            )
+        return clamped
 
-        只攔 speed_rate 是因為它是少數能在跑動中安全熱調的旋鈕（時間膨脹，不離分布）；
+    def _on_param_update(self, params) -> SetParametersResult:
+        """即時更新 speed_rate / cmd_delay_comp_s（其他參數不在此處理）.
+
+        只攔這兩個是因為它們是少數能在跑動中安全熱調的旋鈕：speed_rate 是時間膨脹（不離分布）；
+        cmd_delay_comp_s 只改 obs 的 goal_body 視角（補底盤死時間），不動網路/動作上限/normalizer。
         動作上限 / obs normalizer 改了會破壞 sim-to-real 對齊，故不在此開放熱改。
         """
         for p in params:
@@ -378,6 +408,13 @@ class PolicyNode(Node):
                 old = self.speed_rate
                 self.speed_rate = new_rate
                 self.get_logger().info(f"speed_rate: {old:.2f} → {new_rate:.2f}")
+            elif p.name == "cmd_delay_comp_s":
+                new_comp = self._clamp_comp(float(p.value))
+                old_comp = self.cmd_delay_comp_s
+                self.cmd_delay_comp_s = new_comp
+                self.get_logger().info(
+                    f"cmd_delay_comp_s: {old_comp:.2f} → {new_comp:.2f}s"
+                )
         return SetParametersResult(successful=True)
 
     # ──────────────────────────── Callbacks ────────────────────────────
@@ -543,6 +580,22 @@ class PolicyNode(Node):
         except TransformException:
             return RobotPose(x=odom_x, y=odom_y, yaw=odom_yaw, source="odom_only")
 
+    @staticmethod
+    def _predict_pose_forward(
+        x: float, y: float, yaw: float, v: float, w: float, dt: float,
+    ) -> tuple[float, float, float]:
+        """用測得 body 速度把車姿往前積分 dt 秒（補底盤 cmd→實測 死時間）.
+
+        平移方向取中點 yaw（yaw + w·dt/2）較準；最終 yaw 用全量 w·dt。
+        用「測得」速度而非「命令」速度：底盤角速度跟隨率僅 ~12%，用命令會過補。
+        """
+        yaw_mid = yaw + 0.5 * w * dt
+        return (
+            x + v * math.cos(yaw_mid) * dt,
+            y + v * math.sin(yaw_mid) * dt,
+            yaw + w * dt,
+        )
+
     def _map_odom_from_tf(self) -> tuple[float, float, float] | None:
         """回傳 map→odom 變換 (x, y, yaw)，供狀態顯示 NDT 修正量；查不到回 None."""
         try:
@@ -616,6 +669,15 @@ class PolicyNode(Node):
         else:
             robot_x, robot_y, robot_yaw_use = robot_pose.x, robot_pose.y, robot_pose.yaw
 
+        # cmd_delay 補償（gap #5）：底盤對 cmd 有 ~0.2s 死時間，policy 看到的是舊車姿、
+        # 對舊朝向誤差過度修正 → 0.42Hz 舞龍舞獅極限環。推論前用測得速度把車姿往前推
+        # cmd_delay_comp_s 秒，讓下方 goal_body 對齊「動作生效時」的車姿，打斷極限環。
+        # comp=0 時為 no-op（行為不變）。注意只動 goal_body 視角，velocity obs 仍用實測值。
+        if self.cmd_delay_comp_s > 0.0:
+            robot_x, robot_y, robot_yaw_use = self._predict_pose_forward(
+                robot_x, robot_y, robot_yaw_use, v, w, self.cmd_delay_comp_s,
+            )
+
         # 把 goal 轉到 body frame（policy obs 用的是相對機器人的座標）
         gx, gy = world_to_body(choice.x, choice.y, robot_x, robot_y, robot_yaw_use)
         dist = math.hypot(gx, gy)
@@ -651,6 +713,10 @@ class PolicyNode(Node):
             self._sweep_source = sweep_source_tag
             self._last_subgoal_body = (gx, gy)
             self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
+            # path 進度快照（single goal 時 path_len()=0，儀表板據此判斷不畫進度條）
+            self._nav_path_n = self.subgoals.path_len()
+            self._nav_path_i = self.subgoals.last_nearest_i
+            self._nav_path_carrot = self.subgoals.last_carrot_i
 
         # 硬性緊急停車：繞過 policy，只要任一 bin 距離 < safety_estop 立刻 ESTOP。
         # 這是 policy 之外的最後一道安全網，不信任 policy 在極近距離的判斷。
@@ -814,6 +880,9 @@ class PolicyNode(Node):
             sweep_src = self._sweep_source
             subgoal = self._last_subgoal_body
             subgoal_src = self._last_subgoal_source
+            path_n = self._nav_path_n
+            path_i = self._nav_path_i
+            path_carrot = self._nav_path_carrot
             odom_x, odom_y = self._odom_xy
             odom_yaw = self._odom_yaw
             rl_v, rl_w = tgt_v, tgt_w
@@ -860,6 +929,7 @@ class PolicyNode(Node):
             "cmd_v": round(tgt_v, 3),
             "cmd_w": round(tgt_w, 3),
             "speed_rate": round(self.speed_rate, 2),
+            "cmd_delay_comp_s": round(self.cmd_delay_comp_s, 2),
             # 三層速度：RL 想要 → 送出底盤 → 底盤實測
             "rl_v": round(rl_v, 3), "rl_w": round(rl_w, 3),
             "sent_v": round(sent_v, 3), "sent_w": round(sent_w, 3),
@@ -890,6 +960,11 @@ class PolicyNode(Node):
             "goal_dist": round(goal_dist, 2) if goal_dist is not None else None,
             "goal_ang_deg": round(goal_ang, 1) if goal_ang is not None else None,
             "goal_src": subgoal_src,
+            # 導航型態：path=routing 多 waypoint 路徑導航 / single=單一 goal_pose 導航 / None=無目標
+            "nav_type": _nav_type(subgoal_src),
+            "path_n": path_n if path_n > 0 else None,
+            "path_i": path_i if path_n > 0 else None,
+            "path_carrot": path_carrot if path_n > 0 else None,
             "model": os.path.basename(self._model_path) if self._model_path else None,
         }
         msg = String()

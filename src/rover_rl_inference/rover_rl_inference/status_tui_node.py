@@ -49,16 +49,21 @@ class StatusTuiNode(Node):
         super().__init__("rover_rl_status_tui")
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
         self.declare_parameter("topic_dynamic_bboxes", "/onboard_detector/dynamic_bboxes")
+        self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
         topic_dyn = self.get_parameter(
             "topic_dynamic_bboxes").get_parameter_value().string_value
+        topic_diag = self.get_parameter("topic_diag_event").get_parameter_value().string_value
         self._lock = threading.Lock()
         self._status: dict | None = None
         self._last_t = 0.0
         self._lvdot_n: int | None = None     # 動態障礙框數；None=從未收到
         self._lvdot_t = 0.0
+        self._diag_event: dict | None = None  # goal_reached 等事件
+        self._diag_event_t = 0.0
         self.create_subscription(String, topic, self._cb_status, 10)
         self.create_subscription(MarkerArray, topic_dyn, self._cb_dyn, 10)
+        self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
         self._topic = topic
 
     def _cb_status(self, msg: String) -> None:
@@ -78,9 +83,19 @@ class StatusTuiNode(Node):
             self._lvdot_n = n
             self._lvdot_t = time.monotonic()
 
-    def snapshot(self) -> tuple[dict | None, float, int | None, float]:
+    def _cb_diag_event(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
         with self._lock:
-            return self._status, self._last_t, self._lvdot_n, self._lvdot_t
+            self._diag_event = data
+            self._diag_event_t = time.monotonic()
+
+    def snapshot(self) -> tuple[dict | None, float, int | None, float, dict | None, float]:
+        with self._lock:
+            return (self._status, self._last_t, self._lvdot_n, self._lvdot_t,
+                    self._diag_event, self._diag_event_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -138,7 +153,7 @@ class Dashboard:
         return w
 
     def _render(self, stdscr) -> None:
-        status, last_t, lvdot_n, lvdot_t = self.node.snapshot()
+        status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
@@ -149,7 +164,24 @@ class Dashboard:
         stdscr.erase()
         h, w = stdscr.getmaxyx()
         box_w = min(max(52, w - 2), 70)
-        box_h = 18
+
+        # 先依狀態決定列數與是否畫地鐵式進度條（路徑導航才畫）→ 才能算框高
+        if status is not None and not stale:
+            rows = self._build_rows(status, lvdot_n, lvdot_age)
+            pn = status.get("path_n")
+            show_subway = (status.get("nav_type") == "path" and pn and pn >= 2
+                           and status.get("path_i") is not None)
+        else:
+            rows = []
+            show_subway = False
+
+        n = len(rows)
+        subway_y = 1 + n + 1            # rows 後空一列再畫進度條
+        box_h = (subway_y + 2) if show_subway else max(18, n + 3)
+        # 框高超出終端機 → 先犧牲進度條再縮；仍放不下才提示放大
+        if show_subway and h < box_h + 1:
+            show_subway = False
+            box_h = max(18, n + 3)
         if h < box_h + 1 or w < box_w:
             stdscr.addstr(0, 0, "終端機視窗太小，請放大…")
             stdscr.refresh()
@@ -168,7 +200,6 @@ class Dashboard:
             win.refresh()
             return
 
-        rows = self._build_rows(status, lvdot_n, lvdot_age)
         val_col = 11  # 標籤欄 4 全形字 ≈ 8 格 + 邊距
         for i, (label, value, pair, bold) in enumerate(rows):
             y = 1 + i
@@ -181,15 +212,95 @@ class Dashboard:
                 v = v[:-1]
             win.addstr(y, val_col, v, attr)
 
+        if show_subway:
+            self._draw_subway(win, subway_y, box_w, status)
+
         foot = f" 更新 {age:.1f}s 前 · 按 q 離開 "
         win.addstr(box_h - 1, 2, foot, self._c(5))
         win.refresh()
+
+        # 到達目標 banner（收到 goal_reached event 後顯示 6 秒）
+        if diag_event is not None and diag_event.get("event") == "goal_reached":
+            banner_age = now - diag_event_t
+            if banner_age < 6.0:
+                self._draw_goal_banner(stdscr, h, w, diag_event, 6.0 - banner_age)
 
     @staticmethod
     def _dist(m) -> str:
         if m is None:
             return "—"
         return ">20" if m >= 19.9 else f"{m:.1f}"
+
+    def _draw_goal_banner(self, stdscr, h: int, w: int,
+                          event: dict, remaining: float) -> None:
+        """到達目標時在儀表板正下方疊加大字通知."""
+        banner_h = 7
+        banner_w = min(max(48, w - 2), 72)
+        by = min(h - banner_h - 1, 19)  # 緊接在儀表板下方
+        bx = max(0, (w - banner_w) // 2)
+        if by < 0 or banner_w < 20:
+            return
+        try:
+            bwin = stdscr.derwin(banner_h, banner_w, by, bx)
+            bwin.erase()
+            bwin.box()
+            # 標題：大到達目標
+            title = " ** 到達目標！** "
+            bwin.addstr(1, max(2, (banner_w - self._disp_w(title)) // 2), title,
+                        self._c(1) | curses.A_BOLD)
+            # 距離
+            dist_txt = f"距終點 {event.get('dist', '?')}m"
+            bwin.addstr(3, max(2, (banner_w - self._disp_w(dist_txt)) // 2),
+                        dist_txt, self._c(4))
+            # log 路徑（截斷至可用寬度）
+            csv = event.get("csv", "")
+            if csv:
+                max_csv = banner_w - 6
+                short = csv if len(csv) <= max_csv else "..." + csv[-(max_csv - 3):]
+                bwin.addstr(4, 3, short, self._c(5))
+            # 倒數
+            foot = f" {remaining:.0f}s 後消失 · 按 q 離開 "
+            bwin.addstr(banner_h - 1, 2, foot, self._c(5))
+            bwin.refresh()
+        except curses.error:
+            pass
+
+    def _draw_subway(self, win, y: int, box_w: int, s: dict) -> None:
+        """地鐵路線式進度條：起 ━━ 目前位置(O) ━ carrot(>) ━━ 終，附「第 i/N 點」。
+
+        path 的 waypoint 是密集 pose（非命名站），故以「起→終」連續進度呈現：
+        O = 車目前最近的 waypoint（path_i），> = lookahead carrot（往前的瞬時目標）。
+        """
+        pi = s.get("path_i") or 0
+        pn = s.get("path_n") or 1
+        ci = s.get("path_carrot")
+        win.addstr(y, 2, "路線", self._c(5))
+        x0 = 11
+        avail = box_w - x0 - 2
+        count_txt = f" {pi + 1}/{pn}"
+        # 預留 起[ (3 格) + ]終 (3 格) + 計數文字
+        reserve = 3 + 3 + self._disp_w(count_txt)
+        bar_w = max(8, avail - reserve)
+        frac = pi / (pn - 1) if pn > 1 else 0.0
+        pos = max(0, min(bar_w - 1, int(round(frac * (bar_w - 1)))))
+        track = ["="] * pos + ["O"] + ["-"] * (bar_w - pos - 1)
+        cpos = None
+        if ci is not None and pn > 1:
+            cpos = max(0, min(bar_w - 1, int(round((ci / (pn - 1)) * (bar_w - 1)))))
+            if cpos != pos:
+                track[cpos] = ">"
+        bar = "".join(track)
+        bar_x = x0 + 3
+        win.addstr(y, x0, "起[", self._c(5))
+        win.addstr(y, bar_x, bar, self._c(5))
+        try:
+            win.addch(y, bar_x + pos, ord("O"), self._c(1) | curses.A_BOLD)
+            if cpos is not None and cpos != pos:
+                win.addch(y, bar_x + cpos, ord(">"), self._c(2))
+        except curses.error:
+            pass
+        win.addstr(y, bar_x + bar_w, "]終", self._c(5))
+        win.addstr(y, bar_x + bar_w + 3, count_txt, self._c(4))
 
     @staticmethod
     def _track_pair(sent, act) -> int:
@@ -296,6 +407,18 @@ class Dashboard:
         off_txt = ("—" if off[0] is None else
                    f"({_fmt(off[0], '+.2f')}, {_fmt(off[1], '+.2f')}, {_fmt(off[2], '+.1f')}°)")
 
+        # 導航型態：方式 B（routing 多 waypoint）vs 方式 A（單一 goal_pose）
+        nav_type = s.get("nav_type")
+        if nav_type == "path":
+            pi, pn = s.get("path_i"), s.get("path_n")
+            nav_txt = ("路徑導航 (routing)" if pi is None or not pn
+                       else f"路徑導航 (routing) · 第 {pi + 1}/{pn} 點")
+            nav_pair = 4
+        elif nav_type == "single":
+            nav_txt, nav_pair = "單一 goal 導航", 4
+        else:
+            nav_txt, nav_pair = "待命（無目標）", 5
+
         gd = s.get("goal_dist")
         ga = s.get("goal_ang_deg")
         gsrc = s.get("goal_src") or ""
@@ -343,6 +466,7 @@ class Dashboard:
             ("NDT", ndt_txt, 1 if ndt_ok else 2, False),
             ("位置", pose_txt, pose_pair, False),
             ("偏移", off_txt, 5, False),
+            ("導航", nav_txt, nav_pair, nav_type == "path"),
             ("目標", goal_txt, goal_pair, False),
             ("模型", model_txt, 5, False),
         ]
