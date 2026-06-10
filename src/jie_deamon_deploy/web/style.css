@@ -1,0 +1,895 @@
+/*
+ * ========================================================================
+ * 差速機器人 Web 控制介面 — 暗色主題樣式表
+ * ========================================================================
+ *
+ * CSS 變數定義的色彩系統：
+ *   --bg-primary    深色底色（#0a0e17）    — 頁面背景
+ *   --bg-secondary  次深色（#111827）      — 控制元件背景
+ *   --bg-card       卡片背景（#1a2332）    — 面板/卡片
+ *   --bg-hover      懸停色（#243044）      — 滑鼠懸停回饋
+ *   --text-primary  主文字色（#e2e8f0）    — 標題/重要文字
+ *   --text-secondary 次文字色（#94a3b8）   — 說明/標籤
+ *   --accent-*      強調色系列             — 青/藍/綠/紅/橘/紫
+ *   --glow-*        發光陰影               — 狀態指示用
+ *
+ * 響應式設計策略：
+ *   - 桌面端：左右分欄（LiDAR 視覺化 + 右側控制面板）
+ *   - 平板/手機（<768px）：上下堆疊，控制面板水平排列
+ *   - 觸控裝置：停用 hover 動畫效果，避免誤觸回饋
+ *   - 搖桿/滑桿尺寸固定，確保觸控操作精度
+ *
+ * ========================================================================
+ */
+
+/* ======================== 全域樣式與 CSS 變數 ======================== */
+:root {
+    /* 背景色階（由深到淺） */
+    --bg-primary: #0a0e17;
+    --bg-secondary: #111827;
+    --bg-card: #1a2332;
+    --bg-hover: #243044;
+
+    /* 文字色 */
+    --text-primary: #e2e8f0;
+    --text-secondary: #94a3b8;
+
+    /* 強調色（用於按鈕、圖表、狀態指示） */
+    --accent-cyan: #22d3ee;       /* 機器人/搖桿 */
+    --accent-blue: #3b82f6;       /* 角速度/連結 */
+    --accent-green: #10b981;      /* 啟用/前進 */
+    --accent-red: #ef4444;        /* 停止/錯誤 */
+    --accent-orange: #f97316;     /* 警告/高速模式 */
+    --accent-purple: #a855f7;     /* 目標標記 */
+
+    /* 發光陰影效果 */
+    --glow-cyan: 0 0 20px rgba(34, 211, 238, 0.3);
+    --glow-green: 0 0 20px rgba(16, 185, 129, 0.3);
+    --glow-red: 0 0 20px rgba(239, 68, 68, 0.3);
+
+    /* 共用圓角與過渡時間 */
+    --border-radius: 12px;
+    --transition-fast: 0.15s ease;
+    --transition-normal: 0.3s ease;
+}
+
+/* 全域重置：移除預設邊距，使用 border-box */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+/* 頁面基本設定：無襯線字型、暗色背景、禁止水平捲動 */
+body {
+    font-family: 'Inter', 'SF Pro Display', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    min-height: 100vh;
+    overflow-x: hidden;
+}
+
+/* ======================== 主容器佈局 ======================== */
+/* 垂直 flex 佈局，佔滿視窗高度，最大寬度 1400px 置中 */
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 16px;
+    gap: 16px;
+}
+
+/* ======================== 頂部導覽列 ======================== */
+/* 水平排列 Tab 按鈕，右側絕對定位連線狀態指示器 */
+.nav-bar {
+    display: flex;
+    justify-content: flex-start;
+    align-items: center;
+    padding: 8px 160px 8px 8px;
+    /* 右側留出空間給絕對定位的連線狀態 */
+    background: linear-gradient(135deg, var(--bg-card), var(--bg-secondary));
+    border-radius: var(--border-radius);
+    border: 1px solid rgba(34, 211, 238, 0.1);
+    gap: 8px;
+    position: relative;
+    height: 64px;
+}
+
+/* Tab 按鈕：未選中時半透明 */
+.nav-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: var(--transition-normal);
+    opacity: 0.6;
+}
+
+/* Tab 懸停效果 */
+.nav-item:hover {
+    background: rgba(255, 255, 255, 0.05);
+    opacity: 0.8;
+}
+
+/* Tab 選中狀態：青色邊框 + 完全不透明 */
+.nav-item.active {
+    background: rgba(34, 211, 238, 0.1);
+    opacity: 1;
+    border: 1px solid rgba(34, 211, 238, 0.2);
+}
+
+/* Tab 圖示：未選中時灰階 + 縮小 */
+.nav-item img {
+    height: 40px;
+    width: auto;
+    aspect-ratio: 2/1;
+    object-fit: contain;
+    filter: grayscale(100%);
+    transform: scale(0.8);
+    transition: all 0.3s ease;
+}
+
+/* Tab 圖示選中狀態：彩色 + 原始大小 */
+.nav-item.active img {
+    filter: grayscale(0%);
+    transform: scale(1.0);
+}
+
+/* 連線狀態指示器（絕對定位在導覽列右側） */
+.nav-bar .connection-status {
+    position: absolute;
+    right: 16px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0px;
+    background: var(--bg-secondary);
+    border-radius: 20px;
+    font-size: 0.8rem;
+    z-index: 5;
+}
+
+/* ======================== 標籤頁內容切換 ======================== */
+/* 預設隱藏，啟用時以 flex 顯示並帶淡入動畫 */
+.tab-content {
+    display: none;
+    flex: 1;
+    animation: fadeIn 0.3s ease;
+}
+
+.tab-content.active {
+    display: flex;
+}
+
+/* 淡入動畫：從下方微移 + 透明度漸變 */
+@keyframes fadeIn {
+    from {
+        opacity: 0;
+        transform: translateY(5px);
+    }
+
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+/* ======================== 直接控制面板 ======================== */
+/* 垂直置中佈局：旋轉滑桿 → 搖桿 → 速度切換 */
+.direct-control-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 20px;
+    width: 100%;
+    height: 100%;
+    padding: 20px;
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    border: 1px solid rgba(34, 211, 238, 0.1);
+    box-sizing: border-box;
+}
+
+/* ======================== 旋轉滑桿（控制角速度 wz） ======================== */
+.slider-container {
+    width: 100%;
+    max-width: 400px;
+    height: 60px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* 滑桿軌道 */
+.slider-track {
+    width: 100%;
+    height: 8px;
+    background: var(--bg-secondary);
+    border-radius: 4px;
+    position: relative;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* 軌道中心標記線 */
+.slider-track::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: -5px;
+    bottom: -5px;
+    width: 2px;
+    background: rgba(255, 255, 255, 0.2);
+}
+
+/* 滑桿旋鈕（可拖曳的圓形按鈕） */
+.slider-knob {
+    width: 40px;
+    height: 40px;
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    border-radius: 50%;
+    position: absolute;
+    top: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.3);
+    border: 2px solid rgba(255, 255, 255, 0.8);
+    cursor: grab;
+    z-index: 10;
+}
+
+/* 拖曳中的旋鈕：放大效果 */
+.slider-knob:active {
+    cursor: grabbing;
+    transform: translateX(-50%) scale(1.1);
+}
+
+/* 滑桿左右標籤文字 */
+.slider-label {
+    position: absolute;
+    top: -20px;
+    font-size: 1.2rem;
+    color: var(--text-secondary);
+}
+
+.slider-label.left {
+    left: 0;
+}
+
+.slider-label.right {
+    right: 0;
+}
+
+/* ======================== 虛擬搖桿（控制前後速度 vx） ======================== */
+.joystick-area {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+}
+
+/* 搖桿底盤（360px 圓形區域） */
+.joystick-base {
+    width: 360px;
+    height: 360px;
+    background: rgba(17, 24, 39, 0.8);
+    border-radius: 50%;
+    border: 2px solid rgba(34, 211, 238, 0.3);
+    position: relative;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.2), inset 0 0 30px rgba(0, 0, 0, 0.3);
+}
+
+/* 搖桿十字參考線（純視覺裝飾，不接收事件） */
+.joystick-cross {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 100%;
+    height: 100%;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+}
+
+/* 十字線：垂直線和水平線 */
+.joystick-cross::before,
+.joystick-cross::after {
+    content: '';
+    position: absolute;
+    background: rgba(34, 211, 238, 0.1);
+}
+
+/* 垂直線 */
+.joystick-cross::before {
+    top: 10%;
+    bottom: 10%;
+    left: 50%;
+    width: 2px;
+    transform: translateX(-50%);
+}
+
+/* 水平線 */
+.joystick-cross::after {
+    left: 10%;
+    right: 10%;
+    top: 50%;
+    height: 2px;
+    transform: translateY(-50%);
+}
+
+/* 搖桿圓球（可拖曳的操作手柄） */
+.joystick-stick {
+    width: 80px;
+    height: 80px;
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    border-radius: 50%;
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.4);
+    border: 2px solid rgba(255, 255, 255, 0.5);
+    cursor: grab;
+    z-index: 10;
+}
+
+/* 拖曳中 */
+.joystick-stick:active {
+    cursor: grabbing;
+}
+
+/* 搖桿下方提示文字 */
+.joystick-hint {
+    margin-top: 20px;
+    color: var(--text-secondary);
+    font-size: 1.2rem;
+}
+
+/* ======================== 速度模式切換開關 ======================== */
+/* 低速（0.5x）/ 高速（1.0x）的 toggle 開關 */
+.speed-mode-switch {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 16px 24px;
+    background: var(--bg-secondary);
+    border-radius: 30px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    margin-top: 20px;
+}
+
+/* 模式標籤文字 */
+.mode-label {
+    font-size: 1.20rem;
+    font-weight: 500;
+    transition: var(--transition-normal);
+}
+
+/* 低速標籤：青色（預設啟用） */
+.mode-label.low-label {
+    color: var(--accent-cyan);
+}
+
+/* 高速標籤：預設灰色 */
+.mode-label.high-label {
+    color: var(--text-secondary);
+}
+
+/* 高速模式啟用時：低速標籤變灰，高速標籤變橘 */
+.speed-mode-switch.high-speed .mode-label.low-label {
+    color: var(--text-secondary);
+}
+
+.speed-mode-switch.high-speed .mode-label.high-label {
+    color: var(--accent-orange);
+}
+
+/* ======================== 滑動開關元件 ======================== */
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 56px;
+    height: 28px;
+}
+
+/* 隱藏原生 checkbox */
+.switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+/* 開關軌道 */
+.switch-slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    border-radius: 28px;
+    transition: var(--transition-normal);
+    box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.2);
+}
+
+/* 開關圓形手柄 */
+.switch-slider::before {
+    position: absolute;
+    content: "";
+    height: 22px;
+    width: 22px;
+    left: 3px;
+    bottom: 3px;
+    background: white;
+    border-radius: 50%;
+    transition: var(--transition-normal);
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+}
+
+/* 開關啟用（高速模式）：軌道變橘紅色 */
+.switch input:checked+.switch-slider {
+    background: linear-gradient(135deg, var(--accent-orange), var(--accent-red));
+}
+
+/* 開關啟用：手柄滑到右側 */
+.switch input:checked+.switch-slider::before {
+    transform: translateX(28px);
+}
+
+/* ======================== 施工中佔位頁面 ======================== */
+.construction-container {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    color: var(--text-secondary);
+}
+
+/* 施工圖示浮動動畫 */
+.construction-icon {
+    font-size: 4rem;
+    margin-bottom: 20px;
+    animation: float 3s ease-in-out infinite;
+}
+
+@keyframes float {
+
+    0%,
+    100% {
+        transform: translateY(0);
+    }
+
+    50% {
+        transform: translateY(-20px);
+    }
+}
+
+/* ======================== 連線狀態指示器 ======================== */
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 16px;
+    background: var(--bg-secondary);
+    border-radius: 20px;
+    font-size: 1.2rem;
+}
+
+/* 狀態圓點（預設橘色脈搏動畫 = 連線中） */
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--accent-orange);
+    animation: pulse 2s infinite;
+}
+
+/* 已連線：綠色 + 發光 */
+.connection-status.connected .status-dot {
+    background: var(--accent-green);
+    box-shadow: var(--glow-green);
+}
+
+/* 已斷線：紅色，無動畫 */
+.connection-status.disconnected .status-dot {
+    background: var(--accent-red);
+    animation: none;
+}
+
+/* 脈搏動畫 */
+@keyframes pulse {
+
+    0%,
+    100% {
+        opacity: 1;
+    }
+
+    50% {
+        opacity: 0.5;
+    }
+}
+
+/* ======================== 雷達跟隨面板主內容區 ======================== */
+/* 左右分欄：LiDAR 視覺化面板 + 右側控制面板 */
+.main-content {
+    display: flex;
+    gap: 16px;
+    flex: 1;
+    min-height: 0;
+}
+
+/* ======================== LiDAR 視覺化面板 ======================== */
+.visualization-panel {
+    flex: 1;
+    height: 100%;
+    position: relative;
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    border: 1px solid rgba(34, 211, 238, 0.15);
+    overflow: hidden;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+}
+
+/* LiDAR Canvas：十字準心游標，寬高由 JS 動態設定 */
+#lidarCanvas {
+    cursor: crosshair;
+}
+
+/* Canvas 疊加層（保留用，目前未使用） */
+.canvas-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    pointer-events: none;
+}
+
+/* ======================== 右側控制面板 ======================== */
+/* 固定寬度 280px，垂直排列狀態卡片 */
+.control-panel {
+    width: 280px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    flex-shrink: 0;
+}
+
+/* ======================== 卡片共用樣式 ======================== */
+.status-card,
+.control-card,
+.info-card {
+    background: var(--bg-card);
+    border-radius: var(--border-radius);
+    padding: 16px;
+    border: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* 卡片標題 */
+.status-card h3,
+.control-card h3 {
+    font-size: 0.875rem;
+    font-weight: 500;
+    color: var(--text-secondary);
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* ======================== 狀態行（鍵值對顯示） ======================== */
+.status-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.status-row:last-child {
+    border-bottom: none;
+}
+
+/* 狀態標籤（左側灰色文字） */
+.status-row .label {
+    color: var(--text-secondary);
+    font-size: 0.875rem;
+}
+
+/* 狀態數值（右側等寬字型青色） */
+.status-row .value {
+    font-family: 'JetBrains Mono', monospace;
+    color: var(--accent-cyan);
+    font-weight: 500;
+}
+
+/* ======================== 速度條顯示（保留用） ======================== */
+.speed-display {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.speed-bar-container {
+    position: relative;
+}
+
+.speed-bar {
+    height: 6px;
+    border-radius: 3px;
+    background: var(--bg-secondary);
+    position: relative;
+    overflow: hidden;
+    margin-bottom: 4px;
+}
+
+/* 速度條填充（從中心向外延伸） */
+.speed-bar::after {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 0;
+    height: 100%;
+    width: 0%;
+    border-radius: 3px;
+    transition: var(--transition-fast);
+}
+
+/* vx 速度條：紅→橘漸層 */
+.speed-bar.speed-vx::after {
+    background: linear-gradient(90deg, var(--accent-red), var(--accent-orange));
+}
+
+/* vy 速度條：綠→青漸層 */
+.speed-bar.speed-vy::after {
+    background: linear-gradient(90deg, var(--accent-green), var(--accent-cyan));
+}
+
+/* wz 速度條：藍→紫漸層 */
+.speed-bar.speed-wz::after {
+    background: linear-gradient(90deg, var(--accent-blue), var(--accent-purple));
+}
+
+/* 速度標籤文字（等寬字型） */
+.speed-label {
+    font-size: 0.75rem;
+    color: var(--text-secondary);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.speed-label span {
+    color: var(--text-primary);
+}
+
+/* ======================== 控制按鈕 ======================== */
+/* 運動使能/停止按鈕：綠色漸層，啟用時變紅 */
+.control-btn {
+    width: 100%;
+    padding: 14px 20px;
+    border: none;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent-green), #059669);
+    color: white;
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    transition: var(--transition-normal);
+    margin-bottom: 10px;
+    box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+}
+
+/* 按鈕懸停：上移 + 加深陰影 */
+.control-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 20px rgba(16, 185, 129, 0.4);
+}
+
+/* 按鈕按下：回復位置 */
+.control-btn:active {
+    transform: translateY(0);
+}
+
+/* 按鈕啟用狀態（運動中）：紅色漸層 */
+.control-btn.active {
+    background: linear-gradient(135deg, var(--accent-red), #dc2626);
+    box-shadow: 0 4px 15px rgba(239, 68, 68, 0.3);
+}
+
+.control-btn.active:hover {
+    box-shadow: 0 6px 20px rgba(239, 68, 68, 0.4);
+}
+
+/* 次要按鈕樣式 */
+.control-btn.secondary {
+    background: var(--bg-secondary);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: none;
+}
+
+.control-btn.secondary:hover {
+    background: var(--bg-hover);
+    box-shadow: none;
+}
+
+.control-btn.secondary.active {
+    background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    border: none;
+    box-shadow: 0 4px 15px rgba(34, 211, 238, 0.3);
+}
+
+/* 按鈕圖示 */
+.btn-icon {
+    font-size: 1.2rem;
+}
+
+/* ======================== 資訊卡片 ======================== */
+.info-card {
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.1), rgba(59, 130, 246, 0.1));
+    border: 1px solid rgba(34, 211, 238, 0.2);
+}
+
+.info-card p {
+    font-size: 0.875rem;
+    color: var(--accent-cyan);
+    text-align: center;
+}
+
+/* ======================== 響應式設計（平板/手機） ======================== */
+@media (max-width: 768px) {
+    /* 縮小容器邊距 */
+    .container {
+        padding: 8px;
+    }
+
+    /* 雷達跟隨面板改為上下堆疊 */
+    .main-content {
+        flex-direction: column;
+    }
+
+    /* 控制面板改為水平排列、自動換行 */
+    .control-panel {
+        width: 100%;
+        flex-direction: row;
+        flex-wrap: wrap;
+    }
+
+    /* 卡片自適應寬度 */
+    .status-card,
+    .control-card {
+        flex: 1;
+        min-width: 150px;
+    }
+
+    .info-card {
+        width: 100%;
+    }
+
+    /* LiDAR 面板最小高度 */
+    .visualization-panel {
+        min-height: 400px;
+    }
+}
+
+/* ======================== 觸控裝置優化 ======================== */
+/* 停用 hover 動畫，避免觸控後殘留的懸停狀態 */
+@media (hover: none) {
+    .control-btn:hover {
+        transform: none;
+    }
+}
+
+/* ======================== 動作按鈕容器（保留用，差速機器人未使用） ======================== */
+.action-buttons-container {
+    display: flex;
+    gap: 16px;
+    width: 100%;
+    max-width: 400px;
+    justify-content: space-between;
+}
+
+/* 動作按鈕樣式（保留用） */
+.action-btn {
+    flex: 1;
+    padding: 12px;
+    border: none;
+    border-radius: 10px;
+    background: var(--bg-secondary);
+    color: var(--text-primary);
+    font-size: 1rem;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    transition: var(--transition-normal);
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.action-btn:hover {
+    background: var(--bg-hover);
+    transform: translateY(-2px);
+    box-shadow: 0 6px 12px rgba(0, 0, 0, 0.2);
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.action-btn:active {
+    transform: translateY(0);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+    background: rgba(34, 211, 238, 0.1);
+}
+
+/* ======================== 底盤模式控制列 ======================== */
+.mode-bar {
+    display: flex;
+    gap: 4px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.mode-btn {
+    flex: 1;
+    padding: 8px 4px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition-normal);
+    white-space: nowrap;
+}
+
+.mode-btn:hover {
+    background: var(--bg-hover);
+    border-color: rgba(34, 211, 238, 0.3);
+}
+
+.mode-btn:active {
+    transform: scale(0.96);
+}
+
+/* 各模式啟用狀態配色 */
+.mode-btn.active[data-mode="0"] { /* 放鬆 */
+    background: rgba(16, 185, 129, 0.2);
+    border-color: #10b981;
+    color: #10b981;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.3);
+}
+.mode-btn.active[data-mode="1"] { /* 停止 */
+    background: rgba(239, 68, 68, 0.2);
+    border-color: #ef4444;
+    color: #ef4444;
+    box-shadow: 0 0 8px rgba(239, 68, 68, 0.3);
+}
+.mode-btn.active[data-mode="2"] { /* 手動 */
+    background: rgba(59, 130, 246, 0.2);
+    border-color: #3b82f6;
+    color: #3b82f6;
+    box-shadow: 0 0 8px rgba(59, 130, 246, 0.3);
+}
+.mode-btn.active[data-mode="3"] { /* 自動 */
+    background: rgba(168, 85, 247, 0.2);
+    border-color: #a855f7;
+    color: #a855f7;
+    box-shadow: 0 0 8px rgba(168, 85, 247, 0.3);
+}
