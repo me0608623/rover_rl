@@ -356,13 +356,15 @@ function initTabSwitching() {
                 mode: mode
             });
 
-            // 跟隨 tab：自動啟用追蹤 + 運動 + 切底盤到 Web 模式
+            // 跟隨 tab：啟用追蹤 + 切底盤到 Web 模式，但【不自動運動】
+            // 運動要等使用者在雷達圖上雙擊目標後才開始（setTarget 內觸發 set_moving）
             if (tab.dataset.tab === 'follow') {
                 sendCommand({ type: 'set_active', active: true });
-                sendCommand({ type: 'set_moving', enabled: true });
+                sendCommand({ type: 'set_moving', enabled: false });  // 先停，等雙擊目標
                 sendCommand({ type: 'set_mux_mode', mode: 3 });
             } else {
                 sendCommand({ type: 'set_active', active: false });
+                sendCommand({ type: 'set_moving', enabled: false });  // 離開跟隨即停
             }
 
             // 如果切換到直接控制，可選擇自動開啟運動使能
@@ -701,6 +703,7 @@ function handleCanvasTouch(e) {
 
 /**
  * 設定跟隨目標位置：將像素座標轉換為機器人座標後發送給後端
+ * 雙擊目標 = 使用者確認要跟隨 → 同時啟動運動（set_moving:true）
  */
 function setTarget(pixelX, pixelY) {
     const robot = toRobot(pixelX, pixelY);
@@ -709,6 +712,9 @@ function setTarget(pixelX, pixelY) {
         x: robot.x,
         y: robot.y
     });
+    // 雙擊目標後才開始跟隨運動
+    sendCommand({ type: 'set_moving', enabled: true });
+    showToast(`🎯 開始跟隨目標 (${robot.x.toFixed(1)}, ${robot.y.toFixed(1)})`);
 }
 
 // ======================== WebSocket 連線管理 ========================
