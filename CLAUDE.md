@@ -34,6 +34,47 @@ obs_raw [B, 139] ── normalize + slice → obs79 [B, 79]
 - **5 Hz 控制週期**（dt=0.2s）— 訓練值，**勿改**
 - **動作上限**：v=1.0 m/s, a=0.5 m/s², ω=2.0 rad/s — **不要 extrapolate** 即使底盤更強
 
+### ⭐ v3c (SA3_v3c) 新模型 — 2026-06-12 加入（83D，與 SA6 不同！）
+
+> **完整說明見 `V3C_DEPLOY.md`。** 這裡是給車端 Claude 的速覽，避免誤用 SA6 設定跑 v3c。
+
+PC 端新增 **SA3_v3c** 模型，與 SA6 (79/139D) **不相容**，靠「換模型 + 換 yaml」切換，
+**SA6 路徑完全保留、行為 byte 不變**（不要為了 v3c 去改 SA6 的預設 yaml 或 79/139 程式分支）。
+
+| 項目 | SA6（舊，預設） | **v3c（新）** |
+|------|------|------|
+| raw_obs_dim | 79 / 139 | **83**（79D + 4D action stacking） |
+| RNN hidden | 30 | **64** |
+| LiDAR r_min | 0.9 | **0.25**（VLP-16 表面→人物中心校準） |
+| 角速度上限 | 2.0 | **0.25π≈0.785** |
+| 角速度 α slew | 無 | **3.0 rad/s²**（防舞龍舞獅） |
+| 模型 .ts | `sa6_tc_dense_420k.ts` | `sa3_v3c_240000.ts` |
+| yaml | `policy_params.yaml` | `policy_params_v3c.yaml` |
+| preprocessor yaml | `lidar_preprocessor_params.yaml` | `lidar_preprocessor_params_v3c.yaml` |
+
+83D obs 佈局：`[0:4]ego [4:6]goal [6:78]lidar(72) [78]time [79:83]action_stack`。
+其中 **state_mlp 分支=11D**（ego4+goal2+time1+act_hist4）、**lidar 分支=72D**。
+
+**action_stack（[79:83]）不是硬體量測**，是 policy 自己上 2 步 `decode_logits_to_cmd`
+回傳的 `(actual_accel, cmd_w)`（cmd_w 已過 slew），`policy_node` 內 `deque(maxlen=2)`
+推論後 push、停車/新 goal 清空。程式已接好，車端不需動。
+
+**啟動 v3c**（覆寫兩個 params_file）：
+```bash
+ros2 launch rover_rl_bringup deploy_with_bev.launch.py \
+  params_file:=$(ros2 pkg prefix rover_rl_bringup)/share/rover_rl_bringup/config/policy_params_v3c.yaml \
+  preprocessor_params_file:=$(ros2 pkg prefix rover_rl_bringup)/share/rover_rl_bringup/config/lidar_preprocessor_params_v3c.yaml \
+  initial_mode:=idle
+```
+模型放在 `~/rover_rl/models/sa3_v3c_240000.ts`（已由 PC 端 scp，gitignore 不入庫）。
+
+**v3c 注意事項**：
+- v3c yaml `speed_rate=1.0`（action_stack 與 slew 僅 rate=1 精確對齊）；首次上電靠
+  「架空車輪 + estop + 保守 goal」確保安全，**不要靠降 speed_rate**。
+- `episode_horizon_s=60.0` 為暫沿用值，只影響 obs[78] time-ramp，非安全關鍵，待驗證。
+- 訓練端 `modular_rnn_models.py` / `export_policy.py` 已支援 83D 自動偵測；重匯出新
+  checkpoint 不用改程式。
+
 ## LiDAR 前處理：獨立節點架構（採 spot_rl/spot_obs_process.cpp pattern）
 
 **重要**：rover_rl 把 LiDAR 前處理切成**獨立節點**，與 RL 推論節點解耦。
@@ -602,7 +643,7 @@ ros2 run rover_rl_inference routing_click_bridge
 | Goal 永遠收不到 | `goal_frame` 設錯 | 改 `goal_frame: odom`（沒 map）或 `map`（有 NDT/AMCL） |
 | goal 方位/距離全歪（點正前方卻算成遠處側後方） | `/ndt_pose` 是 map→odom 非車姿，被當車姿用 | 已修：車姿改走 TF `map→base_footprint`（見上方 NDT 段）。確認 `pose_src=tf`、`pose_x/y` 與 `tf2_echo map base_footprint` 一致 |
 | routing_click_bridge 找不到節點 | 地圖節點未啟 | 先確認 `/get_route_info` service 存在 |
-| 跑起來但車原地震 | normalizer 期望 139D 你給 79D（或反） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照 |
+| 跑起來但車原地震 | normalizer 期望維度與 model 不符（79/83/139 互錯，如 v3c 用了 SA6 yaml） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照；v3c 應為 raw_obs=83 |
 | cmd 振幅異常大 | normalizer mean/var 沒 bake 進 model | 重新 export_policy.py（必須帶有 obs_normalizer 的 checkpoint） |
 | RViz Nav2 goal 不被收 | topic remap | 確認 `/goal_pose` 是 Nav2 standard，不是 `/move_base_simple/goal` |
 | /rover_rl/bev_image 沒畫面 | matplotlib Agg 依賴 | 確認 `pip install matplotlib` 已裝 |
@@ -625,14 +666,17 @@ ros2 run rover_rl_inference routing_click_bridge
 
 ## 模型選擇建議
 
-| Model | 訓練場景 | 建議使用情境 |
-|---|---|---|
-| `sa6_tc_dense_420k.ts` ⭐ | T 型走廊 dense 障礙物，420k steps | **首選**，最久訓練 + 中等難度 |
-| `sa7_tc_dense_300000.ts` | T 走廊高壓（occlusion 20%, dyn=8） | 進階場景；首次部署別用 |
-| `sa5_tc_g1_p30_270000.ts` | T 走廊 g1_p30（goal=1, penalty=-30） | 訓練早期；當前不建議 |
+| Model | obs | 訓練場景 | 建議使用情境 |
+|---|---|---|---|
+| `sa3_v3c_240000.ts` 🆕 | **83D** | 牆壁+crossing，goal 動態，action stacking 抗抽動 | **最新**；用 `*_v3c.yaml`，見上方 v3c 段 + `V3C_DEPLOY.md` |
+| `sa6_tc_dense_420k.ts` ⭐ | 79/139D | T 型走廊 dense 障礙物，420k steps | SA6 首選，最久訓練 + 中等難度 |
+| `sa7_tc_dense_300000.ts` | 79/139D | T 走廊高壓（occlusion 20%, dyn=8） | 進階場景；首次部署別用 |
+| `sa5_tc_g1_p30_270000.ts` | 79/139D | T 走廊 g1_p30（goal=1, penalty=-30） | 訓練早期；當前不建議 |
 
-⚠️ **這三個都是 T-Corridor 課程**。實車場景若不是 T 走廊（例：開放廣場、長廊），policy 可能表現不佳。
-如果實測有問題，跟 PC 端訓練組要求一個 open-scene baseline 重訓。
+⚠️ **SA5/6/7 是 T-Corridor 課程，v3c 是牆壁+crossing 課程**。實車場景差異大時 policy 可能
+表現不佳；實測有問題就跟 PC 端訓練組要求對應場景重訓。
+⚠️ **v3c 與 SA6 不可混用設定**：v3c 必須配 `*_v3c.yaml`（83D / r_min 0.25 / ω 0.785 / slew），
+用 SA6 yaml 跑 v3c 會「raw_obs 維度不符」或行為失準。
 
 ## BEV 處理（純可視化，不是 policy 輸入）
 
