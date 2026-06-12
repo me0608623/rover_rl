@@ -62,6 +62,8 @@ def generate_launch_description():
     default_params = os.path.join(rl_pkg, "config", "policy_params.yaml")
     default_pre_params = os.path.join(rl_pkg, "config",
                                        "lidar_preprocessor_params.yaml")
+    # diag_logger 設定真值（auto_rearm / goal_change_eps_m / wandb 等都在這）
+    diag_params_file = os.path.join(rl_pkg, "config", "diag_logger_params.yaml")
 
     # ── args ──
     # 全部宣告為 LaunchConfiguration（延遲取值），實際預設值在 return 區的
@@ -376,28 +378,38 @@ def generate_launch_description():
 
     # ── Part 9: rover_rl — 診斷記錄（被動，不影響推論）──
     # 訂閱 odom/ndt/goal/cmd_vel/obs，20Hz 寫 CSV 到 ~/rover_rl/logs/diag/
-    # 收到第一個 goal/path 才開始建資料夾記錄（log_only_with_goal），可同步 wandb
-    diag_logger_node = Node(
-        package="rover_rl_inference",
-        executable="diag_logger",
-        name="rover_rl_diag_logger",
-        output="screen",
-        emulate_tty=True,
-        parameters=[{
-            "rate_hz": 20.0,
-            "log_dir": os.path.expanduser("~/rover_rl/logs/diag"),
-            "topic_cmd_vel": "/input/nav_cmd_vel",
-            "topic_obs_debug": "/rover_rl_policy/obs_debug",
-            "topic_record_ctrl": "/rover_rl/record",
-            "require_start": LaunchConfiguration("require_start"),
-            "log_only_with_goal": True,
-            "enable_wandb": LaunchConfiguration("enable_wandb"),
-            "wandb_mode": LaunchConfiguration("wandb_mode"),
-        }],
-        condition=IfCondition(LaunchConfiguration("enable_diag")),
-    )
+    # 設定真值在 config/diag_logger_params.yaml；用 OpaqueFunction 讓 CLI arg
+    # 留空(預設"")時走 yaml、有給才覆寫（一個 goal/path = 一段，到終點自動停+re-arm）
+    def make_diag_node(context, *args, **kwargs):
+        ov = {}
+        _b = lambda v: v.lower() == "true"     # "true"/"false" → bool
+        rs = LaunchConfiguration("require_start").perform(context)
+        ew = LaunchConfiguration("enable_wandb").perform(context)
+        wm = LaunchConfiguration("wandb_mode").perform(context)
+        ar = LaunchConfiguration("auto_rearm").perform(context)
+        ge = LaunchConfiguration("goal_change_eps_m").perform(context)
+        if rs != "":
+            ov["require_start"] = _b(rs)
+        if ew != "":
+            ov["enable_wandb"] = _b(ew)
+        if wm != "":
+            ov["wandb_mode"] = wm
+        if ar != "":
+            ov["auto_rearm"] = _b(ar)
+        if ge != "":
+            ov["goal_change_eps_m"] = float(ge)
+        return [Node(
+            package="rover_rl_inference",
+            executable="diag_logger",
+            name="rover_rl_diag_logger",
+            output="screen",
+            emulate_tty=True,
+            parameters=[diag_params_file, ov],   # yaml 為底，ov 只覆寫有給的 CLI arg
+            condition=IfCondition(LaunchConfiguration("enable_diag")),
+        )]
+    diag_logger_node = OpaqueFunction(function=make_diag_node)
 
-    # ── Part 10: LV-DOT 動態障礙物偵測（LiDAR+depth 融合，發 map frame markers）──
+    # ── Part 10: LV-DOT 動態障礙物偵測（LiDAR+depth 融合，發 odom frame markers，見 vis_frame 參數）──
     # 與 policy 解耦：偵測結果發到 /onboard_detector/*，供 status_tui / RViz 觀察，
     # policy 推論不吃此資料（obs 障礙欄仍補 0）
     lvdot_pkg = get_package_share_directory("onboard_detector")
@@ -476,13 +488,18 @@ def generate_launch_description():
         DeclareLaunchArgument("rviz", default_value="true"),
         DeclareLaunchArgument("enable_diag", default_value="true",
                               description="診斷記錄節點（goal 後記 CSV 到 ~/rover_rl/logs）"),
-        DeclareLaunchArgument("require_start", default_value="false",
-                              description="false=deploy 後自動待錄，發 goal 即開始記錄；"
-                                          "true=需另送 /rover_rl/record start 才開錄"),
-        DeclareLaunchArgument("enable_wandb", default_value="true",
-                              description="診斷記錄同步上 wandb（run 名=diag_日期_時間）"),
-        DeclareLaunchArgument("wandb_mode", default_value="offline",
-                              description="wandb 模式：offline(實車建議，回頭 wandb sync)/online/disabled"),
+        # 以下 5 個 diag 參數的真值在 config/diag_logger_params.yaml；
+        # 預設留空("")=走 yaml，CLI 有給才覆寫（現場熱調，免改 yaml）
+        DeclareLaunchArgument("require_start", default_value="",
+                              description="覆寫 yaml：false=發 goal 即開錄；true=需 record start。空=走 yaml"),
+        DeclareLaunchArgument("enable_wandb", default_value="",
+                              description="覆寫 yaml：診斷同步上 wandb（true/false）。空=走 yaml"),
+        DeclareLaunchArgument("wandb_mode", default_value="",
+                              description="覆寫 yaml：online/offline/disabled。空=走 yaml"),
+        DeclareLaunchArgument("auto_rearm", default_value="",
+                              description="覆寫 yaml：到 goal 停後自動 re-arm 開新一段（true/false）。空=走 yaml"),
+        DeclareLaunchArgument("goal_change_eps_m", default_value="",
+                              description="覆寫 yaml：新目標 vs 同終點重複發布的位移門檻(m)。空=走 yaml"),
         DeclareLaunchArgument("enable_lvdot", default_value="true",
                               description="LV-DOT 動態障礙物偵測（→ /onboard_detector/*）"),
         DeclareLaunchArgument("enable_lvdot_yolo", default_value="false",

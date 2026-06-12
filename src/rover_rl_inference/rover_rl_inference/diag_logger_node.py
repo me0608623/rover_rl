@@ -142,6 +142,11 @@ class DiagLoggerNode(Node):
         self.declare_parameter("robot_radius_m", 0.35)
         # false(預設)=啟動即待錄，發 goal 即開始；true=需送 record start 才開錄
         self.declare_parameter("require_start", False)
+        # true(預設)=收到 goal 後還要等「真正有速度輸出」才開檔+wandb（避免發了 goal 但車
+        #            沒動就佔一個空 run）；false=收到 goal 立即開檔（舊行為）
+        self.declare_parameter("start_on_motion", True)
+        # 判定「有速度輸出」的門檻（m/s 或 rad/s）：|cmd_v| 或 |cmd_w| 超過即算啟動
+        self.declare_parameter("start_motion_eps", 0.03)
         # 到達 goal 自動停止：距離低於此值連續 N tick → stop_experiment
         self.declare_parameter("auto_stop_goal_tol", 0.6)
         self.declare_parameter("auto_stop_goal_ticks", 10)   # 20Hz × 10 = 0.5s
@@ -178,6 +183,8 @@ class DiagLoggerNode(Node):
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
         self.require_start = bool(gp("require_start").value)
+        self.start_on_motion = bool(gp("start_on_motion").value)
+        self.start_motion_eps = float(gp("start_motion_eps").value)
         self.auto_stop_goal_tol = float(gp("auto_stop_goal_tol").value)
         self.auto_stop_goal_ticks = int(gp("auto_stop_goal_ticks").value)
         self.auto_rearm = bool(gp("auto_rearm").value)
@@ -204,6 +211,7 @@ class DiagLoggerNode(Node):
         # 實驗 / 檔案
         self._started = False
         self._armed = False        # 已待命但尚未建資料夾（等第一個 goal）
+        self._pending_motion = False  # 已收 goal、等待真正速度輸出才開檔（start_on_motion）
         self._exp_label = ""
         self._fh = None
         self._writer = None
@@ -255,6 +263,7 @@ class DiagLoggerNode(Node):
         self._reset_run_stats()
         self._goal_seq = 0
         self._goal = None
+        self._pending_motion = False
         self._last_done_goal = None
         if self.log_only_with_goal:
             # 待命：收到第一個 goal 才建資料夾 + 開檔（避免沒走 goal 留空資料夾）
@@ -380,7 +389,8 @@ class DiagLoggerNode(Node):
     def stop_experiment(self) -> None:
         if self._armed and not self._started:
             self._armed = False
-            self.get_logger().info("⏹ 取消待命（未收到 goal，無資料夾/紀錄產生）")
+            self._pending_motion = False
+            self.get_logger().info("⏹ 取消待命（未開始紀錄，無資料夾產生）")
             return
         if not self._started:
             return
@@ -402,6 +412,7 @@ class DiagLoggerNode(Node):
         self._reset_run_stats()
         self._goal_seq = 0
         self._goal = None
+        self._pending_motion = False
         self._goal_close_ticks = 0
         self._armed = True
         self.get_logger().info(
@@ -487,19 +498,41 @@ class DiagLoggerNode(Node):
             if (self._last_done_goal is not None
                     and self._xy_dist(new_xy, self._last_done_goal) <= self.goal_change_eps_m):
                 return
+            # 已在等速度輸出（pending）：同終點 2Hz republish 只刷新座標，不重印 log
+            if (self._pending_motion and self._goal is not None
+                    and self._xy_dist(new_xy, self._goal[:2]) <= self.goal_change_eps_m):
+                self._goal = (x, y, frame)
+                return
             self._reset_run_stats()
             self._goal = (x, y, frame)
             self._goal_seq = 1
             self._goal_close_ticks = 0
-            self._open_run_files(self._exp_label)   # 第一個 goal/path → 建資料夾開新一段紀錄
-            self.get_logger().info(
-                f"[{kind} #1] ({x:.2f},{y:.2f}) frame={frame}{extra} → 開始新一段紀錄"
-            )
+            if self.start_on_motion:
+                # 收到 goal 但先不開檔，等 _cb_cmd 偵測到真正速度輸出才建資料夾+wandb
+                self._pending_motion = True
+                self.get_logger().info(
+                    f"[{kind} #1] ({x:.2f},{y:.2f}) frame={frame}{extra}"
+                    f" → 收到目標，等待速度輸出後開始紀錄"
+                )
+            else:
+                self._open_run_files(self._exp_label)   # 舊行為：第一個 goal 立即開檔
+                self.get_logger().info(
+                    f"[{kind} #1] ({x:.2f},{y:.2f}) frame={frame}{extra} → 開始新一段紀錄"
+                )
             return
         # 既非 started 也非 armed（auto_rearm=false 已停）→ 不再記錄，忽略
 
     def _cb_cmd(self, msg: Twist) -> None:
         self._cmd = (msg.linear.x, msg.angular.z, time.monotonic())
+        # pending（已收 goal 等速度）：偵測到真正速度輸出 → 建資料夾開檔 + wandb
+        if self._pending_motion and (
+                abs(msg.linear.x) > self.start_motion_eps
+                or abs(msg.angular.z) > self.start_motion_eps):
+            self._pending_motion = False
+            self._open_run_files(self._exp_label)
+            self.get_logger().info(
+                f"▶ 偵測到速度輸出（v={msg.linear.x:+.2f} w={msg.angular.z:+.2f}）→ 開始紀錄 + wandb"
+            )
 
     def _cb_obs(self, msg: Float32MultiArray) -> None:
         if len(msg.data) >= 6:

@@ -579,6 +579,18 @@ ros2 run rover_rl_inference routing_click_bridge
 - **LV-DOT 動態障礙**：儀表板「動態」列**直接訂閱** `/onboard_detector/dynamic_bboxes`（MarkerArray，
   與 policy 解耦，policy 推論不吃此資料、obs 障礙欄仍補 0）。顯示動態障礙框數；未啟動→灰、
   >2s 無更新→黃「偵測器可能死」、0 個→綠。topic 可用 `topic_dynamic_bboxes` 參數改。
+- **右側 LiDAR 雷達（2026-06-09 加入）**：主框右邊空白區多開一個子視窗，把 BEV 的極座標散點
+  **用純文字重畫**（不把 `/rover_rl/bev_image` 點陣圖塞進 curses——curses 不支援影像、且吃終端機）。
+  **直接訂閱 `/rover_rl/lidar_sweep_72`**（與 status JSON 解耦，狀態逾時也能看 LiDAR），反算公尺後
+  畫散點：綠=安全(>5m)、黃=注意(2~5m)、紅=危險(<2m)、貼近量程上限視為無回波不畫；機器人置中 `↑`、
+  goal 黃 `◆`（來自 status 的 `goal_dist`/`goal_ang_deg`，與 sweep 同 `atan2(left,fwd)` 慣例、含
+  BEV 同款左右鏡像）。**前方朝上**。
+  - **兩種風格可熱切換**：`radar_style:=braille`（預設，每字元 2×4 點、≈80×80 點解析、輪廓最接近 BEV）
+    或 `dots`（彩色 `●` 散點、最簡）。`ros2 param set /rover_rl_status_tui radar_style dots` 現場切。
+  - 參數：`enable_radar`(預設 True)、`radar_range_m`(顯示半徑，預設 10m，超出貼邊)、`topic_sweep`、
+    `r_max`/`r_robot`(正規化反算，與 preprocessor 對齊)。
+  - **窄螢幕自動退化**：右側可用寬度 <26 欄就不畫雷達（比照站線放不下的退化邏輯），純文字終端無關。
+  - 想要照片級畫質（trail/距離環/點大小分級）仍用 `rqt_image_view /rover_rl/bev_image`；雷達只做一眼態勢感知。
 
 ### 速度/延遲離線分析（diag_logger + analyze_diag）
 - `diag_logger` 已加訂閱 `/rover_rl_policy/status`，CSV 多記 `rl_v/rl_w`（RL 意圖）、
@@ -788,21 +800,25 @@ subscribe_once(topic="/camera/camera/color/image_raw",
 analyze_previously_received_image()
 ```
 
-### RealSense 相機（開機自動啟動）
+### RealSense 相機（隨 lv-dot 共同啟動，2026-06-10 更新）
 
-主機 `192.168.3.13` 開機會**自動啟動** RealSense 相機，影像透過 zenoh 傳到全網。
-rover_rl 推論**不使用**此相機（policy 只吃 72-bin LiDAR sweep），相機純供
-人工/AI 視覺確認場景用。
+相機（D435i）接在主機 `192.168.3.13`（帳號 humble，Jetson 本機無相機裝置）。
+**舊的開機自啟 systemd 服務已不存在**（實查無 realsense.service / cron / autostart）。
+現行機制：`lv-dot` launch（`run_detector.launch.py`）內建 `use_camera:=true`（預設開），
+透過免密 SSH（aa@jetson → humble@.13，金鑰已建）跑遠端 `~/start_realsense.sh`
+（含 `enable_depth:=true` + depth 640,480,30 + color 640,480,15 + zenoh RMW）。
+**冪等 + 脫鉤**（2026-06-10 實測）：相機已在跑 → 沿用不重啟（避免雙開搶 USB）；
+沒在跑 → setsid+nohup 背景拉起（log: `~/realsense_lvdot.log` on .13）。
+**關 lv-dot 不會關相機**——要手動關：`ssh humble@192.168.3.13 "pkill -f 'realsense2_camera_[n]ode'"`
+（pattern 必須用 [n] bracket trick，否則 pkill 比中 ssh 自己的指令字串）。
 
-啟動指令（已設為開機自啟，列出供參考）：
-```bash
-ros2 launch realsense2_camera rs_launch.py \
-  enable_depth:=false rgb_camera.color_profile:=640,480,15
-```
+rover_rl 推論**不使用**此相機（policy 只吃 72-bin LiDAR sweep）；
+LV-DOT 的視覺分支（depth UV detector + YOLO 2D）與人工確認場景需要它。
 
 | Topic | Type | 說明 |
 |---|---|---|
 | `/camera/camera/color/image_raw` | `sensor_msgs/Image` | 640×480 rgb8 @ 15fps |
+| `/camera/camera/depth/image_rect_raw` | `sensor_msgs/Image` | 640×480 @ 30fps |
 | `/camera/camera/color/camera_info` | `sensor_msgs/CameraInfo` | 內參 |
 
 frame_id = `camera_color_optical_frame`。透過 ROS MCP 看畫面：
@@ -812,7 +828,10 @@ subscribe_once(topic="/camera/camera/color/image_raw",
 analyze_previously_received_image()
 ```
 
-⚠️ depth 預設關閉（`enable_depth:=false`）。若要點雲/深度需另開 launch 參數。
+⚠️ 注意：`ros2 topic list` 看到 `/camera/*` 不代表相機在發（detector 訂閱端也會讓
+topic 名字出現）——要用 `ros2 topic info -v` 看 **Publisher count**。
+（2026-06-10 曾發生 D435i 整支從 USB 消失 → 遠端一直 `No RealSense devices were found!`，
+重插即恢復。看到此訊息先查 .13 的 `lsusb | grep -i intel`。）
 
 ### 與 rover_rl 部署整合
 

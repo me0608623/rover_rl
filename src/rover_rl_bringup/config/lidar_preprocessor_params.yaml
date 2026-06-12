@@ -1,22 +1,22 @@
 rover_rl_lidar_preprocessor:
   ros__parameters:
     # --- 輸入/輸出 ---
-    topic_in: "/velodyne_points"
-    topic_odom: "/odom"
-    topic_out_sweep: "/rover_rl/lidar_sweep_72"
-    topic_out_scan: "/rover_rl/lidar_scan"
+    topic_in: "/velodyne_points"             # 原始 VLP-16 點雲輸入
+    topic_odom: "/odom"                       # motion compensation 用的里程計
+    topic_out_sweep: "/rover_rl/lidar_sweep_72"  # 輸出 72-bin sweep（給 policy）
+    topic_out_scan: "/rover_rl/lidar_scan"   # 輸出 LaserScan（給 RViz/costmap）
     publish_laserscan: true                  # RViz 可看；給 costmap 也可用
-    laserscan_frame: "velodyne_link"
-    lidar_qos_best_effort: true
+    laserscan_frame: "velodyne_link"         # 輸出 LaserScan 的 frame_id
+    lidar_qos_best_effort: true              # velodyne 驅動為 SensorDataQoS
 
     # --- 處理頻率 ---
     publish_rate_hz: 10.0                    # VLP-16 同步：10 Hz
 
     # --- 訓練端對齊參數（與 ObservationsCfgVLP16 完全一致；勿改） ---
-    num_bins: 72
-    r_max: 20.0
-    r_robot: 0.35
-    r_min: 0.9
-    z_filter: 0.5
-    yaw_offset_deg: 0.0
+    num_bins: 72                             # 角度 bin 數（atan2 環周 360°/72）
+    r_max: 20.0                              # 最遠有效距離(m)，>= 此值正規化為 1.0
+    r_robot: 0.35                            # 機器人半徑(m)，正規化基準
+    r_min: 0.9                               # VLP-16 硬體盲區(m)
+    z_filter: 0.5                            # sensor frame |z|>0.5 過濾地板/天花板
+    yaw_offset_deg: 0.0                      # velodyne_link 相對 base_link 無 yaw → 0
     motion_compensation: true                # 補償掃描期間機器人位移
