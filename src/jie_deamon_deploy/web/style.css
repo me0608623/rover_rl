@@ -122,11 +122,11 @@ body {
     border: 1px solid rgba(34, 211, 238, 0.2);
 }
 
-/* Tab 圖示：未選中時灰階 + 縮小 */
+/* Tab 圖示：未選中時灰階 + 縮小（依原圖比例自動縮放，不強制 aspect-ratio） */
 .nav-item img {
     height: 40px;
     width: auto;
-    aspect-ratio: 2/1;
+    max-width: 90px;
     object-fit: contain;
     filter: grayscale(100%);
     transform: scale(0.8);
