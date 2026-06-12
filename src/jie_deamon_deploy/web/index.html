@@ -1,0 +1,152 @@
+<!--
+  ========================================================================
+  Web UI 架構概覽
+  ========================================================================
+  本檔案為差速機器人遠端控制介面的 HTML 結構。
+  透過 WebSocket（port 8890）與 C++ 後端通訊。
+
+  三個 Tab 面板功能：
+    1. 直接控制（direct） — 虛擬搖桿 + 旋轉滑桿，手動遙控機器人
+    2. 雷達跟隨（follow） — LiDAR 即時可視化，自動跟隨目標
+    3. 地圖導航（nav）    — 尚未實作（施工中佔位頁面）
+
+  已移除機械狗專用的動作按鈕（趴下/站起），僅保留差速機器人適用的控制元件。
+  ========================================================================
+-->
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <!-- 行動裝置視窗設定：禁止使用者縮放，確保觸控操作不誤縮放 -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>雷达跟随可视化</title>
+    <!-- 引入暗色主題樣式表 -->
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <!-- 最外層容器：垂直佈局，佔滿全螢幕高度 -->
+    <div class="container">
+        <!-- 頂部導覽列：包含三個 Tab 切換按鈕 + 連線狀態指示器 -->
+        <nav class="nav-bar">
+            <!-- Tab 1: 直接控制（預設啟用） -->
+            <div class="nav-item active" data-tab="direct">
+                <img src="icon/ico_1.png" alt="直接控制">
+            </div>
+            <!-- Tab 2: 雷達跟隨 -->
+            <div class="nav-item" data-tab="follow">
+                <img src="icon/ico_2.png" alt="雷达跟随">
+            </div>
+            <!-- Tab 3: 地圖導航 -->
+            <div class="nav-item" data-tab="nav">
+                <img src="icon/ico_3.png" alt="地图导航">
+            </div>
+            <!-- WebSocket 連線狀態顯示（綠=已連線、紅=已斷線、橘=連線中） -->
+            <div class="connection-status" id="connectionStatus">
+                <span class="status-dot"></span>
+                <span class="status-text">连接中...</span>
+            </div>
+        </nav>
+
+        <!-- 底盤模式控制列：停止/放鬆/手把/Web控制/導航 -->
+        <div class="mode-bar" id="modeBar">
+            <button class="mode-btn" data-mode="1" id="modeStop">🔒 停止</button>
+            <button class="mode-btn active" data-mode="0" id="modeRelease">🔓 放鬆</button>
+            <button class="mode-btn" data-mode="2" id="modeManual">🎮 手把</button>
+            <button class="mode-btn" data-mode="3" id="modeAuto">🌐 Web</button>
+        </div>
+
+        <!-- ======================== 直接控制面板 ======================== -->
+        <div id="panel-direct" class="tab-content active">
+            <div class="direct-control-container">
+                <!-- 旋轉控制滑桿：左右拖曳控制角速度 wz -->
+                <div class="slider-container">
+                    <div class="slider-track"></div>
+                    <!-- 滑桿旋鈕，由 JS 控制水平位移 -->
+                    <div class="slider-knob" id="rotationKnob"></div>
+                    <div class="slider-label left">↺ 左转</div>
+                    <div class="slider-label right">右转 ↻</div>
+                </div>
+
+                <!-- 虛擬搖桿：上下拖曳控制前後速度 vx（差速機器人 vy 恆為 0） -->
+                <div class="joystick-area">
+                    <div class="joystick-base" id="joystickBase">
+                        <!-- 搖桿圓球，由 JS 控制 transform 位移 -->
+                        <div class="joystick-stick" id="joystickStick"></div>
+                        <!-- 十字參考線（純視覺裝飾） -->
+                        <div class="joystick-cross"></div>
+                    </div>
+                    <div class="joystick-hint">前进/后退控制</div>
+                </div>
+
+                <!-- 速度模式切換：低速（0.5 倍）/ 高速（1.0 倍） -->
+                <div class="speed-mode-switch">
+                    <span class="mode-label low-label">低速</span>
+                    <label class="switch">
+                        <input type="checkbox" id="speedModeToggle">
+                        <span class="switch-slider"></span>
+                    </label>
+                    <span class="mode-label high-label">高速</span>
+                </div>
+
+                <!-- 差速機器人無需動作按鈕（已移除趴下/站起按鈕） -->
+            </div>
+        </div>
+
+        <!-- ======================== 導航面板（施工中） ======================== -->
+        <div id="panel-nav" class="tab-content" style="display: none;">
+            <div class="construction-container">
+                <div class="construction-icon">🚧</div>
+                <h2>正在施工</h2>
+                <p>敬请期待...</p>
+            </div>
+        </div>
+
+        <!-- ======================== 雷達跟隨面板 ======================== -->
+        <!-- 包含 LiDAR 視覺化 Canvas 與右側控制面板 -->
+        <main id="panel-follow" class="main-content tab-content" style="display: none;">
+            <!-- 左側：LiDAR 即時雷達圖（Canvas 由 JS 動態繪製） -->
+            <div class="visualization-panel">
+                <canvas id="lidarCanvas"></canvas>
+            </div>
+
+            <!-- 右側：狀態資訊 + 速度指令顯示 + 運動使能按鈕 -->
+            <aside class="control-panel">
+                <!-- 目標狀態卡片：顯示跟隨目標的 X/Y 座標 -->
+                <div class="status-card">
+                    <h3>🎯 目标状态</h3>
+                    <div class="status-row">
+                        <span class="label">位置 X</span>
+                        <span class="value" id="targetX">0.00 m</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="label">位置 Y</span>
+                        <span class="value" id="targetY">0.00 m</span>
+                    </div>
+                </div>
+
+                <!-- 速度指令卡片：以十字座標 + 圓弧圖形顯示 vx/vy/wz -->
+                <div class="status-card speed-card">
+                    <h3>🚀 速度指令</h3>
+                    <div class="speed-canvas-container">
+                        <canvas id="speedCanvas" height="100"></canvas>
+                    </div>
+                </div>
+
+                <!-- 運動使能/停止按鈕 -->
+                <div class="control-card">
+                    <!-- <h3>⚙️ 控制</h3> -->
+                    <button class="control-btn" id="movingToggle">
+                        <span class="btn-icon">⏸️</span>
+                        <span class="btn-text">运动停止</span>
+                    </button>
+                </div>
+            </aside>
+        </main>
+    </div>
+    <!-- 載入主應用程式邏輯（WebSocket、搖桿、雷達繪圖） -->
+    <script src="app.js"></script>
+</body>
+
+</html>

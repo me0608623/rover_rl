@@ -1,6 +1,6 @@
-"""Observation builder — 79D (SA1_v2 / SA5/6/7) 與 83D (v3c) 兩種 layout.
+"""79D observation builder — 對齊 SA1_v2 PolicyCfg.
 
-79D Layout (與 ObservationsCfgVLP16.PolicyCfg 完全一致)：
+Layout (與 ObservationsCfgVLP16.PolicyCfg 完全一致)：
     [0]      ā_t   = a_t / max_acceleration       # normalized linear accel
     [1]      v̄_t   = v_t / max_linear_velocity   # normalized linear vel
     [2]      ω̄_t   = ω_t / max_angular_velocity_obs   # normalized angular vel
@@ -9,20 +9,9 @@
     [6:78]   LiDAR 72-bin sweep (normalized [0, 1])
     [78]     time_remaining ratio [0, 1]
 
-83D Layout (v3c — 79D 之後接 4D action history，抗抽動)：
-    [0:79]   同上 79D（ego + goal + LiDAR + time）
-    [79]     a_{t-1} = applied_accel_{t-1} / act_hist_a_max,   clip[-2, 2]
-    [80]     ω_{t-1} = applied_omega_{t-1} / act_hist_omega_max, clip[-2, 2]
-    [81]     a_{t-2} = applied_accel_{t-2} / act_hist_a_max,   clip[-2, 2]
-    [82]     ω_{t-2} = applied_omega_{t-2} / act_hist_omega_max, clip[-2, 2]
-
 注意：
 - obs 內 ω 用 max_angular_velocity_obs=1.5 正規化（與 vlp16 ObsTerm 一致），
-  動作端 max_angular_vel 另計；兩者不同，請勿混用。
-- action history 用 act_hist_a_max=0.2、act_hist_omega_max=π/15（≈0.209）正規化，
-  與訓練端 discrete_applied_action_history 一致；**這不是動作上限，是歷史欄正規化分母**。
-- action history 來源是 policy 自己上 2 步「下達並經動態 clamp/slew 後」的指令
-  (decode_logits_to_cmd 回傳的 actual_accel / actual_omega)，**不是 IMU/odom 量測值**。
+  動作端 max_angular_vel=2.0；兩者不同，請勿混用。
 - goal 為 body frame：x 前方 (+), y 左方 (+)。需要從 world goal 與當前 odom 算 TF。
 """
 from __future__ import annotations
@@ -43,9 +32,6 @@ class ObsParams:
     robot_radius: float = 0.35             # obs[3] 常數欄；同 sweep 正規化用的 r_robot
     lidar_num_bins: int = 72
     episode_horizon_s: float = 60.0  # time_remaining 分母（訓練 episode 長度）
-    # v3c action history 正規化分母（對齊 discrete_applied_action_history 的 a_max / omega_max）
-    act_hist_a_max: float = 0.2                   # [79]/[81] applied accel 正規化分母
-    act_hist_omega_max: float = math.pi / 15.0    # [80]/[82] applied omega 正規化分母 ≈ 0.2094
 
 
 def build_obs_79d(
@@ -86,60 +72,6 @@ def build_obs_79d(
     return obs
 
 
-def normalize_applied_action(
-    accel: float,
-    omega: float,
-    params: ObsParams = ObsParams(),
-) -> tuple[float, float]:
-    """把一步 applied action (accel, omega) 正規化成 action-history 欄位用的 (a_norm, ω_norm).
-
-    對齊訓練端 discrete_applied_action_history：a / act_hist_a_max、ω / act_hist_omega_max，
-    再 clip 到 [-2, 2]（防實車瞬時超標污染分布 / NaN 傳播）。
-
-    Args:
-        accel: 該步實際 applied 線加速度 (m/s²) = decode_logits_to_cmd 回傳的 actual_accel
-        omega: 該步實際 applied 角速度 (rad/s) = decode_logits_to_cmd 回傳的 cmd_w（已 slew）
-    Returns:
-        (a_norm, ω_norm)，皆 clip 在 [-2, 2]
-    """
-    a = float(np.clip(accel / max(params.act_hist_a_max, 1e-6), -2.0, 2.0))
-    w = float(np.clip(omega / max(params.act_hist_omega_max, 1e-6), -2.0, 2.0))
-    return a, w
-
-
-def build_obs_83d(
-    last_accel: float,
-    linear_vel: float,
-    angular_vel: float,
-    goal_body_x: float,
-    goal_body_y: float,
-    lidar_sweep_72: np.ndarray,
-    elapsed_s: float,
-    action_hist_norm: np.ndarray | None = None,
-    params: ObsParams = ObsParams(),
-) -> np.ndarray:
-    """83D = 79D base + 4D action history (v3c).
-
-    Args:
-        action_hist_norm: shape (4,) = [a_{t-1}, ω_{t-1}, a_{t-2}, ω_{t-2}]，**已正規化**
-            (用 normalize_applied_action 算好，新→舊排列)。None → 全 0（episode/goal reset）。
-    """
-    o79 = build_obs_79d(
-        last_accel, linear_vel, angular_vel, goal_body_x, goal_body_y,
-        lidar_sweep_72, elapsed_s, params,
-    )
-    obs = np.empty(83, dtype=np.float32)
-    obs[0:79] = o79                    # ego + goal + LiDAR + time（time 在 [78]）
-    if action_hist_norm is None:
-        obs[79:83] = 0.0
-    else:
-        ah = np.asarray(action_hist_norm, dtype=np.float32).reshape(-1)
-        if ah.shape != (4,):
-            raise ValueError(f"action_hist_norm shape {ah.shape} != (4,)")
-        obs[79:83] = ah
-    return obs
-
-
 def build_obs_raw(
     raw_obs_dim: int,
     *,
@@ -150,23 +82,21 @@ def build_obs_raw(
     goal_body_y: float,
     lidar_sweep_72: np.ndarray,
     elapsed_s: float,
-    action_hist_norm: np.ndarray | None = None,
     params: ObsParams = ObsParams(),
+    action_history: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build raw obs vector matching the bundle's expected raw_obs_dim.
 
     - 79D (SA1_v2): ego(4) + goal(2) + LiDAR(72) + time(1)
-    - 83D (v3c): 79D + action history(4)；需傳 action_hist_norm（None → 補 0）
     - 139D (SA5/6/7): ego(4) + goal(2) + LiDAR(72) + obstacles(60 zeros) + time(1)
+    - 83D (v3c action stacking): 79D + action_history(4) = [a_t-1, ω_t-1, a_t-2, ω_t-2]
 
     部署沒有 ground-truth 障礙物，60D 補零；normalizer 會把這些零依訓練統計轉換，
     再 slice 掉（export_policy 已內建 [0..77, 138] 切片）。
+
+    action_history 僅 83D（v3c）會用到；79/139D 忽略。內容為「正規化後的近 2 步動作」，
+    由 policy_node 維護（appendleft 最新）。⚠ 正規化常數必須與 v3c 訓練端一致。
     """
-    if raw_obs_dim == 83:
-        return build_obs_83d(
-            last_accel, linear_vel, angular_vel, goal_body_x, goal_body_y,
-            lidar_sweep_72, elapsed_s, action_hist_norm, params,
-        )
     o79 = build_obs_79d(
         last_accel, linear_vel, angular_vel, goal_body_x, goal_body_y,
         lidar_sweep_72, elapsed_s, params,
@@ -182,7 +112,19 @@ def build_obs_raw(
         # out[78:138] = 0           # obstacles ground-truth unavailable
         out[138] = o79[78]          # time
         return out
-    raise ValueError(f"unsupported raw_obs_dim={raw_obs_dim} (expected 79, 83 or 139)")
+    if raw_obs_dim == 83:
+        # v3c action stacking：79D（time 在 index 78）後直接接 4D action history，
+        # 與訓練端 concat([..., [time], act_hist]) 的順序逐字一致。
+        if action_history is None or action_history.shape != (4,):
+            raise ValueError(
+                f"raw_obs_dim=83 需 action_history shape (4,)，got "
+                f"{None if action_history is None else action_history.shape}"
+            )
+        out = np.empty(83, dtype=np.float32)
+        out[0:79] = o79
+        out[79:83] = action_history.astype(np.float32)
+        return out
+    raise ValueError(f"unsupported raw_obs_dim={raw_obs_dim}")
 
 
 def world_goal_to_body(

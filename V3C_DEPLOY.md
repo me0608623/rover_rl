@@ -41,12 +41,15 @@ python -m rover_rl_inference.export_policy \
 
 | 改動 | SA6 | v3c | 落點 |
 |------|-----|-----|------|
-| obs 維度 | 79/139 | **83** | `obs_builder.build_obs_83d` + `build_obs_raw` 新增 83 分支 |
+| obs 維度 | 79/139 | **83** | `obs_builder.build_obs_raw(action_history=)` 新增 83 分支 |
+| action history | 無 | **4D** | `policy_node`：`act_stack_*` 參數 + `_push_act_hist`（clip **[-2,2]**）+ episode reset |
 | LiDAR r_min | 0.9 | **0.25** | `lidar_preprocessor_params_v3c.yaml` 的 `r_min`（程式預設不變） |
 | 角速度上限 | 2.0 | **0.25π≈0.785** | `policy_params_v3c.yaml` 的 `act_max_angular_velocity` |
 | 角速度 α slew | 無 | **3.0 rad/s²** | `action_decoder`（`max_angular_accel`，0=舊行為）+ yaml `act_max_angular_accel` |
 
 > ⚠️ ω 上限與 slew 必須**同時**改：少了 slew，action_stack 的 ω 欄會與訓練不一致。
+> 註：action history 正規化分母 `act_stack_omega_max=π/15`、clip `[-2,2]`（對齊訓練端
+> `discrete_applied_action_history`）；`obs_max_angular_velocity=1.5` 是 obs[2] 正規化、與上述無關。
 
 ## 啟動
 

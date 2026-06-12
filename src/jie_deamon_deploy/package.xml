@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<!--
+  package.xml — jie_deamon 套件描述檔
+
+  檔案說明:
+    定義 jie_deamon 套件的元資料（名稱、版本、描述、維護者）
+    以及編譯 / 執行所需的依賴套件。
+
+  Humble 相容性:
+    - format="3" 在 Humble 中完全支持，與 Jazzy 相同
+    - 所有 <depend> 標籤在 Humble / Jazzy 中語法一致
+    - ament_cmake 建置工具在兩個版本中行為相同
+-->
+<!-- format="3": ROS 2 套件描述格式第 3 版（Humble / Jazzy 皆支持） -->
+<package format="3">
+  <!-- 套件名稱（須與 CMakeLists.txt 的 project() 一致） -->
+  <name>jie_deamon</name>
+  <!-- 套件版本號 -->
+  <version>1.0.0</version>
+  <!-- 套件描述 -->
+  <description>機器人後端服務節點（支援差速驅動）</description>
+  <!-- 維護者資訊 -->
+  <maintainer email="zhangwanjie@6-robot.com">ZhangWanjie</maintainer>
+  <!-- 授權條款 -->
+  <license>MIT</license>
+
+  <!-- 建置工具依賴: ament_cmake（ROS 2 CMake 建置系統） -->
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- 編譯 + 執行期依賴（<depend> = <build_depend> + <exec_depend>） -->
+  <depend>rclcpp</depend>           <!-- ROS 2 C++ 客戶端函式庫 -->
+  <depend>sensor_msgs</depend>      <!-- 感測器訊息型別（LaserScan 等） -->
+  <depend>geometry_msgs</depend>    <!-- 幾何訊息型別（Twist、Pose 等） -->
+  <depend>std_msgs</depend>         <!-- 標準訊息型別（String、Bool 等） -->
+
+  <!-- 測試依賴: ament lint 自動化程式碼風格檢查 -->
+  <test_depend>ament_lint_auto</test_depend>    <!-- 自動偵測並執行 linter -->
+  <test_depend>ament_lint_common</test_depend>  <!-- 常用 linter 集合 -->
+
+  <!-- 匯出建置類型（告訴 colcon 使用 ament_cmake 建置） -->
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

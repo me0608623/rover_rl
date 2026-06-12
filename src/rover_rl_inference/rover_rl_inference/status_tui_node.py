@@ -20,14 +20,26 @@ from __future__ import annotations
 import curses
 import json
 import locale
+import math
 import threading
 import time
 import unicodedata
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float32MultiArray, String
 from visualization_msgs.msg import MarkerArray
+
+# 到達判定距離（m）：與 diag_logger 的 auto_stop_goal_tol 對齊，goal_dist ≤ 此值即算到達
+GOAL_REACHED_DIST_M = 0.6
+
+# braille 點字 2×4 子格 → bit 對照（U+2800 基底）。
+# 一個 braille 字元 = 2 欄 × 4 列共 8 點，可在純文字終端達到 4× 縱向解析度，
+# 用來在右側畫極座標 LiDAR 雷達（不必把 matplotlib BEV 影像塞進 curses）。
+BRAILLE_DOTS = {
+    (0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+    (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80,
+}
 
 MODE_LABEL = {
     "nav": "NAV 自動導航",
@@ -51,12 +63,23 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_dynamic_bboxes", "/onboard_detector/dynamic_bboxes")
         self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
         self.declare_parameter("topic_route_stations", "/rover_rl/route_stations")
+        # 右側 LiDAR 雷達（重畫 BEV 的極座標散點，不吃 bev_image 影像）
+        self.declare_parameter("topic_sweep", "/rover_rl/lidar_sweep_72")
+        self.declare_parameter("enable_radar", True)
+        self.declare_parameter("radar_style", "braille")   # braille / dots，可熱切換
+        self.declare_parameter("radar_range_m", 10.0)      # 雷達顯示半徑（>此距離貼邊）
+        self.declare_parameter("r_max", 20.0)              # 與 preprocessor 正規化對齊
+        self.declare_parameter("r_robot", 0.35)
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
         topic_dyn = self.get_parameter(
             "topic_dynamic_bboxes").get_parameter_value().string_value
         topic_diag = self.get_parameter("topic_diag_event").get_parameter_value().string_value
         topic_stations = self.get_parameter(
             "topic_route_stations").get_parameter_value().string_value
+        topic_sweep = self.get_parameter("topic_sweep").get_parameter_value().string_value
+        self._radar_range = float(self.get_parameter("radar_range_m").value)
+        self._r_max = float(self.get_parameter("r_max").value)
+        self._r_robot = float(self.get_parameter("r_robot").value)
         self._lock = threading.Lock()
         self._status: dict | None = None
         self._last_t = 0.0
@@ -66,10 +89,13 @@ class StatusTuiNode(Node):
         self._diag_event_t = 0.0
         self._stations: dict | None = None    # routing 具名站序 {stations, wp_idx, n_wp}
         self._stations_t = 0.0
+        self._sweep: list | None = None        # 72-bin 正規化 sweep（畫雷達用）
+        self._sweep_t = 0.0
         self.create_subscription(String, topic, self._cb_status, 10)
         self.create_subscription(MarkerArray, topic_dyn, self._cb_dyn, 10)
         self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
         self.create_subscription(String, topic_stations, self._cb_stations, 10)
+        self.create_subscription(Float32MultiArray, topic_sweep, self._cb_sweep, 10)
         self._topic = topic
 
     def _cb_status(self, msg: String) -> None:
@@ -107,11 +133,17 @@ class StatusTuiNode(Node):
             self._stations = data
             self._stations_t = time.monotonic()
 
+    def _cb_sweep(self, msg: Float32MultiArray) -> None:
+        with self._lock:
+            self._sweep = list(msg.data)
+            self._sweep_t = time.monotonic()
+
     def snapshot(self) -> tuple:
         with self._lock:
             return (self._status, self._last_t, self._lvdot_n, self._lvdot_t,
                     self._diag_event, self._diag_event_t,
-                    self._stations, self._stations_t)
+                    self._stations, self._stations_t,
+                    self._sweep, self._sweep_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -192,7 +224,7 @@ class Dashboard:
 
     def _render(self, stdscr) -> None:
         (status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t,
-         stations, stations_t) = self.node.snapshot()
+         stations, stations_t, sweep, sweep_t) = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
@@ -213,7 +245,18 @@ class Dashboard:
             stations_fresh = stations_t and (now - stations_t) < 5.0
             if is_path and stations_fresh:
                 station_info = self._current_station(stations, status.get("path_i"))
-            rows = self._build_rows(status, lvdot_n, lvdot_age, station_info)
+            # 到達目標後讓「目標」列改顯示黃字「已到達並已儲存diag」。判定二擇一：
+            #   ① goal_dist ≤ 0.6m（與 diag auto_stop_goal_tol 對齊，即時反映）
+            #   ② 收到 goal_reached event 後 10s 內（diag 確實已存檔的權威來源）
+            # 新 goal 進來、距離又拉開即自動回復正常距離/方位顯示
+            gd = status.get("goal_dist")
+            goal_reached = (
+                (gd is not None and gd <= GOAL_REACHED_DIST_M)
+                or (diag_event is not None
+                    and diag_event.get("event") == "goal_reached"
+                    and (now - diag_event_t) < 10.0))
+            rows = self._build_rows(status, lvdot_n, lvdot_age, station_info,
+                                    goal_reached)
             # 有具名站序 → 畫站名地鐵線；否則退回幾何進度條（起→O→終）
             show_route = station_info is not None
             show_subway = (not show_route and is_path and pn and pn >= 2
@@ -245,6 +288,9 @@ class Dashboard:
             win.addstr(box_h // 2, 3, msg, self._c(2) | curses.A_BOLD)
             win.addstr(box_h - 1, 2, " 按 q 離開 ", self._c(5))
             win.refresh()
+            # 雷達只吃 sweep，與 policy 狀態解耦：狀態逾時仍可看 LiDAR
+            self._maybe_draw_radar(stdscr, h, w, box_w, box_h,
+                                   sweep, sweep_t, None, now)
             return
 
         val_col = 11  # 標籤欄 4 全形字 ≈ 8 格 + 邊距
@@ -267,6 +313,10 @@ class Dashboard:
         foot = f" 更新 {age:.1f}s 前 · 按 q 離開 "
         win.addstr(box_h - 1, 2, foot, self._c(5))
         win.refresh()
+
+        # 右側 LiDAR 雷達（重畫 BEV 極座標散點 + goal 箭頭）
+        self._maybe_draw_radar(stdscr, h, w, box_w, box_h,
+                               sweep, sweep_t, status, now)
 
         # 到達目標 banner（收到 goal_reached event 後顯示 6 秒）
         if diag_event is not None and diag_event.get("event") == "goal_reached":
@@ -311,6 +361,132 @@ class Dashboard:
             foot = f" {remaining:.0f}s 後消失 · 按 q 離開 "
             bwin.addstr(banner_h - 1, 2, foot, self._c(5))
             bwin.refresh()
+        except curses.error:
+            pass
+
+    # ── 右側 LiDAR 雷達（把 BEV 的極座標散點重畫成文字，不吃 bev_image 影像） ──
+    def _maybe_draw_radar(self, stdscr, h: int, w: int, box_w: int, box_h: int,
+                          sweep, sweep_t: float, status, now: float) -> None:
+        node = self.node
+        try:
+            if not node.get_parameter("enable_radar").value:
+                return
+            style = node.get_parameter("radar_style").get_parameter_value().string_value
+        except Exception:
+            style = "braille"
+        rx = box_w + 1                 # 緊接主框右側
+        avail_w = w - rx - 1
+        rh = box_h
+        if avail_w < 26 or h < rh + 1:  # 太窄/太矮放不下 → 跳過（窄螢幕自動退化）
+            return
+        # braille 點字物理上近正方，inner_cols ≈ 2×inner_rows 才會畫成圓
+        desired_w = (rh - 2) * 2 + 2
+        rw = min(avail_w, max(28, desired_w))
+        try:
+            win = stdscr.derwin(rh, rw, 0, rx)
+        except curses.error:
+            return
+        win.erase()
+        win.box()
+        title = f" LiDAR 雷達 前↑ {node._radar_range:.0f}m "
+        win.addstr(0, max(2, (rw - self._disp_w(title)) // 2), title,
+                   self._c(4) | curses.A_BOLD)
+        sweep_age = now - sweep_t if sweep_t else float("inf")
+        if not sweep or sweep_age > 1.5:
+            m = "⚠ 等待 sweep…" if not sweep else f"⚠ sweep 逾時 {sweep_age:.1f}s"
+            win.addstr(rh // 2, max(2, (rw - self._disp_w(m)) // 2), m, self._c(2))
+            win.refresh()
+            return
+        rows, cols = rh - 2, rw - 2
+        if style == "dots":
+            self._radar_dots(win, rows, cols, sweep, status)
+        else:
+            self._radar_braille(win, rows, cols, sweep, status)
+        win.refresh()
+
+    def _sev(self, real: float) -> int:
+        # 與 BEV 同門檻：>=5m 安全(綠)、2~5m 注意(黃/橙)、<2m 危險(紅)。
+        return 1 if real >= 5.0 else (2 if real >= 2.0 else 3)
+
+    def _radar_braille(self, win, rows: int, cols: int, sweep, status) -> None:
+        r_max, r_robot = self.node._r_max, self.node._r_robot
+        rng = self.node._radar_range
+        denom = r_max - r_robot
+        n = len(sweep) or 1
+        wd, hd = cols * 2, rows * 4          # 點字解析度：每 cell 2×4 點
+        cx, cy = wd / 2.0, hd / 2.0
+        scale = (min(wd, hd) / 2.0 - 2) / rng if rng > 0 else 1.0
+        mask: dict = {}
+        sev: dict = {}
+        for i, norm in enumerate(sweep):
+            real = norm * denom + r_robot
+            if real >= r_max - 0.5:          # 貼近量程上限視為無回波 → 不畫（空曠）
+                continue
+            d = real if real < rng else rng  # 超出顯示半徑 → 貼邊
+            ang = math.radians(-180.0 + i * (360.0 / n))
+            dx = int(round(cx + d * math.sin(ang) * scale))   # +右
+            dy = int(round(cy - d * math.cos(ang) * scale))   # +上（前方）
+            if not (0 <= dx < wd and 0 <= dy < hd):
+                continue
+            key = (dy // 4, dx // 2)
+            mask[key] = mask.get(key, 0) | BRAILLE_DOTS[(dx % 2, dy % 4)]
+            s = self._sev(real)
+            if s > sev.get(key, 0):
+                sev[key] = s
+        for (row, col), bits in mask.items():
+            try:
+                win.addstr(1 + row, 1 + col, chr(0x2800 + bits),
+                           self._c(sev[(row, col)]))
+            except curses.error:
+                pass
+        self._radar_overlays(win, rows, cols, status,
+                             lambda sx, sy: ((cy - sy * scale) // 4,
+                                             (cx + sx * scale) // 2))
+
+    def _radar_dots(self, win, rows: int, cols: int, sweep, status) -> None:
+        r_max, r_robot = self.node._r_max, self.node._r_robot
+        rng = self.node._radar_range
+        denom = r_max - r_robot
+        n = len(sweep) or 1
+        hx, hy = (cols - 1) / 2.0, (rows - 1) / 2.0
+        for i, norm in enumerate(sweep):
+            real = norm * denom + r_robot
+            if real >= r_max - 0.5:
+                continue
+            d = real if real < rng else rng
+            ang = math.radians(-180.0 + i * (360.0 / n))
+            col = int(round(hx + (d * math.sin(ang) / rng) * hx))
+            row = int(round(hy - (d * math.cos(ang) / rng) * hy))
+            if not (0 <= col < cols and 0 <= row < rows):
+                continue
+            try:
+                win.addstr(1 + row, 1 + col, "●", self._c(self._sev(real)))
+            except curses.error:
+                pass
+        self._radar_overlays(win, rows, cols, status,
+                             lambda sx, sy: (hy - (sy / rng) * hy,
+                                             hx + (sx / rng) * hx))
+
+    def _radar_overlays(self, win, rows: int, cols: int, status, w2c) -> None:
+        """疊上機器人（中心↑）與 goal（黃◆）。w2c: (sx,sy)世界→(row,col)格映射。"""
+        try:
+            win.addstr(1 + rows // 2, 1 + cols // 2, "↑",
+                       self._c(5) | curses.A_BOLD)
+        except curses.error:
+            pass
+        if not status:
+            return
+        gd, ga = status.get("goal_dist"), status.get("goal_ang_deg")
+        if gd is None or ga is None:
+            return
+        rng = self.node._radar_range
+        d = min(gd, rng)
+        ang = math.radians(ga)               # 0=正前方，與 sweep 同慣例
+        row, col = w2c(d * math.sin(ang), d * math.cos(ang))
+        row = max(0, min(rows - 1, int(round(row))))
+        col = max(0, min(cols - 1, int(round(col))))
+        try:
+            win.addstr(1 + row, 1 + col, "◆", self._c(2) | curses.A_BOLD)
         except curses.error:
             pass
 
@@ -437,7 +613,8 @@ class Dashboard:
         return 1       # 綠
 
     def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf"),
-                    station_info=None) -> list[tuple[str, str, int, bool]]:
+                    station_info=None, goal_reached=False
+                    ) -> list[tuple[str, str, int, bool]]:
         # 把 status JSON 整理成儀表板每一列 (標籤, 數值字串, 顏色pair, 粗體)。
         # 渲染層只負責畫，所有「該紅該黃」的健康度判斷都集中在這裡。
         mode = s.get("mode", "?")
@@ -522,7 +699,10 @@ class Dashboard:
         gd = s.get("goal_dist")
         ga = s.get("goal_ang_deg")
         gsrc = s.get("goal_src") or ""
-        if gd is None:
+        goal_bold = False
+        if goal_reached:
+            goal_txt, goal_pair, goal_bold = "✓ 已到達並已儲存 diag", 2, True
+        elif gd is None:
             goal_txt, goal_pair = "尚無 goal/path", 5
         else:
             tag = f"  ({gsrc.split('/')[0]})" if gsrc else ""
@@ -567,7 +747,7 @@ class Dashboard:
             ("位置", pose_txt, pose_pair, False),
             ("偏移", off_txt, 5, False),
             ("導航", nav_txt, nav_pair, nav_type == "path"),
-            ("目標", goal_txt, goal_pair, False),
+            ("目標", goal_txt, goal_pair, goal_bold),
             ("模型", model_txt, 5, False),
         ]
 

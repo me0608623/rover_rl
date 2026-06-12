@@ -59,7 +59,7 @@ from .localization import MapOdomOffsetTracker, RobotPose, world_to_body
 from .markers import build_marker_array
 from .mode_manager import Mode, ModeManager
 from .model_runtime import PolicyRunner, load_bundle
-from .obs_builder import ObsParams, build_obs_raw, normalize_applied_action
+from .obs_builder import ObsParams, build_obs_raw
 from .subgoal_selector import SubgoalSelector
 
 
@@ -100,6 +100,10 @@ class PolicyNode(Node):
             f"rover_rl_policy 啟動完成\n"
             f"  模型: {self._model_path} (raw_obs={self.bundle.raw_obs_dim}, "
             f"hidden={self.bundle.hidden_dim})\n"
+            f"  action stacking: {'啟用' if self.use_act_stack else '關閉'}"
+            + (f" (size={self.act_stack_size}, a_max={self.act_stack_a_max:.3f}, "
+               f"ω_max={self.act_stack_omega_max:.4f})" if self.use_act_stack else "")
+            + "\n"
             f"  模式: {self.mode_mgr.mode.value} (require_ndt={self.require_ndt})\n"
             f"  速度: speed_rate={self.speed_rate:.2f} "
             f"(實體上限 v={self.act_params.max_linear_velocity*self.speed_rate:.2f}m/s "
@@ -160,11 +164,20 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
         # v3c 角速度 α slew 上限 (rad/s²)：0.0=不做 slew（79/139 舊模型）；v3c=3.0。
-        # ⚠️ 用 v3c (raw_obs=83) 模型時，act_max_angular_velocity 必須一併改成 0.7853981634 (0.25π)。
+        # 對齊訓練端 discrete_differential_drive；用 v3c 時須同時把 act_max_angular_velocity 設 0.25π。
         self.declare_parameter("act_max_angular_accel", 0.0)
         # 全域速度縮放（spot_rl 時間膨脹）：(0,1]，1.0=原速，0.5=半速
         # 動作上限 ×rate，感知速度/目標 ÷rate → policy 留在訓練分布內
         self.declare_parameter("speed_rate", 1.0)
+        # ── action stacking（v3c）：僅當 bundle 的 raw_obs_dim==83 自動啟用 ──
+        # 把近 N 步「正規化後的動作」接在 79D obs 之後（[a_t-1,ω_t-1,a_t-2,ω_t-2]），
+        # 鏡像訓練端 sim 的 action history buffer。載 79/139D 模型時這些參數完全不作用。
+        # ⚠ a_max / omega_max 是「動作正規化分母」，必須與 v3c 訓練端逐字相同，否則 obs 尺度
+        #   錯位、policy 行為失準。預設值取自 PC v3c 規格（A_MAX=0.2, OMEGA_MAX=π/15），
+        #   上線 v3c 前務必跟訓練 repo 對齊（PC 兩份文件對 OMEGA_MAX 給過 π/15 與 0.25π 兩值）。
+        self.declare_parameter("act_stack_size", 2)
+        self.declare_parameter("act_stack_a_max", 0.2)
+        self.declare_parameter("act_stack_omega_max", math.pi / 15.0)
         # goal / localization
         self.declare_parameter("goal_frame", "map")
         self.declare_parameter("base_frame", "base_footprint")
@@ -184,6 +197,15 @@ class PolicyNode(Node):
         # 的車姿，打斷極限環。0.0=關閉（預設，行為完全不變）。
         # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2
         self.declare_parameter("cmd_delay_comp_s", 0.0)
+        # 補償總開關：false=完全關閉（不論 cmd_delay_comp_s 設多少）。
+        # 讓你保留調好的秒數、用這個開關決定開不開，不必每次改回 0。
+        # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_enable true
+        self.declare_parameter("cmd_delay_comp_enable", False)
+        # 預測用的速度來源：
+        #   "measured"  = odom 實測速度（本身在震盪 → 可能把震盪回授進 obs，火上加油）
+        #   "commanded" = 上一拍 policy 命令速度（Smith-predictor 思路，不耦合 odom 震盪）
+        # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_src commanded
+        self.declare_parameter("cmd_delay_comp_src", "measured")
         # 底盤實體上限（僅供診斷：判定 cmd 是否超出底盤能力，見 CLAUDE.md gap #2）
         self.declare_parameter("chassis_v_max", 1.5)
         self.declare_parameter("chassis_omega_max", 1.2)
@@ -234,7 +256,15 @@ class PolicyNode(Node):
             max_angular_accel=float(gp("act_max_angular_accel").value),
         )
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
+        # action stacking 常數（是否啟用由 bundle.raw_obs_dim 決定，於 bundle 載入後設定）
+        self.act_stack_size = max(1, int(gp("act_stack_size").value))
+        self.act_stack_a_max = max(float(gp("act_stack_a_max").value), 1e-6)
+        self.act_stack_omega_max = max(float(gp("act_stack_omega_max").value), 1e-6)
         self.cmd_delay_comp_s = self._clamp_comp(float(gp("cmd_delay_comp_s").value))
+        self.cmd_delay_comp_enable = bool(gp("cmd_delay_comp_enable").value)
+        self.cmd_delay_comp_src = self._clamp_src(
+            gp("cmd_delay_comp_src").get_parameter_value().string_value
+        )
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
         self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
@@ -260,6 +290,8 @@ class PolicyNode(Node):
             )
         self.bundle = load_bundle(self._model_path, device=self._device)
         self.runner = PolicyRunner(self.bundle)
+        # 83D bundle → 啟用 action stacking（mirror 訓練端 action history）
+        self.use_act_stack = (self.bundle.raw_obs_dim == 83)
 
     # ──────────────────────────── 狀態與元件 ────────────────────────────
 
@@ -279,6 +311,12 @@ class PolicyNode(Node):
         self._odom_w = 0.0
         self._odom_t = 0.0
         self._last_accel = 0.0
+        # action stacking buffer（v3c）：存近 N 步「正規化後動作 [a,ω]」，appendleft 最新。
+        # 79/139D 模型不會用到（use_act_stack=False），但仍維護以簡化重置邏輯。
+        self._act_hist: collections.deque = collections.deque(
+            [np.zeros(2, dtype=np.float32) for _ in range(self.act_stack_size)],
+            maxlen=self.act_stack_size,
+        )
         self._start_t = time.monotonic()
         # 上次 policy 推論的「目標 cmd」（給 cmd timer 取用）
         # 推論(5Hz)與發布(20Hz)解耦的關鍵橋樑：inference 只寫這組目標值，
@@ -286,11 +324,6 @@ class PolicyNode(Node):
         self._target_v = 0.0
         self._target_w = 0.0
         self._target_set_t = 0.0
-        # v3c action history（raw_obs=83 才用）：存最近 2 步「已正規化」的 applied (a, ω)，
-        # 新→舊。每元素 = (a_norm, ω_norm)。obs[79:83] 由此攤平；新 goal / 停車時清空（≈episode reset）。
-        # 來源是 policy 自己上 2 步 decode 出的 actual_accel / cmd_w（slew 後），非硬體量測。
-        self._use_act_hist = (getattr(self.bundle, "raw_obs_dim", 79) == 83)
-        self._act_hist: collections.deque = collections.deque(maxlen=2)
         # 上次 sweep（給 marker 用）
         self._last_sweep: np.ndarray | None = None
         # 上次 subgoal（給 marker 用）
@@ -405,6 +438,15 @@ class PolicyNode(Node):
             )
         return clamped
 
+    def _clamp_src(self, s: str) -> str:
+        """cmd_delay_comp_src 只接受 measured / commanded；其他值警告並退回 measured."""
+        if s not in ("measured", "commanded"):
+            self.get_logger().warn(
+                f"cmd_delay_comp_src={s!r} 非法（僅 measured/commanded），退回 measured"
+            )
+            return "measured"
+        return s
+
     def _on_param_update(self, params) -> SetParametersResult:
         """即時更新 speed_rate / cmd_delay_comp_s（其他參數不在此處理）.
 
@@ -425,6 +467,21 @@ class PolicyNode(Node):
                 self.get_logger().info(
                     f"cmd_delay_comp_s: {old_comp:.2f} → {new_comp:.2f}s"
                 )
+            elif p.name == "cmd_delay_comp_enable":
+                new_en = bool(p.value)
+                old_en = self.cmd_delay_comp_enable
+                self.cmd_delay_comp_enable = new_en
+                self.get_logger().info(
+                    f"cmd_delay_comp_enable: {old_en} → {new_en} "
+                    f"(comp_s={self.cmd_delay_comp_s:.2f}, src={self.cmd_delay_comp_src})"
+                )
+            elif p.name == "cmd_delay_comp_src":
+                new_src = self._clamp_src(
+                    p.value if isinstance(p.value, str) else str(p.value)
+                )
+                old_src = self.cmd_delay_comp_src
+                self.cmd_delay_comp_src = new_src
+                self.get_logger().info(f"cmd_delay_comp_src: {old_src} → {new_src}")
         return SetParametersResult(successful=True)
 
     # ──────────────────────────── Callbacks ────────────────────────────
@@ -473,6 +530,7 @@ class PolicyNode(Node):
         self.subgoals.set_single_goal(msg.pose.position.x, msg.pose.position.y, frame)
         self.runner.reset()
         self.cmd_filter.reset()
+        self._reset_act_hist()
         with self._lock:
             self._start_t = time.monotonic()
         self.get_logger().info(
@@ -490,6 +548,7 @@ class PolicyNode(Node):
         self.subgoals.prefer_path = True
         self.runner.reset()
         self.cmd_filter.reset()
+        self._reset_act_hist()
         with self._lock:
             self._start_t = time.monotonic()
         self.get_logger().info(
@@ -538,6 +597,9 @@ class PolicyNode(Node):
             self.bundle = new_bundle
             self.runner = PolicyRunner(new_bundle)
             self.cmd_filter.reset()
+            # 換模型可能換 obs 維度 → 重判 action stacking 是否啟用並清空 history
+            self.use_act_stack = (new_bundle.raw_obs_dim == 83)
+            self._reset_act_hist()
             self._model_path = new_path
             res.success = True
             res.message = (f"已重載: {new_path} (raw_obs={new_bundle.raw_obs_dim}, "
@@ -552,6 +614,7 @@ class PolicyNode(Node):
     def _srv_reset_hidden(self, req: Trigger.Request, res: Trigger.Response):
         self.runner.reset()
         self.cmd_filter.reset()
+        self._reset_act_hist()
         with self._lock:
             self._target_v = 0.0
             self._target_w = 0.0
@@ -616,6 +679,32 @@ class PolicyNode(Node):
         except TransformException:
             return None
 
+    # ──────────────────────────── Action stacking (v3c) ────────────────────────────
+
+    def _reset_act_hist(self) -> None:
+        """新 episode（新 goal/path、切模式、重載模型、reset_hidden）時清空動作歷史。
+        鏡像訓練端 on_episode_reset：避免上一段殘留動作污染新 episode 的前幾步 obs。"""
+        with self._lock:
+            self._act_hist = collections.deque(
+                [np.zeros(2, dtype=np.float32) for _ in range(self.act_stack_size)],
+                maxlen=self.act_stack_size,
+            )
+
+    def _act_hist_flat(self) -> np.ndarray:
+        """把 deque 攤平成 [a_t-1, ω_t-1, a_t-2, ω_t-2, ...]（最新在前）。"""
+        with self._lock:
+            return np.concatenate(list(self._act_hist)).astype(np.float32)
+
+    def _push_act_hist(self, accel: float, cmd_w: float) -> None:
+        """把這一拍實際輸出的動作正規化後 appendleft。
+        正規化分母為訓練端 action max（act_stack_a_max / act_stack_omega_max），非 obs normalizer。
+        clip 範圍 [-2, 2] 對齊訓練端 discrete_applied_action_history 的 clamp(-2, 2)
+        （⚠ 不是 [-1,1]：ω/0.209 在 ω=0.4 時即達 1.91，用 [-1,1] 會把合法值剪掉而失真）。"""
+        a_norm = float(np.clip(accel / self.act_stack_a_max, -2.0, 2.0))
+        w_norm = float(np.clip(cmd_w / self.act_stack_omega_max, -2.0, 2.0))
+        with self._lock:
+            self._act_hist.appendleft(np.array([a_norm, w_norm], dtype=np.float32))
+
     # ──────────────────────────── Timer: 推論 (5 Hz) ────────────────────────────
 
     def _tick_inference(self) -> None:
@@ -636,6 +725,9 @@ class PolicyNode(Node):
             v = self._odom_v
             w = self._odom_w
             last_accel = self._last_accel
+            # 上一拍 policy 命令速度（cmd_delay_comp_src=commanded 時用來預測，避免耦合 odom 震盪）
+            last_cmd_v = self._target_v
+            last_cmd_w = self._target_w
             elapsed = now - self._start_t
 
         # 選 sweep 來源：preprocessor topic 首選；沒收到/過期 → fallback inline
@@ -683,9 +775,14 @@ class PolicyNode(Node):
         # 對舊朝向誤差過度修正 → 0.42Hz 舞龍舞獅極限環。推論前用測得速度把車姿往前推
         # cmd_delay_comp_s 秒，讓下方 goal_body 對齊「動作生效時」的車姿，打斷極限環。
         # comp=0 時為 no-op（行為不變）。注意只動 goal_body 視角，velocity obs 仍用實測值。
-        if self.cmd_delay_comp_s > 0.0:
+        if self.cmd_delay_comp_enable and self.cmd_delay_comp_s > 0.0:
+            # 預測用速度：commanded=上一拍命令（不耦合 odom 震盪）；measured=odom 實測
+            if self.cmd_delay_comp_src == "commanded":
+                pred_v, pred_w = last_cmd_v, last_cmd_w
+            else:
+                pred_v, pred_w = v, w
             robot_x, robot_y, robot_yaw_use = self._predict_pose_forward(
-                robot_x, robot_y, robot_yaw_use, v, w, self.cmd_delay_comp_s,
+                robot_x, robot_y, robot_yaw_use, pred_v, pred_w, self.cmd_delay_comp_s,
             )
 
         # 把 goal 轉到 body frame（policy obs 用的是相對機器人的座標）
@@ -746,34 +843,21 @@ class PolicyNode(Node):
             g_inflate_x *= s
             g_inflate_y *= s
 
-        # v3c action history：讀「上 2 步」已正規化的 applied (a,ω)，攤平成 4D（新→舊，不足補 0）。
-        # 舊模型 (_use_act_hist=False) → None，build_obs_raw 走 79/139 路徑，行為不變。
-        act_hist_norm = None
-        if self._use_act_hist:
-            with self._lock:
-                hist = list(self._act_hist)            # 新→舊
-            flat: list[float] = []
-            for a_n, w_n in hist:
-                flat.extend((a_n, w_n))
-            while len(flat) < 4:
-                flat.append(0.0)
-            act_hist_norm = np.asarray(flat[:4], dtype=np.float32)
-
         # RL 推論（餵入「感知世界」的放大量）
+        # action stacking（v3c）：83D bundle 才帶 action history，否則 builder 忽略此參數
+        act_hist = self._act_hist_flat() if self.use_act_stack else None
         obs = build_obs_raw(
             self.bundle.raw_obs_dim,
             last_accel=last_accel * inv, linear_vel=v * inv, angular_vel=w * inv,
             goal_body_x=g_inflate_x, goal_body_y=g_inflate_y,
             lidar_sweep_72=sweep, elapsed_s=elapsed,
-            action_hist_norm=act_hist_norm,
             params=self.obs_params,
+            action_history=act_hist,
         )
         logits = self.runner.step(obs)
         # 動作端：上限 ×rate 縮回實體速度；current_vel 用真實 v 做積分
         # （obs 端放大 1/rate、action 端縮小 ×rate 的不對稱，正是時間膨脹的本質：
         #  policy 在「放大的感知世界」決策，輸出再縮回真實世界的慢速指令）
-        # ⚠️ v3c 建議 speed_rate=1.0（訓練無時間膨脹）；rate<1 時 action history 與 slew 的
-        #    縮放僅近似對齊。max_angular_accel 一併 ×rate 才與線性/角速度上限同尺度。
         act_eff = (self.act_params if rate >= 0.999 else ActionParams(
             num_bins=self.act_params.num_bins,
             max_linear_velocity=self.act_params.max_linear_velocity * rate,
@@ -782,7 +866,7 @@ class PolicyNode(Node):
             dt=self.act_params.dt,
             max_angular_accel=self.act_params.max_angular_accel * rate,
         ))
-        # v3c slew 需「上一步 applied ω」（= 上次 _target_w）；舊模型 max_angular_accel=0 時不使用
+        # v3c α slew 需「上一步 applied ω」（= 上次 _target_w）；舊模型 max_angular_accel=0 時不使用
         cmd_v, cmd_w, accel = decode_logits_to_cmd(
             logits, current_linear_vel=v,
             params=act_eff, deterministic=self.deterministic,
@@ -794,12 +878,12 @@ class PolicyNode(Node):
             self._target_v = cmd_v
             self._target_w = cmd_w
             self._target_set_t = now
-            # 推完把這步 applied (a,ω) 正規化後推進歷史（新→舊）；下一 tick 它變成 t-1。
-            # 與訓練端 discrete_applied_action_history「step 後 push」順序一致。
-            if self._use_act_hist:
-                self._act_hist.appendleft(
-                    normalize_applied_action(accel, cmd_w, self.obs_params)
-                )
+
+        # action stacking（v3c）：把這一拍動作存進 history 供下一拍 obs。
+        # 用 ×inv 把 act_eff 的 ×rate 縮放還原回 policy-frame（rate=1.0 時為 no-op），
+        # 與 obs 端 ego 速度同樣放大 inv 一致；sim 無 speed_rate 故存 policy-frame 才對齊。
+        if self.use_act_stack:
+            self._push_act_hist(accel * inv, cmd_w * inv)
 
         if self.pub_obs is not None:
             m = Float32MultiArray()
@@ -810,9 +894,6 @@ class PolicyNode(Node):
         with self._lock:
             self._target_v = 0.0
             self._target_w = 0.0
-            # 停車 = episode 邊界，清空 action history（下次起步從 [0,0,0,0] 開始，對齊訓練 reset）
-            if getattr(self, "_use_act_hist", False):
-                self._act_hist.clear()
         if warn:
             self.get_logger().warn(reason, throttle_duration_sec=2.0)
 
@@ -968,6 +1049,8 @@ class PolicyNode(Node):
             "cmd_w": round(tgt_w, 3),
             "speed_rate": round(self.speed_rate, 2),
             "cmd_delay_comp_s": round(self.cmd_delay_comp_s, 2),
+            "cmd_delay_comp_enable": self.cmd_delay_comp_enable,
+            "cmd_delay_comp_src": self.cmd_delay_comp_src,
             # 三層速度：RL 想要 → 送出底盤 → 底盤實測
             "rl_v": round(rl_v, 3), "rl_w": round(rl_w, 3),
             "sent_v": round(sent_v, 3), "sent_w": round(sent_w, 3),
