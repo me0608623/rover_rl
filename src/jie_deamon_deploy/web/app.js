@@ -397,7 +397,18 @@ function initSpeedModeSwitch() {
 }
 
 // ======================== 虛擬搖桿邏輯 ========================
-// 差速機器人：搖桿 Y 軸 → vx（前後速度），X 軸不使用（vy 恆為 0）
+// 差速機器人 360° 全向搖桿：
+//   Y 軸 → vx（前進後退）
+//   X 軸 → wz（轉向，往左前=前進+左轉，像實體手把搖桿）
+// 最終 wz = 滑桿 currentWz + 搖桿 joystickWz（疊加），讓滑桿與搖桿可同時微調
+let joystickWz = 0;  // 搖桿 X 軸貢獻的角速度
+
+// 合成最終角速度：滑桿 + 搖桿，限制在動作上限內
+function combinedWz() {
+    const wz = currentWz + joystickWz;
+    return Math.max(-CONFIG.MAX_ANGULAR_SPEED, Math.min(CONFIG.MAX_ANGULAR_SPEED, wz));
+}
+
 function initJoystick() {
     const base = document.getElementById('joystickBase');
     const stick = document.getElementById('joystickStick');
@@ -454,8 +465,9 @@ function initJoystick() {
 
         activeTouchId = null;
         stick.style.transform = `translate(-50%, -50%)`;
-        // 只清零平移速度，保持當前角速度
-        sendVelocity(0, 0, currentWz);
+        // 搖桿回中：vx 與搖桿轉向都歸零，保留滑桿的 currentWz
+        joystickWz = 0;
+        sendVelocity(0, 0, combinedWz());
     }
 
     // 計算搖桿位移並轉換為速度指令
@@ -473,11 +485,14 @@ function initJoystick() {
 
         stick.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
 
-        // 差速機器人: Y 軸映射為前後速度 vx（向上為正），X 軸不支援橫移(vy=0)
+        // 360° 全向搖桿（差速機器人）:
+        //   Y 軸（上下）→ vx 前進後退（向上為正）
+        //   X 軸（左右）→ joystickWz 轉向（向左 dx<0 → wz>0 左轉）
         const vx = -(dy / maxRadius) * CONFIG.MAX_LINEAR_SPEED;
         const vy = 0;
+        joystickWz = -(dx / maxRadius) * CONFIG.MAX_ANGULAR_SPEED;
 
-        sendVelocity(vx, vy, currentWz);
+        sendVelocity(vx, vy, combinedWz());
     }
 
     // 桌面端事件綁定
@@ -535,7 +550,7 @@ function initSlider() {
 
         // 映射角速度: 向左(offset<0) → wz>0(逆時針), 向右(offset>0) → wz<0(順時針)
         currentWz = -(offset / (rect.width / 2)) * CONFIG.MAX_ANGULAR_SPEED;
-        sendVelocity(lastVx, lastVy, currentWz);
+        sendVelocity(lastVx, lastVy, combinedWz());
     }
 
     // 放開旋鈕：回中歸零
@@ -552,7 +567,7 @@ function initSlider() {
         activeTouchId = null;
         knob.style.transform = `translateX(-50%)`;
         currentWz = 0;
-        sendVelocity(lastVx, lastVy, 0);
+        sendVelocity(lastVx, lastVy, combinedWz());
     }
 
     // 桌面端事件綁定

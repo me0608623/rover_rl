@@ -286,6 +286,7 @@ body {
     border: 2px solid rgba(34, 211, 238, 0.3);
     position: relative;
     box-shadow: 0 0 20px rgba(0, 0, 0, 0.2), inset 0 0 30px rgba(0, 0, 0, 0.3);
+    touch-action: none;   /* 禁止瀏覽器手勢，搖桿拖曳由 JS 處理 */
 }
 
 /* 搖桿十字參考線（純視覺裝飾，不接收事件） */
