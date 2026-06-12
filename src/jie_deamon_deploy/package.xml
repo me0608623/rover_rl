@@ -33,6 +33,8 @@
   <depend>sensor_msgs</depend>      <!-- 感測器訊息型別（LaserScan 等） -->
   <depend>geometry_msgs</depend>    <!-- 幾何訊息型別（Twist、Pose 等） -->
   <depend>std_msgs</depend>         <!-- 標準訊息型別（String、Bool 等） -->
+  <depend>campusrover_msgs</depend> <!-- 校園車訊息（RoutingPath、ModuleInfo 等） -->
+  <depend>nav_msgs</depend>         <!-- 導航訊息（Path 等） -->
 
   <!-- 測試依賴: ament lint 自動化程式碼風格檢查 -->
   <test_depend>ament_lint_auto</test_depend>    <!-- 自動偵測並執行 linter -->

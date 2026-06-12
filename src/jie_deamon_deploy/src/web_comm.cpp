@@ -152,6 +152,15 @@ void WebCommManager::broadcastData() {
 }
 
 /*
+ * broadcastRouteNodes — 廣播路由節點列表給所有 WebSocket 客戶端
+ * nodes_json 已是完整 JSON 字串，直接廣播。
+ */
+void WebCommManager::broadcastRouteNodes(const std::string& nodes_json) {
+    if (!running_) return;
+    broadcastToWebSockets(nodes_json);
+}
+
+/*
  * startWebSocketServer — 建立並啟動 WebSocket 伺服器
  * 使用原生 POSIX socket，在 WS_PORT 上監聽連線。
  * 新連線由獨立執行緒處理（wsAcceptLoop）。
@@ -285,6 +294,18 @@ void WebCommManager::handleWebSocketMessage(const std::string& msg) {
                 if (mux_mode_callback_) mux_mode_callback_(mode);
             }
         }
+    } else if (JsonParser::hasType(msg, "route_nav")) {  // 路徑導航
+        std::string origin = JsonParser::extractString(msg, "origin");
+        std::string dest = JsonParser::extractString(msg, "destination");
+        if (route_nav_callback_ && !origin.empty() && !dest.empty()) {
+            route_nav_callback_(origin, dest);
+        }
+    } else if (JsonParser::hasType(msg, "goal_nav")) {  // 單點導航
+        double x = JsonParser::extractNumber(msg, "x");
+        double y = JsonParser::extractNumber(msg, "y");
+        if (goal_nav_callback_) goal_nav_callback_(x, y);
+    } else if (JsonParser::hasType(msg, "get_route_nodes")) {  // 請求節點列表
+        if (get_nodes_callback_) get_nodes_callback_();
     }
 }
 

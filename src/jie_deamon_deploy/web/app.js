@@ -26,7 +26,19 @@ const CONFIG = {
     TARGET_RADIUS: 0.3,           // 目標半徑（公尺）
     MAX_LINEAR_SPEED: 1.0,        // 最大線速度（m/s）
     MAX_ANGULAR_SPEED: 2.0,       // 最大角速度（rad/s）
-    RECONNECT_DELAY: 2000         // 斷線重連延遲（毫秒）
+    RECONNECT_DELAY: 2000,        // 斷線重連延遲（毫秒）
+
+    // 地圖座標校正：3f_routing.png 像素 ↔ 世界座標
+    // worldLeft/Right/Bottom/Top = 圖片四邊對應的世界座標
+    MAP: {
+        worldLeft: -30.0,
+        worldRight: 30.0,
+        worldBottom: -45.0,
+        worldTop: -5.0,
+        imgWidth: 1883,
+        imgHeight: 735,
+        nodeRadius: 18,        // 節點 marker 半徑（像素）
+    }
 };
 
 // ======================== 全域狀態 ========================
@@ -49,11 +61,189 @@ let lidarData = {
     rectangleWidth: 0.35              // 目標通道寬度（公尺）
 };
 
+// ======================== 導航狀態 ========================
+let navState = {
+    routeNodes: [],          // 從後端收到的拓撲節點列表 [{name, x, y}, ...]
+    navMode: 'route',        // 'route' = 路徑導航, 'goal' = 單點導航
+    selectedOrigin: null,    // 已選起點 (node name)
+    selectedDest: null,      // 已選終點 (node name)
+    selectionStep: 0,        // 0=等起點, 1=等終點
+    goalMarker: null,        // 單點導航目標 {x, y} (地圖原始像素)
+};
+
+// ======================== Toast 通知 ========================
+let toastTimer = null;
+function showToast(msg) {
+    let el = document.getElementById('navToast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'navToast';
+        el.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);' +
+            'background:rgba(0,0,0,0.85);color:#e2e8f0;padding:8px 18px;border-radius:20px;' +
+            'font-size:0.85rem;z-index:100;pointer-events:none;transition:opacity 0.3s;white-space:nowrap;';
+        document.body.appendChild(el);
+    }
+    el.textContent = msg;
+    el.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { el.style.opacity = '0'; }, 2500);
+}
+
+// ======================== 地圖檢視器（Pan / Zoom） ========================
+const mapView = {
+    tx: 0, ty: 0, scale: 1,         // transform 狀態
+    dragging: false,                 // 是否正在拖曳
+    lastX: 0, lastY: 0,             // 上次指標位置
+    pinchDist: 0,                    // 雙指距離（pinch zoom）
+    MIN_SCALE: 0.5, MAX_SCALE: 5.0, // 縮放範圍
+    el: null, transformEl: null,     // DOM 元素快取
+
+    init() {
+        this.el = document.getElementById('mapViewer');
+        this.transformEl = document.getElementById('mapTransform');
+        if (!this.el || !this.transformEl) return;
+
+        // 初始置中 + fit
+        this.resetView();
+
+        // 滑鼠事件
+        this.el.addEventListener('mousedown', e => this._onPointerDown(e.clientX, e.clientY, e));
+        this.el.addEventListener('mousemove', e => this._onPointerMove(e.clientX, e.clientY));
+        this.el.addEventListener('mouseup', () => this._onPointerUp());
+        this.el.addEventListener('mouseleave', () => this._onPointerUp());
+        this.el.addEventListener('wheel', e => { e.preventDefault(); this._onWheel(e); }, { passive: false });
+
+        // 觸控事件
+        this.el.addEventListener('touchstart', e => this._onTouchStart(e), { passive: false });
+        this.el.addEventListener('touchmove', e => this._onTouchMove(e), { passive: false });
+        this.el.addEventListener('touchend', e => this._onTouchEnd(e));
+        this.el.addEventListener('touchcancel', e => this._onTouchEnd(e));
+
+        // 縮放按鈕
+        document.getElementById('zoomIn').addEventListener('click', () => this.zoomBy(1.3));
+        document.getElementById('zoomOut').addEventListener('click', () => this.zoomBy(1 / 1.3));
+        document.getElementById('zoomReset').addEventListener('click', () => this.resetView());
+    },
+
+    resetView() {
+        if (!this.el || !this.transformEl) return;
+        const vw = this.el.clientWidth;
+        const vh = this.el.clientHeight;
+        const iw = CONFIG.MAP.imgWidth;
+        const ih = CONFIG.MAP.imgHeight;
+        // fit image into viewer with small padding
+        const scaleX = (vw - 10) / iw;
+        const scaleY = (vh - 10) / ih;
+        this.scale = Math.min(scaleX, scaleY, 1.0);
+        this.tx = (vw - iw * this.scale) / 2;
+        this.ty = (vh - ih * this.scale) / 2;
+        this._apply();
+    },
+
+    zoomBy(factor) {
+        const cx = this.el.clientWidth / 2;
+        const cy = this.el.clientHeight / 2;
+        const ns = Math.max(this.MIN_SCALE, Math.min(this.MAX_SCALE, this.scale * factor));
+        // 以畫面中心為縮放基準
+        this.tx = cx - (cx - this.tx) * (ns / this.scale);
+        this.ty = cy - (cy - this.ty) * (ns / this.scale);
+        this.scale = ns;
+        this._apply();
+    },
+
+    /** 把 viewer 內的 clientX/Y 轉成地圖原始像素座標（考慮 transform） */
+    clientToMapPixel(cx, cy) {
+        const rect = this.el.getBoundingClientRect();
+        const vx = cx - rect.left;   // viewer 內座標
+        const vy = cy - rect.top;
+        const mx = (vx - this.tx) / this.scale;
+        const my = (vy - this.ty) / this.scale;
+        return { x: mx, y: my };
+    },
+
+    _apply() {
+        this.transformEl.style.transform = `translate(${this.tx}px,${this.ty}px) scale(${this.scale})`;
+        this.transformEl.style.transformOrigin = '0 0';
+    },
+
+    _onPointerDown(cx, cy, e) {
+        // 不攔截節點 marker 的點擊
+        if (e && e.target.closest('.map-node')) return;
+        this.dragging = true;
+        this.lastX = cx;
+        this.lastY = cy;
+        this.el.style.cursor = 'grabbing';
+    },
+    _onPointerMove(cx, cy) {
+        if (!this.dragging) return;
+        this.tx += cx - this.lastX;
+        this.ty += cy - this.lastY;
+        this.lastX = cx;
+        this.lastY = cy;
+        this._apply();
+    },
+    _onPointerUp() {
+        this.dragging = false;
+        if (this.el) this.el.style.cursor = 'grab';
+    },
+    _onWheel(e) {
+        const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+        const rect = this.el.getBoundingClientRect();
+        const cx = e.clientX - rect.left;
+        const cy = e.clientY - rect.top;
+        const ns = Math.max(this.MIN_SCALE, Math.min(this.MAX_SCALE, this.scale * factor));
+        this.tx = cx - (cx - this.tx) * (ns / this.scale);
+        this.ty = cy - (cy - this.ty) * (ns / this.scale);
+        this.scale = ns;
+        this._apply();
+    },
+    _onTouchStart(e) {
+        if (e.touches.length === 1) {
+            // 單指：記錄起點（不立即 drag，等移動距離 > 門檻才 drag）
+            this._onPointerDown(e.touches[0].clientX, e.touches[0].clientY, e);
+        } else if (e.touches.length === 2) {
+            // 雙指 pinch
+            this.pinchDist = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY);
+        }
+    },
+    _onTouchMove(e) {
+        e.preventDefault();
+        if (e.touches.length === 1 && this.dragging) {
+            this._onPointerMove(e.touches[0].clientX, e.touches[0].clientY);
+        } else if (e.touches.length === 2) {
+            const d = Math.hypot(
+                e.touches[0].clientX - e.touches[1].clientX,
+                e.touches[0].clientY - e.touches[1].clientY);
+            if (this.pinchDist > 0) {
+                const factor = d / this.pinchDist;
+                const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                const rect = this.el.getBoundingClientRect();
+                const vx = cx - rect.left;
+                const vy = cy - rect.top;
+                const ns = Math.max(this.MIN_SCALE, Math.min(this.MAX_SCALE, this.scale * factor));
+                this.tx = vx - (vx - this.tx) * (ns / this.scale);
+                this.ty = vy - (vy - this.ty) * (ns / this.scale);
+                this.scale = ns;
+                this._apply();
+            }
+            this.pinchDist = d;
+        }
+    },
+    _onTouchEnd(e) {
+        if (e.touches.length < 2) this.pinchDist = 0;
+        if (e.touches.length === 0) this._onPointerUp();
+    },
+};
+
 // ======================== 初始化入口 ========================
 document.addEventListener('DOMContentLoaded', () => {
-    initCanvas();                // 初始化 Canvas 及事件監聽
+    initCanvas();                // 初始化 Canvas 及事件監聯
     initWebSocket();             // 建立 WebSocket 連線
     initControls();              // 綁定控制按鈕事件
+    initNavPanel();              // 初始化導航面板
     requestAnimationFrame(render); // 啟動渲染迴圈
 });
 
@@ -154,16 +344,22 @@ function initTabSwitching() {
             // mode 0: 直接控制, mode 1: 雷達跟隨, mode 2: 導航
             let mode = 1; // 預設跟隨
             if (tab.dataset.tab === 'direct') mode = 0;
-            else if (tab.dataset.tab === 'nav') mode = 2;
+            else if (tab.dataset.tab === 'nav') {
+                mode = 2;
+                // 切到導航面板時重新請求節點 + fit 地圖
+                sendCommand({ type: 'get_route_nodes' });
+                setTimeout(() => mapView.resetView(), 100);
+            }
 
             sendCommand({
                 type: 'switch_mode',
                 mode: mode
             });
 
-            // 跟隨 tab：自動啟用追蹤 + 切底盤到 Web 模式
+            // 跟隨 tab：自動啟用追蹤 + 運動 + 切底盤到 Web 模式
             if (tab.dataset.tab === 'follow') {
                 sendCommand({ type: 'set_active', active: true });
+                sendCommand({ type: 'set_moving', enabled: true });
                 sendCommand({ type: 'set_mux_mode', mode: 3 });
             } else {
                 sendCommand({ type: 'set_active', active: false });
@@ -532,6 +728,9 @@ function initWebSocket() {
                     mode: mode
                 });
                 console.log('發送初始控制模式:', mode);
+
+                // 請求路由節點列表
+                sendCommand({ type: 'get_route_nodes' });
             }
         };
 
@@ -608,6 +807,11 @@ function handleData(data) {
         lidarData.rectangleWidth = data.rectangle_width || 0.35; // 目標通道寬度
 
         updateUI();
+    } else if (data.type === 'route_nodes') {
+        // 收到路由節點列表 → 更新導航狀態 + 重新繪製節點
+        navState.routeNodes = data.nodes || [];
+        renderMapNodes();
+        console.log('收到路由節點:', navState.routeNodes.length);
     }
 }
 
@@ -1131,4 +1335,269 @@ function drawStatus() {
     ctx.fillText(status, 10, 22);
 
     ctx.shadowBlur = 0;
+}
+
+// ======================== 導航面板邏輯 ========================
+
+/**
+ * 座標轉換：世界座標 → 地圖圖片像素
+ */
+function worldToMapPixel(wx, wy) {
+    const m = CONFIG.MAP;
+    const px = ((wx - m.worldLeft) / (m.worldRight - m.worldLeft)) * m.imgWidth;
+    const py = ((m.worldTop - wy) / (m.worldTop - m.worldBottom)) * m.imgHeight;
+    return { x: px, y: py };
+}
+
+/**
+ * 座標轉換：地圖圖片像素 → 世界座標
+ */
+function mapPixelToWorld(px, py) {
+    const m = CONFIG.MAP;
+    const wx = m.worldLeft + (px / m.imgWidth) * (m.worldRight - m.worldLeft);
+    const wy = m.worldTop - (py / m.imgHeight) * (m.worldTop - m.worldBottom);
+    return { x: wx, y: wy };
+}
+
+/**
+ * 初始化導航面板：子模式切換、地圖 viewer、按鈕
+ */
+function initNavPanel() {
+    // 初始化地圖 pan/zoom viewer
+    mapView.init();
+
+    // 子模式切換
+    document.querySelectorAll('.submode-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.submode-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            navState.navMode = btn.dataset.navmode;
+            navState.selectedOrigin = null;
+            navState.selectedDest = null;
+            navState.selectionStep = 0;
+            updateNavUI();
+        });
+    });
+
+    // 地圖單擊 tap → 選擇路由節點（用延遲區分單擊/雙擊）
+    let pointerDownPos = null;
+    let singleTapTimer = null;
+    const viewer = document.getElementById('mapViewer');
+    viewer.addEventListener('pointerdown', e => {
+        if (e.target.closest('.map-node')) return;
+        if (e.target.closest('.zoom-btn')) return;
+        pointerDownPos = { x: e.clientX, y: e.clientY };
+    });
+    viewer.addEventListener('pointerup', e => {
+        if (!pointerDownPos) return;
+        const dx = e.clientX - pointerDownPos.x;
+        const dy = e.clientY - pointerDownPos.y;
+        pointerDownPos = null;
+        // 移動 > 8px 視為 drag，不觸發 tap
+        if (Math.hypot(dx, dy) > 8) return;
+        // 延遲 300ms 再觸發單擊（雙擊會取消它）
+        const cx = e.clientX, cy = e.clientY;
+        clearTimeout(singleTapTimer);
+        singleTapTimer = setTimeout(() => {
+            handleMapTap(cx, cy);
+        }, 300);
+    });
+
+    // 地圖雙擊/雙 tap → 單點導航（兩種模式都能用）
+    let lastTapTime = 0;
+    let lastTapPos = { x: 0, y: 0 };
+
+    // 統一用 pointerup 偵測快速連點（滑鼠 + 觸控都走 pointer）
+    viewer.addEventListener('pointerup', e => {
+        if (e.target.closest('.map-node')) return;
+        if (e.target.closest('.zoom-btn')) return;
+        const now = Date.now();
+        const dx = Math.abs(e.clientX - lastTapPos.x);
+        const dy = Math.abs(e.clientY - lastTapPos.y);
+        // 400ms 內同位置連擊 = 雙擊
+        if (now - lastTapTime < 400 && dx < 30 && dy < 30) {
+            clearTimeout(singleTapTimer);  // 取消待發的單擊
+            handleMapDblTap(e.clientX, e.clientY);
+            lastTapTime = 0;  // 重置避免三連擊
+        } else {
+            lastTapTime = now;
+        }
+        lastTapPos = { x: e.clientX, y: e.clientY };
+    });
+
+    // 節點 marker 點擊（事件代理）
+    document.getElementById('mapOverlay').addEventListener('click', e => {
+        const node = e.target.closest('.map-node');
+        if (!node) return;
+        selectNode(node.dataset.name);
+    });
+
+    // 開始導航按鈕
+    document.getElementById('startRouteNav').addEventListener('click', () => {
+        if (navState.selectedOrigin && navState.selectedDest) {
+            sendCommand({
+                type: 'route_nav',
+                origin: navState.selectedOrigin,
+                destination: navState.selectedDest
+            });
+            console.log(`路徑導航: ${navState.selectedOrigin} → ${navState.selectedDest}`);
+            sendCommand({ type: 'set_mux_mode', mode: 3 });
+        }
+    });
+
+    // 取消按鈕
+    document.getElementById('cancelRouteNav').addEventListener('click', () => {
+        navState.selectedOrigin = null;
+        navState.selectedDest = null;
+        navState.selectionStep = 0;
+        updateNavUI();
+    });
+}
+
+/**
+ * 單次 tap → 路徑導航選節點
+ */
+function handleMapTap(cx, cy) {
+    if (navState.navMode !== 'route') return;
+    if (navState.routeNodes.length === 0) {
+        showToast('節點載入中，請稍候…');
+        return;
+    }
+
+    const mp = mapView.clientToMapPixel(cx, cy);
+
+    // 找最近的節點（地圖原始像素距離）
+    let minDist = Infinity, nearest = null;
+    for (const node of navState.routeNodes) {
+        const np = worldToMapPixel(node.x, node.y);
+        const d = Math.hypot(np.x - mp.x, np.y - mp.y);
+        if (d < minDist) { minDist = d; nearest = node; }
+    }
+    // 門檻：地圖原始像素 30px / 當前縮放
+    const threshold = 30 / mapView.scale * 2;
+    if (!nearest || minDist > Math.max(30, threshold)) {
+        showToast('請點選藍色節點');
+        return;
+    }
+    selectNode(nearest.name);
+}
+
+/**
+ * 節點 marker 點擊或 tap 選到 → 更新選擇狀態
+ */
+function selectNode(name) {
+    if (navState.navMode !== 'route') return;
+    if (navState.selectionStep === 0) {
+        navState.selectedOrigin = name;
+        navState.selectionStep = 1;
+        showToast(`🟢 起點: ${name}`);
+    } else {
+        navState.selectedDest = name;
+        navState.selectionStep = 0;
+        showToast(`🔴 終點: ${name}`);
+    }
+    updateNavUI();
+    renderMapNodes();
+}
+
+/**
+ * 雙擊 / 雙 tap → 單點導航（任何模式都能用）
+ */
+function handleMapDblTap(cx, cy) {
+    const mp = mapView.clientToMapPixel(cx, cy);
+    // 超出圖片範圍就忽略
+    if (mp.x < 0 || mp.x > CONFIG.MAP.imgWidth || mp.y < 0 || mp.y > CONFIG.MAP.imgHeight) return;
+
+    const world = mapPixelToWorld(mp.x, mp.y);
+    navState.goalMarker = { x: mp.x, y: mp.y };
+    renderGoalMarker();
+    showToast(`🎯 目標: (${world.x.toFixed(1)}, ${world.y.toFixed(1)})`);
+    sendCommand({ type: 'goal_nav', x: world.x, y: world.y });
+    sendCommand({ type: 'set_mux_mode', mode: 3 });
+}
+
+/**
+ * 在地圖上顯示單點導航目標 marker
+ */
+function renderGoalMarker() {
+    // 移除舊的
+    const old = document.getElementById('goalMarker');
+    if (old) old.remove();
+    if (!navState.goalMarker) return;
+
+    const overlay = document.getElementById('mapOverlay');
+    const m = document.createElement('div');
+    m.id = 'goalMarker';
+    m.style.cssText = `position:absolute;left:${navState.goalMarker.x}px;top:${navState.goalMarker.y}px;` +
+        `transform:translate(-50%,-50%);width:30px;height:30px;border-radius:50%;` +
+        `background:rgba(239,68,68,0.6);border:3px solid #ef4444;color:#fff;` +
+        `display:flex;align-items:center;justify-content:center;font-size:14px;z-index:5;` +
+        `box-shadow:0 0 12px rgba(239,68,68,0.6);pointer-events:none;`;
+    m.textContent = '🎯';
+    overlay.appendChild(m);
+}
+
+/**
+ * 渲染節點 markers 覆蓋在圖片上（使用原始像素座標）
+ */
+function renderMapNodes() {
+    const overlay = document.getElementById('mapOverlay');
+    overlay.innerHTML = '';
+    if (navState.routeNodes.length === 0) return;
+
+    for (const node of navState.routeNodes) {
+        const pixel = worldToMapPixel(node.x, node.y);
+        const marker = document.createElement('div');
+        marker.className = 'map-node';
+        marker.dataset.name = node.name;
+        // 使用絕對像素（overlay 固定 1883×735）
+        marker.style.left = `${pixel.x}px`;
+        marker.style.top = `${pixel.y}px`;
+        marker.textContent = node.name;
+
+        if (node.name === navState.selectedOrigin) marker.classList.add('origin');
+        if (node.name === navState.selectedDest) marker.classList.add('dest');
+
+        overlay.appendChild(marker);
+    }
+}
+
+/**
+ * 更新導航面板 UI 狀態
+ */
+function updateNavUI() {
+    const originEl = document.getElementById('selectedOrigin');
+    const destEl = document.getElementById('selectedDest');
+    const startBtn = document.getElementById('startRouteNav');
+    const hint = document.getElementById('mapHint');
+    const routeCtrl = document.getElementById('routeControls');
+    const goalCtrl = document.getElementById('goalControls');
+
+    originEl.textContent = navState.selectedOrigin || '—';
+    destEl.textContent = navState.selectedDest || '—';
+    startBtn.disabled = !(navState.selectedOrigin && navState.selectedDest);
+
+    if (navState.navMode === 'route') {
+        routeCtrl.style.display = 'flex';
+        goalCtrl.style.display = 'none';
+        hint.style.display = 'block';
+        if (navState.routeNodes.length === 0) {
+            hint.textContent = '⏳ 節點載入中…';
+        } else {
+            hint.textContent = navState.selectionStep === 0
+                ? '📍 點選節點選起點'
+                : '📍 再點選節點選終點';
+        }
+    } else {
+        routeCtrl.style.display = 'none';
+        goalCtrl.style.display = 'flex';
+        hint.style.display = 'block';
+        hint.textContent = '📍 雙擊地圖任意位置設定目標';
+    }
+
+    // 更新節點 marker 的選中狀態
+    document.querySelectorAll('.map-node').forEach(m => {
+        m.classList.toggle('origin', m.dataset.name === navState.selectedOrigin);
+        m.classList.toggle('dest', m.dataset.name === navState.selectedDest);
+    });
 }

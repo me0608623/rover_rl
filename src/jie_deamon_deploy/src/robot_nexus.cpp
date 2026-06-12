@@ -24,6 +24,9 @@
 #include <geometry_msgs/msg/twist.hpp>          // 速度指令訊息型別（linear + angular）
 // std_msgs/String 保留供未來擴充用
 #include <std_msgs/msg/string.hpp>              // 字串訊息型別（備用）
+#include <geometry_msgs/msg/pose_stamped.hpp>   // 單點導航目標
+#include <campusrover_msgs/srv/routing_path.hpp> // 路徑導航服務
+#include <campusrover_msgs/srv/module_info.hpp>  // 拓撲節點查詢服務
 #include <thread>                                // 標準執行緒支援
 #include <chrono>                                // 時間工具（用於定時器週期）
 
@@ -149,6 +152,49 @@ public:
             RCLCPP_INFO(this->get_logger(), "Web 介面: http://%s:%d", local_ip.c_str(), HTTP_PORT);
         }
 
+        // === 路徑導航 + 單點導航 ===
+        goal_pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/goal_pose", 1);
+        routing_client_ = this->create_client<campusrover_msgs::srv::RoutingPath>("/routing_to_path/routing_call");
+        route_info_client_ = this->create_client<campusrover_msgs::srv::ModuleInfo>("/get_route_info");
+
+        // 路徑導航回呼：Web → routing service → /global_path
+        web_comm_.setRouteNavCallback([this](const std::string& origin, const std::string& dest) {
+            if (!routing_client_->wait_for_service(std::chrono::seconds(1))) {
+                RCLCPP_ERROR(this->get_logger(), "routing service 不可用");
+                return;
+            }
+            auto req = std::make_shared<campusrover_msgs::srv::RoutingPath::Request>();
+            req->origin = origin;
+            req->destination = {dest};
+            auto future = routing_client_->async_send_request(req,
+                [this, origin, dest](rclcpp::Client<campusrover_msgs::srv::RoutingPath>::SharedFuture f) {
+                    auto resp = f.get();
+                    int n_pts = 0;
+                    for (const auto& p : resp->routing) n_pts += (int)p.poses.size();
+                    RCLCPP_INFO(this->get_logger(), "routing 完成: %s → %s  path points=%d",
+                                origin.c_str(), dest.c_str(), n_pts);
+                });
+        });
+
+        // 單點導航回呼：Web → /goal_pose
+        web_comm_.setGoalNavCallback([this](double x, double y) {
+            auto msg = geometry_msgs::msg::PoseStamped();
+            msg.header.frame_id = "map";
+            msg.header.stamp = this->now();
+            msg.pose.position.x = x;
+            msg.pose.position.y = y;
+            msg.pose.orientation.w = 1.0;
+            goal_pose_pub_->publish(msg);
+            RCLCPP_INFO(this->get_logger(), "單點導航: (%.2f, %.2f)", x, y);
+        });
+
+        // 請求節點列表回呼
+        web_comm_.setGetNodesCallback([this]() { sendRouteNodes(); });
+
+        // 定時抓取拓撲節點（重試直到成功）
+        fetch_nodes_timer_ = this->create_wall_timer(
+            std::chrono::seconds(2), [this]() { fetchRouteNodes(); });
+
         // 配置 Android 通訊模組
         android_comm_.setLogCallback(log_cb);  // 設定日誌回呼
         android_comm_.start();                  // 啟動 UDP 接收執行緒
@@ -160,6 +206,17 @@ public:
         direct_control_timer_ = this->create_wall_timer(
             std::chrono::milliseconds(100),  // 每 100 毫秒觸發
             std::bind(&DirectController::timerCallback, &direct_controller_)  // 綁定控制器回呼
+        );
+
+        /*
+         * Web 廣播定時器（10Hz）— 不依賴點雲 callback
+         * 之前廣播只在 cloudCallback 觸發，若點雲斷流或 callback 未觸發，
+         * Web 前端就完全收不到資料（畫面凍結）。改用獨立 timer 保底廣播，
+         * 確保前端持續收到 scan_data（即使點雲暫時沒更新，也會送出最後狀態）。
+         */
+        broadcast_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(100),  // 10Hz
+            [this]() { web_comm_.broadcastData(); }
         );
 
         RCLCPP_INFO(this->get_logger(), "機器人中樞節點 'robot_nexus' 已啟動 (差速驅動模式)");
@@ -188,7 +245,18 @@ private:
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr mux_mode_pub_;              // /mux_mode_cmd 發布者
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;       // /scan 訂閱者
     rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;    // /velodyne_points 訂閱者
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr goal_pose_pub_; // /goal_pose 發布者
+    rclcpp::Client<campusrover_msgs::srv::RoutingPath>::SharedPtr routing_client_;    // routing service client
+    rclcpp::Client<campusrover_msgs::srv::ModuleInfo>::SharedPtr route_info_client_;  // 拓撲查詢 client
     rclcpp::TimerBase::SharedPtr direct_control_timer_;                            // 10Hz 定時器
+    rclcpp::TimerBase::SharedPtr broadcast_timer_;                                 // 10Hz Web 廣播定時器
+    rclcpp::TimerBase::SharedPtr fetch_nodes_timer_;                               // 拓撲節點抓取定時器
+
+    // 路由節點列表（從 /get_route_info 取得）
+    struct RouteNode { std::string name; double x, y; };
+    std::vector<RouteNode> route_nodes_;
+    std::mutex nodes_mutex_;
+    bool nodes_loaded_ = false;
 
     /*
      * scanCallback — 雷射雷達掃描回呼函式
@@ -248,14 +316,67 @@ private:
 
         shared_state_.setPoints(std::move(points));
 
-        // 跟隨模式：用投影後的 2D 點做追蹤 + 避障 + 廣播
+        // 跟隨模式：用投影後的 2D 點做追蹤 + 避障
         if (shared_state_.active.load()) {
             lidar_tracker_.processCloudPoints(
                 shared_state_.getPoints());  // getPoints() 回傳 const ref
-        } else {
-            // 非跟隨模式：只廣播點雲給 Web 顯示
-            web_comm_.broadcastData();
+            // processCloudPoints 內部會呼叫 data_broadcast_callback_
+            // 但若提前 return（空點雲）則不會，這裡補保底廣播
         }
+
+        // 永遠廣播：確保 Web 前端即時收到點雲資料
+        web_comm_.broadcastData();
+    }
+
+    /*
+     * fetchRouteNodes — 定時嘗試從 /get_route_info 取得拓撲節點列表
+     * 成功後停掉 timer，並立即廣播給前端。
+     */
+    void fetchRouteNodes() {
+        if (nodes_loaded_) {
+            fetch_nodes_timer_->cancel();
+            return;
+        }
+        if (!route_info_client_->wait_for_service(std::chrono::milliseconds(100))) return;
+
+        auto req = std::make_shared<campusrover_msgs::srv::ModuleInfo::Request>();
+        req->building = "itc";
+        req->floor = "3";
+        auto future = route_info_client_->async_send_request(req,
+            [this](rclcpp::Client<campusrover_msgs::srv::ModuleInfo>::SharedFuture f) {
+                try {
+                    auto resp = f.get();
+                    std::lock_guard<std::mutex> lock(nodes_mutex_);
+                    route_nodes_.clear();
+                    for (const auto& n : resp->node) {
+                        route_nodes_.push_back({n.name, n.pose.position.x, n.pose.position.y});
+                    }
+                    nodes_loaded_ = true;
+                    RCLCPP_INFO(this->get_logger(), "載入 %zu 個路由節點", route_nodes_.size());
+                    sendRouteNodes();
+                } catch (const std::exception& e) {
+                    RCLCPP_ERROR(this->get_logger(), "get_route_info 失敗: %s", e.what());
+                }
+            });
+    }
+
+    /*
+     * sendRouteNodes — 把路由節點列表序列化成 JSON 廣播給 Web 前端
+     */
+    void sendRouteNodes() {
+        std::lock_guard<std::mutex> lock(nodes_mutex_);
+        if (route_nodes_.empty()) return;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3);
+        oss << "{\"type\":\"route_nodes\",\"nodes\":[";
+        for (size_t i = 0; i < route_nodes_.size(); ++i) {
+            if (i > 0) oss << ",";
+            oss << "{\"name\":\"" << route_nodes_[i].name << "\","
+                << "\"x\":" << route_nodes_[i].x << ","
+                << "\"y\":" << route_nodes_[i].y << "}";
+        }
+        oss << "]}";
+        web_comm_.broadcastRouteNodes(oss.str());
     }
 };
 

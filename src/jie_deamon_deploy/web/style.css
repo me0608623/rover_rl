@@ -893,3 +893,268 @@ body {
     color: #a855f7;
     box-shadow: 0 0 8px rgba(168, 85, 247, 0.3);
 }
+
+/* ======================== 導航面板 ======================== */
+
+/* 整體 flex 佈局：上控制 + 中地圖 */
+.nav-panel {
+    flex-direction: column !important;
+}
+
+/* 上方控制區（固定高度、不自動伸縮） */
+.nav-top-bar {
+    flex-shrink: 0;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+/* 子模式切換列 */
+.nav-submode-bar {
+    display: flex;
+    gap: 4px;
+    padding: 6px 8px;
+}
+
+.submode-btn {
+    flex: 1;
+    padding: 8px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    border-radius: 8px;
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition-normal);
+}
+
+.submode-btn.active {
+    background: rgba(34, 211, 238, 0.2);
+    border-color: var(--accent-cyan);
+    color: var(--accent-cyan);
+}
+
+/* 路徑導航控制列 */
+.nav-controls {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+}
+
+.route-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+
+.route-point {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+.point-label {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    white-space: nowrap;
+}
+
+.point-value {
+    font-weight: 600;
+    color: var(--text-primary);
+    font-size: 0.8rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.route-arrow {
+    color: var(--accent-cyan);
+    font-size: 1rem;
+}
+
+.nav-buttons {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.nav-btn {
+    padding: 8px 14px;
+    border: none;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: var(--transition-normal);
+    white-space: nowrap;
+}
+
+.nav-btn.start-btn {
+    background: linear-gradient(135deg, var(--accent-blue), var(--accent-purple));
+    color: white;
+}
+
+.nav-btn.start-btn:disabled {
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    cursor: not-allowed;
+}
+
+.nav-btn.start-btn:not(:disabled):active {
+    transform: scale(0.96);
+}
+
+.nav-btn.cancel-btn {
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* 單點導航提示 */
+.goal-controls {
+    padding: 8px 12px;
+}
+
+.goal-hint {
+    color: var(--accent-cyan);
+    font-size: 0.8rem;
+    text-align: center;
+    padding: 6px 10px;
+    border: 1px dashed rgba(34, 211, 238, 0.3);
+    border-radius: 6px;
+    background: rgba(34, 211, 238, 0.05);
+}
+
+/* 地圖檢視器（佔滿剩餘空間，可縮放平移） */
+.map-viewer {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+    background: var(--bg-primary);
+    touch-action: none;      /* 禁止瀏覽器手勢，由 JS 處理 */
+    cursor: grab;
+    -webkit-user-select: none;
+    user-select: none;
+}
+
+/* transform 容器（圖片 + 節點一起縮放平移） */
+.map-transform {
+    position: absolute;
+    top: 0;
+    left: 0;
+    will-change: transform;
+}
+
+.map-transform img {
+    display: block;
+    width: 1883px;
+    height: 735px;
+    pointer-events: none;
+    -webkit-user-drag: none;
+}
+
+/* 節點覆蓋層（跟圖片同尺寸） */
+.map-overlay {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 1883px;
+    height: 735px;
+    pointer-events: none;   /* overlay 本身不攔截，由各 marker 自己處理 */
+}
+
+/* 節點 marker */
+.map-node {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    width: 36px;
+    height: 36px;
+    border-radius: 50%;
+    background: rgba(59, 130, 246, 0.4);
+    border: 2px solid rgba(59, 130, 246, 0.8);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.5rem;
+    font-weight: 700;
+    color: #93c5fd;
+    cursor: pointer;
+    pointer-events: auto;   /* marker 可點 */
+    z-index: 2;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.9);
+    transition: background 0.15s, border-color 0.15s, box-shadow 0.15s;
+}
+
+.map-node:hover {
+    background: rgba(59, 130, 246, 0.7);
+    border-color: #60a5fa;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.5);
+}
+
+/* 起點（綠色） */
+.map-node.origin {
+    background: rgba(16, 185, 129, 0.5);
+    border-color: #10b981;
+    color: #6ee7b7;
+    box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+}
+
+/* 終點（紅色） */
+.map-node.dest {
+    background: rgba(239, 68, 68, 0.5);
+    border-color: #ef4444;
+    color: #fca5a5;
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.5);
+}
+
+/* 縮放按鈕（浮動在右下） */
+.zoom-controls {
+    position: absolute;
+    bottom: 50px;
+    right: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    z-index: 10;
+}
+
+.zoom-btn {
+    width: 38px;
+    height: 38px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    background: rgba(17, 24, 39, 0.85);
+    color: var(--text-primary);
+    font-size: 1.1rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+}
+
+.zoom-btn:active {
+    background: var(--bg-hover);
+}
+
+/* 地圖提示文字 */
+.map-hint {
+    position: absolute;
+    bottom: 10px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.7);
+    color: var(--text-secondary);
+    padding: 5px 14px;
+    border-radius: 16px;
+    font-size: 0.75rem;
+    pointer-events: none;
+    z-index: 5;
+    white-space: nowrap;
+}

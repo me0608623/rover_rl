@@ -94,12 +94,53 @@
             </div>
         </div>
 
-        <!-- ======================== 導航面板（施工中） ======================== -->
-        <div id="panel-nav" class="tab-content" style="display: none;">
-            <div class="construction-container">
-                <div class="construction-icon">🚧</div>
-                <h2>正在施工</h2>
-                <p>敬请期待...</p>
+        <!-- ======================== 導航面板 ======================== -->
+        <div id="panel-nav" class="tab-content nav-panel" style="display: none;">
+            <!-- 上方控制區 -->
+            <div class="nav-top-bar">
+                <!-- 子模式切換 -->
+                <div class="nav-submode-bar">
+                    <button class="submode-btn active" data-navmode="route" id="btnRouteMode">路徑導航</button>
+                    <button class="submode-btn" data-navmode="goal" id="btnGoalMode">單點導航</button>
+                </div>
+                <!-- 路徑導航控制 -->
+                <div class="nav-controls" id="routeControls">
+                    <div class="route-info">
+                        <div class="route-point">
+                            <span class="point-label">🟢 起點</span>
+                            <span class="point-value" id="selectedOrigin">未選擇</span>
+                        </div>
+                        <div class="route-arrow">→</div>
+                        <div class="route-point">
+                            <span class="point-label">🔴 終點</span>
+                            <span class="point-value" id="selectedDest">未選擇</span>
+                        </div>
+                    </div>
+                    <div class="nav-buttons">
+                        <button class="nav-btn start-btn" id="startRouteNav" disabled>🚀 開始</button>
+                        <button class="nav-btn cancel-btn" id="cancelRouteNav">✖</button>
+                    </div>
+                </div>
+                <!-- 單點導航提示 -->
+                <div class="goal-controls" id="goalControls" style="display: none;">
+                    <div class="goal-hint">雙擊地圖任意位置設定導航目標</div>
+                </div>
+            </div>
+
+            <!-- 地圖檢視器（可縮放平移） -->
+            <div class="map-viewer" id="mapViewer">
+                <div class="map-transform" id="mapTransform">
+                    <img src="3f_routing.png" id="mapImage" alt="ITC 3F" draggable="false">
+                    <div class="map-overlay" id="mapOverlay"></div>
+                </div>
+                <!-- 縮放按鈕 -->
+                <div class="zoom-controls">
+                    <button class="zoom-btn" id="zoomIn">＋</button>
+                    <button class="zoom-btn" id="zoomOut">－</button>
+                    <button class="zoom-btn" id="zoomReset">⌂</button>
+                </div>
+                <!-- 選點指示 -->
+                <div class="map-hint" id="mapHint">點選節點選擇起點</div>
             </div>
         </div>
 

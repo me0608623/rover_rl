@@ -66,6 +66,9 @@ public:
     using DirectCmdCallback = std::function<void(double, double, double)>;    // 直接控制指令回呼 (vx, vy, wz)
     using ActionCmdCallback = std::function<void(const std::string&)>;        // 動作指令回呼 (JSON 字串)
     using MuxModeCallback = std::function<void(int)>;                         // 底盤模式切換回呼 (0=放鬆,1=停止,2=手動,3=自動)
+    using RouteNavCallback = std::function<void(const std::string&, const std::string&)>;  // 路徑導航 (origin, dest)
+    using GoalNavCallback = std::function<void(double, double)>;              // 單點導航 (world_x, world_y)
+    using GetNodesCallback = std::function<void()>;                           // 請求節點列表
 
     WebCommManager(SharedState& state) : state_(state) {}  // 建構函式：注入共享狀態
     ~WebCommManager() { stop(); }                           // 解構函式：確保資源釋放
@@ -78,6 +81,12 @@ public:
     void setActionCmdCallback(ActionCmdCallback cb) { action_cmd_callback_ = std::move(cb); }
     /* 設定底盤模式切換回呼 */
     void setMuxModeCallback(MuxModeCallback cb) { mux_mode_callback_ = std::move(cb); }
+    /* 設定路徑導航回呼 */
+    void setRouteNavCallback(RouteNavCallback cb) { route_nav_callback_ = std::move(cb); }
+    /* 設定單點導航回呼 */
+    void setGoalNavCallback(GoalNavCallback cb) { goal_nav_callback_ = std::move(cb); }
+    /* 設定請求節點列表回呼 */
+    void setGetNodesCallback(GetNodesCallback cb) { get_nodes_callback_ = std::move(cb); }
     /* 手動設定 Web 前端根目錄 */
     void setWebRoot(const std::string& root) { web_root_ = root; }
 
@@ -101,6 +110,8 @@ public:
     void stop();
     /* 將光達資料與速度狀態廣播到所有 WebSocket 客戶端 */
     void broadcastData();
+    /* 將路由節點列表廣播到所有 WebSocket 客戶端 */
+    void broadcastRouteNodes(const std::string& nodes_json);
 
 private:
     SharedState& state_;                                    // 共享狀態參考
@@ -117,6 +128,9 @@ private:
     DirectCmdCallback direct_cmd_callback_;                 // 直接控制指令回呼
     ActionCmdCallback action_cmd_callback_;                 // 動作指令回呼
     MuxModeCallback mux_mode_callback_;                     // 底盤模式切換回呼
+    RouteNavCallback route_nav_callback_;                   // 路徑導航回呼
+    GoalNavCallback goal_nav_callback_;                     // 單點導航回呼
+    GetNodesCallback get_nodes_callback_;                   // 請求節點列表回呼
 
     /* 內部日誌輸出 */
     void log(const std::string& msg) { if (log_callback_) log_callback_(msg); }
