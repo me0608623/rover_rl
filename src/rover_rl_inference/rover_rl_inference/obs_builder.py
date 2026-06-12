@@ -83,14 +83,19 @@ def build_obs_raw(
     lidar_sweep_72: np.ndarray,
     elapsed_s: float,
     params: ObsParams = ObsParams(),
+    action_history: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build raw obs vector matching the bundle's expected raw_obs_dim.
 
     - 79D (SA1_v2): ego(4) + goal(2) + LiDAR(72) + time(1)
     - 139D (SA5/6/7): ego(4) + goal(2) + LiDAR(72) + obstacles(60 zeros) + time(1)
+    - 83D (v3c action stacking): 79D + action_history(4) = [a_t-1, ω_t-1, a_t-2, ω_t-2]
 
     部署沒有 ground-truth 障礙物，60D 補零；normalizer 會把這些零依訓練統計轉換，
     再 slice 掉（export_policy 已內建 [0..77, 138] 切片）。
+
+    action_history 僅 83D（v3c）會用到；79/139D 忽略。內容為「正規化後的近 2 步動作」，
+    由 policy_node 維護（appendleft 最新）。⚠ 正規化常數必須與 v3c 訓練端一致。
     """
     o79 = build_obs_79d(
         last_accel, linear_vel, angular_vel, goal_body_x, goal_body_y,
@@ -106,6 +111,18 @@ def build_obs_raw(
         out[0:78] = o79[0:78]      # ego + goal + LiDAR
         # out[78:138] = 0           # obstacles ground-truth unavailable
         out[138] = o79[78]          # time
+        return out
+    if raw_obs_dim == 83:
+        # v3c action stacking：79D（time 在 index 78）後直接接 4D action history，
+        # 與訓練端 concat([..., [time], act_hist]) 的順序逐字一致。
+        if action_history is None or action_history.shape != (4,):
+            raise ValueError(
+                f"raw_obs_dim=83 需 action_history shape (4,)，got "
+                f"{None if action_history is None else action_history.shape}"
+            )
+        out = np.empty(83, dtype=np.float32)
+        out[0:79] = o79
+        out[79:83] = action_history.astype(np.float32)
         return out
     raise ValueError(f"unsupported raw_obs_dim={raw_obs_dim}")
 

@@ -29,7 +29,9 @@ rover_rl_policy:
     # CampusRover URDF: velodyne_link 相對 base_link 無 yaw 旋轉 → offset=0
     lidar_yaw_offset_deg: 0.0         # velodyne_link 相對 base_link 無 yaw → 0
     lidar_z_filter_m: 0.5             # 訓練值；在 sensor frame |z|>0.5 過濾地板/天花板
-    lidar_r_min_m: 0.9                # VLP-16 硬體盲區（訓練值）
+    lidar_r_min_m: 0.9                # VLP-16 硬體盲區（舊/v2 訓練值）。⚠ v3+ 訓練改 0.25，
+                                      #   載 v3 ckpt 時改成 0.25（必須與訓練端一致），
+                                      #   並同步 lidar_preprocessor_params.yaml 的 r_min。
     lidar_r_max_m: 20.0               # 最遠有效距離；>= 此值正規化為 1.0
 
     # --- Obs normalizer（必須與訓練 ObservationsCfgVLP16 一致；勿改） ---
@@ -52,7 +54,18 @@ rover_rl_policy:
     # 動作上限 ×rate、感知速度/目標 ÷rate，policy 完全在訓練分布內。
     # 可即時調：ros2 param set /rover_rl_policy speed_rate 0.5
     # 首次上電建議 0.3~0.5，確認行為正常後再往 1.0 加。
-    speed_rate: 0.4
+    speed_rate: 0.35
+
+    # --- Action stacking（v3c）：僅當 bundle 的 raw_obs_dim==83 自動啟用 ---
+    # 載舊/v3b（79/139D）模型時這三個參數完全不作用。
+    # ⚠ a_max / omega_max 是「動作正規化分母」，必須與 v3c 訓練端 action 上限逐字相同，
+    #   否則 action history 尺度錯位、policy 行為失準。預設取 PC v3c 規格（A_MAX=0.2,
+    #   OMEGA_MAX=π/15≈0.2094），上線 v3c 前務必跟訓練 repo 對齊
+    #   （PC 兩份文件對 OMEGA_MAX 給過 π/15 與 0.25π 兩個值，需確認哪個是 v3c 真值）。
+    # ⚠ v3c 建議 speed_rate=1.0（延遲感知重訓已取代時間膨脹這個治標手段）。
+    act_stack_size: 2                 # 堆疊步數；obs dim = 79 + 2*size（=83 時 size 必為 2）
+    act_stack_a_max: 0.2              # 線加速度正規化分母（= v3c 訓練 action a_max）
+    act_stack_omega_max: 0.20943951   # 角速度正規化分母 π/15（= v3c 訓練 action ω_max）
 
     # --- 控制週期 ---
     control_dt: 0.2                   # 5 Hz inference；訓練 dt 一致，勿改
@@ -78,7 +91,7 @@ rover_rl_policy:
     # 2026-06-08：實測死時間 ~0.2s，物理對應值即 0.2。
     #   （註：measured 來源時 0.2 會把震盪回授而更糟；那是來源的問題、非秒數。
     #     用 commanded 來源就該設回物理值 0.2，領先過頭再往下退 0.15/0.1。）
-    cmd_delay_comp_s: 0.3
+    cmd_delay_comp_s: 0.2
     # 補償總開關（false=完全關閉，不論上面秒數設多少）。讓你保留調好的秒數、用此開關決定開不開。
     # 可熱調：ros2 param set /rover_rl_policy cmd_delay_comp_enable true
     cmd_delay_comp_enable: true
