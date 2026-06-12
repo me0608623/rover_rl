@@ -14,6 +14,9 @@ __pycache__/
 *.swp
 *.swo
 
+# 本地手動備份（改動前的 .bak 安全副本；git 歷史已保留原版，不入庫）
+*.bak_*
+
 # Models（不 commit 大檔，由 Release 或 LFS 管理；可單獨開白名單）
 models/*.ts
 models/*.pt

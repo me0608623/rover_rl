@@ -28,6 +28,10 @@ class ActionParams:
     max_linear_accel: float = 0.5
     max_angular_velocity_action: float = 2.0
     dt: float = 0.2
+    # v3c 角速度 α slew：每步 Δω 上限 = max_angular_accel × dt（防舞龍舞獅）。
+    # 0.0 = 不做 slew（79/139 舊模型行為不變）；v3c 訓練端 = 3.0 rad/s²。
+    # ⚠️ v3c 同時把 max_angular_velocity_action 由 2.0 改為 0.25π≈0.7854。
+    max_angular_accel: float = 0.0
 
 
 def decode_logits_to_cmd(
@@ -36,18 +40,21 @@ def decode_logits_to_cmd(
     params: ActionParams = ActionParams(),
     deterministic: bool = True,
     rng: np.random.Generator | None = None,
+    current_angular_vel: float = 0.0,
 ) -> tuple[float, float, float]:
     """Args:
         logits_38: shape [38]，前 19 為 accel idx，後 19 為 omega idx
         current_linear_vel: 當前線速度 (m/s)，用於動態加速邊界
         deterministic: argmax；False = softmax sampling
         rng: numpy Generator（sampling 時用）
+        current_angular_vel: 上一步 applied 角速度 (rad/s)，僅 max_angular_accel>0 (v3c)
+            時用於 α slew clamp；對齊訓練端 process_actions 的 self._current_omega。
 
     Returns:
         (cmd_linear_vel, cmd_angular_vel, actual_accel)
             cmd_linear_vel: m/s, clamped to [-v_max, +v_max]
-            cmd_angular_vel: rad/s, clamped to [-ω_max, +ω_max]
-            actual_accel: m/s²，可回填到下一輪 obs[0]
+            cmd_angular_vel: rad/s, clamped to [-ω_max, +ω_max]（v3c 已過 slew）
+            actual_accel: m/s²，可回填到下一輪 obs[0] / action history
     """
     if logits_38.shape != (38,):
         raise ValueError(f"logits shape {logits_38.shape} != (38,)")
@@ -88,10 +95,20 @@ def decode_logits_to_cmd(
 
     accel = float(np.clip(accel, a_lo, a_hi))
     next_v = float(np.clip(v + accel * dt, -v_max, +v_max))
-    # omega 是直接速度映射（非積分加速），用 action ω_max=2.0（≠ obs normalizer 1.5）
-    cmd_w = float(np.clip(ratio_w * params.max_angular_velocity_action,
-                          -params.max_angular_velocity_action,
-                          +params.max_angular_velocity_action))
+
+    # omega 是直接速度映射（非積分加速），用 action ω_max（≠ obs normalizer 1.5）
+    w_max = params.max_angular_velocity_action
+    target_w = float(np.clip(ratio_w * w_max, -w_max, +w_max))
+    if params.max_angular_accel > 0.0:
+        # v3c α slew：actual_ω = ω_prev + clamp(target_ω - ω_prev, ±max_dw)，再 clamp 到 ±ω_max。
+        # 與訓練端 discrete_differential_drive.process_actions 第五步完全一致（防舞龍舞獅）。
+        max_dw = params.max_angular_accel * dt
+        w_prev = float(current_angular_vel)
+        cmd_w = w_prev + float(np.clip(target_w - w_prev, -max_dw, max_dw))
+        cmd_w = float(np.clip(cmd_w, -w_max, +w_max))
+    else:
+        # 舊模型 (79/139)：無 slew，直接映射（行為與改動前 byte 級相同）
+        cmd_w = target_w
     return next_v, cmd_w, accel
 
 

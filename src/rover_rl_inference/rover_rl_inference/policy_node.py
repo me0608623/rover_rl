@@ -30,6 +30,7 @@ sim-to-real 核心對策（細節見 rover_rl/CLAUDE.md）：
 """
 from __future__ import annotations
 
+import collections
 import json
 import math
 import os
@@ -58,7 +59,7 @@ from .localization import MapOdomOffsetTracker, RobotPose, world_to_body
 from .markers import build_marker_array
 from .mode_manager import Mode, ModeManager
 from .model_runtime import PolicyRunner, load_bundle
-from .obs_builder import ObsParams, build_obs_raw
+from .obs_builder import ObsParams, build_obs_raw, normalize_applied_action
 from .subgoal_selector import SubgoalSelector
 
 
@@ -158,6 +159,9 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_linear_velocity", 1.0)
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
+        # v3c 角速度 α slew 上限 (rad/s²)：0.0=不做 slew（79/139 舊模型）；v3c=3.0。
+        # ⚠️ 用 v3c (raw_obs=83) 模型時，act_max_angular_velocity 必須一併改成 0.7853981634 (0.25π)。
+        self.declare_parameter("act_max_angular_accel", 0.0)
         # 全域速度縮放（spot_rl 時間膨脹）：(0,1]，1.0=原速，0.5=半速
         # 動作上限 ×rate，感知速度/目標 ÷rate → policy 留在訓練分布內
         self.declare_parameter("speed_rate", 1.0)
@@ -227,6 +231,7 @@ class PolicyNode(Node):
             max_linear_accel=float(gp("act_max_linear_accel").value),
             max_angular_velocity_action=float(gp("act_max_angular_velocity").value),
             dt=self.control_dt,
+            max_angular_accel=float(gp("act_max_angular_accel").value),
         )
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
         self.cmd_delay_comp_s = self._clamp_comp(float(gp("cmd_delay_comp_s").value))
@@ -281,6 +286,11 @@ class PolicyNode(Node):
         self._target_v = 0.0
         self._target_w = 0.0
         self._target_set_t = 0.0
+        # v3c action history（raw_obs=83 才用）：存最近 2 步「已正規化」的 applied (a, ω)，
+        # 新→舊。每元素 = (a_norm, ω_norm)。obs[79:83] 由此攤平；新 goal / 停車時清空（≈episode reset）。
+        # 來源是 policy 自己上 2 步 decode 出的 actual_accel / cmd_w（slew 後），非硬體量測。
+        self._use_act_hist = (getattr(self.bundle, "raw_obs_dim", 79) == 83)
+        self._act_hist: collections.deque = collections.deque(maxlen=2)
         # 上次 sweep（給 marker 用）
         self._last_sweep: np.ndarray | None = None
         # 上次 subgoal（給 marker 用）
@@ -736,28 +746,47 @@ class PolicyNode(Node):
             g_inflate_x *= s
             g_inflate_y *= s
 
+        # v3c action history：讀「上 2 步」已正規化的 applied (a,ω)，攤平成 4D（新→舊，不足補 0）。
+        # 舊模型 (_use_act_hist=False) → None，build_obs_raw 走 79/139 路徑，行為不變。
+        act_hist_norm = None
+        if self._use_act_hist:
+            with self._lock:
+                hist = list(self._act_hist)            # 新→舊
+            flat: list[float] = []
+            for a_n, w_n in hist:
+                flat.extend((a_n, w_n))
+            while len(flat) < 4:
+                flat.append(0.0)
+            act_hist_norm = np.asarray(flat[:4], dtype=np.float32)
+
         # RL 推論（餵入「感知世界」的放大量）
         obs = build_obs_raw(
             self.bundle.raw_obs_dim,
             last_accel=last_accel * inv, linear_vel=v * inv, angular_vel=w * inv,
             goal_body_x=g_inflate_x, goal_body_y=g_inflate_y,
             lidar_sweep_72=sweep, elapsed_s=elapsed,
+            action_hist_norm=act_hist_norm,
             params=self.obs_params,
         )
         logits = self.runner.step(obs)
         # 動作端：上限 ×rate 縮回實體速度；current_vel 用真實 v 做積分
         # （obs 端放大 1/rate、action 端縮小 ×rate 的不對稱，正是時間膨脹的本質：
         #  policy 在「放大的感知世界」決策，輸出再縮回真實世界的慢速指令）
+        # ⚠️ v3c 建議 speed_rate=1.0（訓練無時間膨脹）；rate<1 時 action history 與 slew 的
+        #    縮放僅近似對齊。max_angular_accel 一併 ×rate 才與線性/角速度上限同尺度。
         act_eff = (self.act_params if rate >= 0.999 else ActionParams(
             num_bins=self.act_params.num_bins,
             max_linear_velocity=self.act_params.max_linear_velocity * rate,
             max_linear_accel=self.act_params.max_linear_accel * rate,
             max_angular_velocity_action=self.act_params.max_angular_velocity_action * rate,
             dt=self.act_params.dt,
+            max_angular_accel=self.act_params.max_angular_accel * rate,
         ))
+        # v3c slew 需「上一步 applied ω」（= 上次 _target_w）；舊模型 max_angular_accel=0 時不使用
         cmd_v, cmd_w, accel = decode_logits_to_cmd(
             logits, current_linear_vel=v,
             params=act_eff, deterministic=self.deterministic,
+            current_angular_vel=self._target_w,
         )
 
         with self._lock:
@@ -765,6 +794,12 @@ class PolicyNode(Node):
             self._target_v = cmd_v
             self._target_w = cmd_w
             self._target_set_t = now
+            # 推完把這步 applied (a,ω) 正規化後推進歷史（新→舊）；下一 tick 它變成 t-1。
+            # 與訓練端 discrete_applied_action_history「step 後 push」順序一致。
+            if self._use_act_hist:
+                self._act_hist.appendleft(
+                    normalize_applied_action(accel, cmd_w, self.obs_params)
+                )
 
         if self.pub_obs is not None:
             m = Float32MultiArray()
@@ -775,6 +810,9 @@ class PolicyNode(Node):
         with self._lock:
             self._target_v = 0.0
             self._target_w = 0.0
+            # 停車 = episode 邊界，清空 action history（下次起步從 [0,0,0,0] 開始，對齊訓練 reset）
+            if getattr(self, "_use_act_hist", False):
+                self._act_hist.clear()
         if warn:
             self.get_logger().warn(reason, throttle_duration_sec=2.0)
 

@@ -156,9 +156,11 @@ def _autodetect(ckpt: dict, overrides: dict) -> dict:
     # 用 normalizer mean 的長度判定 raw obs 維度（這是區分 79D / 139D 架構的依據）
     raw_obs_dim = int(mean.numel()) if mean is not None and hasattr(mean, "numel") else 79
 
+    # v3c (raw=83) policy 直接看全部 83D；79/139 舊架構 policy 只看 79D
+    used_obs_dim = 83 if raw_obs_dim == 83 else 79
     cfg = {
         "raw_obs_dim": raw_obs_dim,
-        "used_obs_dim": 79,
+        "used_obs_dim": used_obs_dim,
         "hidden_dim": int(args.get("hidden_dim") or 30),
         "preprocess_dim": int(args.get("preprocess_dim") or 12),
         "fc_dim": int(args.get("fc_dim") or 48),
@@ -174,12 +176,15 @@ def _autodetect(ckpt: dict, overrides: dict) -> dict:
     # （該欄位 sim 才有、實車拿不到，部署時補 0，故匯出時也排除）
     if raw_obs_dim == 79:
         cfg["policy_indices"] = list(range(0, 79))
+    elif raw_obs_dim == 83:
+        # v3c: raw obs 已是 83D（ego4+goal2+lidar72+time1+act_hist4），policy 全取（恆等）
+        cfg["policy_indices"] = list(range(0, 83))
     elif raw_obs_dim == 139:
         cfg["policy_indices"] = list(range(0, 78)) + [138]
     else:
         raise ValueError(
             f"unknown obs layout: raw_obs_dim={raw_obs_dim}; "
-            f"expected 79 or 139. Override via flags if needed."
+            f"expected 79, 83 (v3c) or 139. Override via flags if needed."
         )
     return cfg
 
@@ -215,7 +220,9 @@ def export(args):
             print(f"      {k}: {v}")
 
     mm = _load_training_models()
-    extractor = mm.LidarStateExtractor()
+    # v3c (raw=83) 用 11D state_mlp（含 4D action history）；79/139 舊架構用 7D state。
+    # include_act_hist 必須與 checkpoint 的 state_mlp 輸入維度一致，否則 load_state_dict 形狀不符。
+    extractor = mm.LidarStateExtractor(include_act_hist=(cfg["raw_obs_dim"] == 83))
     rnn = mm.PreprocessRNN(
         input_dim=extractor.output_dim,
         fc_dim=cfg["fc_dim"],
