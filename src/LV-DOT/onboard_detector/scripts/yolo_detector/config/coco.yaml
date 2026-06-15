@@ -1,0 +1,19 @@
+# YOLO-FastestV2 訓練設定（上游：訓練偵測器模型用，非實車推論設定）
+DATASET:
+  TRAIN: "/home/qiuqiu/Desktop/coco2017/train2017.txt"   # 訓練集清單路徑
+  VAL: "/home/qiuqiu/Desktop/coco2017/val2017.txt"       # 驗證集清單路徑
+  NAMES: "configs/coco.names"                            # 類別名稱檔
+MODEL:
+  NC: 80                  # 類別數（COCO 80 類）
+  INPUT_WIDTH: 352        # 網路輸入寬
+  INPUT_HEIGHT: 352       # 網路輸入高
+TRAIN:
+  LR: 0.001               # 學習率
+  THRESH: 0.25            # 信心門檻
+  WARMUP: true            # 是否 warmup
+  BATCH_SIZE: 96          # batch 大小
+  END_EPOCH: 300          # 總訓練 epoch
+  MILESTIONES:            # LR 衰減的 epoch 里程碑
+    - 100
+    - 200
+    - 250

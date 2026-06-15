@@ -1,0 +1,112 @@
+# LV-DOT detector params (ROS2 Humble). /** applies to the node regardless of name.
+/**:
+  ros__parameters:
+    localization_mode: 1   # odom mode(/odom 穩定@20Hz; /ndt_pose 傳輸不穩)
+    vis_frame: odom        # 發布 frame_id。odom mode 下資料就在 odom 座標；之前硬編 "map"
+                           # → 沒開 NDT 時 RViz 無 map frame 全畫不出來、開 NDT 時畫偏
+
+    # ROS Topics（對齊 rover_rl 實車 topic）
+    depth_image_topic: /camera/camera/depth/image_rect_raw  # 需先開 enable_depth:=true 才有此 topic
+    color_image_topic: /camera/camera/color/image_raw
+    lidar_pointcloud_topic: /velodyne_points
+    pose_topic: /ndt_pose
+    odom_topic: /odom
+
+    # Camera Parameters
+    depth_intrinsics: [385.3096008300781, 385.3096008300781, 324.7971496582031, 237.722900390625]  # fx, fy, cx, cy
+    color_intrinsics: [606.3120727539062, 605.92626953125, 314.6913146972656, 252.1909942626953]  # fx, fy, cx, cy
+    depth_scale_factor: 1000.0  # 1000 for Intel Realsense Camera
+    depth_min_value: 0.5        # 深度有效最小值(m)，太近濾掉
+    depth_max_value: 5.0        # 深度有效最大值(m)，太遠濾掉
+    depth_filter_margin: 10     # 影像邊緣裁切像素數（去雜訊邊框）
+    depth_skip_pixel: 2         # 每隔 N 像素取樣（降運算）
+    image_cols: 640   # 對齊實機 depth 寬度。2026-06-15：相機改 640x480，原本誤留 848 → U-depth 圖
+                      # 幾何錯位、深度 3D 框形成失敗、融合只剩 LiDAR(稀疏)。內參 cx=324.8 本就是 640 的
+    image_rows: 480             # depth 影像高度
+
+    # Sensor Transforms (row-major 4x4)
+    # 2026-06-10 改實機值（之前是 LV-DOT 範例值 z=0.15/0.095 → LiDAR 高度差 1.14m
+    # 讓 ground filter 把人體 1.34m 以下全切掉 → 人抓不到、只框到牆面上緣雜訊）。
+    # 平移量自 TF 實測：base_link→velodyne=(-0.103,0,1.288)、
+    # base_link→camera_*_optical≈(-0.137,0.015,1.238)；旋轉維持標準光學系→body。
+    body_to_camera_depth: [0.0,  0.0,  1.0, -0.136,
+                          -1.0,  0.0,  0.0,  0.0,
+                           0.0, -1.0,  0.0,  1.237,
+                           0.0,  0.0,  0.0,  1.0]
+    body_to_camera_color: [0.0,  0.0,  1.0, -0.137,
+                          -1.0,  0.0,  0.0,  0.015,
+                           0.0, -1.0,  0.0,  1.238,
+                           0.0,  0.0,  0.0,  1.0]
+    body_to_lidar: [1.0,  0.0,  0.0, -0.103,
+                    0.0,  1.0,  0.0,  0.0,
+                    0.0,  0.0,  1.0,  1.288,
+                    0.0,  0.0,  0.0,  1.0]
+
+    # System
+    time_step: 0.05                    # 主迴圈週期(s)，20Hz。was 0.033：5 個 timer @30Hz 把單核
+                                       # 吃到 108% → executor 餓死 lidar/odom sync 訂閱 → 點雲
+                                       # 內容凍結 1.2s（「藍框停在幾秒前」真兇）。LiDAR 10Hz，
+                                       # 20Hz 迴圈仍有 2 倍餘裕
+
+    # DBSCAN Common
+    ground_height: 0.2                 # 低於此高度(m)視為地面，濾除
+    roof_height: 2.0                   # 高於此高度(m)視為天花板，濾除
+    lidar_min_range: 0.9               # lidar XY 距離 < 此值的點丟棄（VLP-16 盲區 + 車自身結構，
+                                       # 之前車旁 0.7m 一直冒「動態框」就是自身點抖動）
+
+    # DBSCAN visual param
+    voxel_occupied_thresh: 5.0         # voxel 視為被佔據的點數門檻
+    dbscan_min_points_cluster: 20      # 視覺 DBSCAN 成簇最少點數
+    dbscan_search_range_epsilon: 0.2   # was 0.05（太小→碎裂）
+
+    # DBSCAN LiDAR param
+    lidar_DBSCAN_min_points: 15        # was 10（太低→稀疏雜訊成框）。8 試後方無效又拖效能，還原
+    lidar_DBSCAN_epsilon: 0.3          # was 0.05（太小→物體碎成多框）
+    downsample_threshold: 2000         # 點數超過此值就加大 voxel 降採樣（顧 loop 速度）。4000 試後方無效，還原
+                                       # 後點變多、DBSCAN 拖慢主迴圈 30→11Hz（延遲感來源之一）
+    gaussian_downsample_rate: 1000     # 高斯隨機降採樣 σ。was 6：保留率隨距離衰減（9.4m 只留29%）
+                                       # → 遠處簇成員每幀隨機變動 → 簇心跳動 → 靜態物假速度誤判動態
+                                       # （誤報只在 4.7/9.4m、近處乾淨的根因）。設 1000=全留，
+                                       # 點數交給後段確定性 voxel grid + downsample_threshold 控制
+
+    # LiDAR Visual Filtering
+    filtering_BBox_IOU_threshold: 0.2  # lidar/visual bbox 融合 IOU 門檻
+
+    # Tracking and data association
+    max_match_range: 0.8               # 前後幀配對最大距離(m)。was 0.5：B 改善連續性——VLP-16 稀疏點
+                                       # 下人物簇會碎裂、簇心跳動，0.5 配不回→track 歸零；0.8 把跳動的
+                                       # 簇心重新併回同一 track，活更久才湊得滿幀數做動態分類
+    max_size_diff_range: 0.5           # 配對允許的尺寸差(m)
+    feature_weight: [3.0, 3.0, 0.1, 0.5, 0.5, 0.05, 0.0, 0.0, 0.0]  # 配對特徵權重(位置/尺寸/速度…)
+    history_size: 100                  # 每個 track 保留的歷史幀數
+    fix_size_history_threshold: 10     # 累積 N 幀後固定 bbox 尺寸
+    fix_size_dimension_threshold: 0.4  # 尺寸變動 < 此值(m)才固定
+    kalman_filter_param: [0.25, 0.01, 0.05, 0.05, 0.04, 0.3, 0.6]   # KF 過程/量測噪音參數
+    kalman_filter_averaging_frames: 10 # 速度估計平均幀數
+
+    # Classification
+    frame_skip: 5                      # 每隔 N 幀做一次分類
+    dynamic_velocity_threshold: 0.3    # 速度 > 此值(m/s)候選為動態（人走路 1~1.5m/s）。
+                                       # 噪音根因（隨機降採樣/外參/自鎖閂）修掉後不需 0.4 高壓
+    dynamic_voting_threshold: 0.6      # was 0.8：放寬 LiDAR-only(側後方稀疏簇難湊 80%同向)。誤報需實測
+                                       # 需「連續15幀、每幀90%點超速」幾乎不可能 → 車後方抓不到人
+    frames_force_dynamic: 999999       # 強制動態自鎖閂：30 幀內 10 幀標過動態→永久鎖死動態。
+                                       # was 10：靜態物（玻璃/稀疏抖動）一旦短暫誤判就回不來
+                                       # → 設超大值=停用。真人持續移動不靠這個也抓得到
+    frames_force_dynamic_check_range: 30  # 強制動態的檢查視窗幀數
+    dynamic_min_displacement: 0.2      # 動態判定窗內最小淨位移(m)，於「滿窗」(disp_window)時要求。
+                                       # A：實際門檻隨可用歷史線性縮放→等效淨速度恆定(0.2/0.5s=0.4m/s)，
+                                       # 與舊滿窗值一致；短 track 也能判動態，抖動(~0 淨位移)仍被擋。0=停用
+    dynamic_disp_window: 10            # 淨位移「滿窗」幀數(~0.5s@20Hz)。was 20：太長→LiDAR track 撐不到
+    dynamic_min_disp_frames: 6         # 位移檢查最少需要的幀數(~0.3s)。少於此視為太短、無從證明位移
+    detection_stale_timeout: 0.5       # LiDAR/odom 同步逾時(s)：odom 斷流時偵測凍結，超時即
+                                       # 清空動態框+警告（否則 30Hz 重發過期框=假延遲）
+    dynamic_consistency_threshold: 4   # was 6：放寬，間歇的人較易湊滿一致性窗。誤報需實測
+                                       # 撐到 10 幀太難；6 幀(~0.3s)+ 80%容忍(5/6) 兼顧抑噪與可達成
+
+    # Constrain size
+    target_constrain_size: true    # 2026-06-10 re-enable：目前目標=抓行人，only 人形尺寸可同時
+                                   # 濾掉牆面/玻璃flicker誤判（容差寬：到1.3x1.3x2.5都算）。
+                                   # 若日後要抓推車等非人形動態再關
+    target_object_size: [0.5, 0.5, 1.5]  # 目標物典型尺寸(x,y,z m)
+    max_object_size: [3.0, 3.0, 2.0]     # 物件最大尺寸(m)，超過視為誤框

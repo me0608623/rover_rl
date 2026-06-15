@@ -887,6 +887,86 @@ ros2 launch rosbridge_server rosbridge_websocket_launch.xml &
 
 若 rosbridge 沒有 source rover_rl 環境就啟動，會連到不同 zenoh domain，看不到 rover_rl 的 topics。
 
+## LV-DOT 動態障礙偵測 + VO 介面（2026-06-15 整合）
+
+> LV-DOT（`src/LV-DOT/onboard_detector`）：LiDAR + 視覺融合的動態障礙偵測追蹤，**與 RL policy 完全解耦**
+> （policy 不吃此資料、obs 障礙欄仍補 0）。輸出供 RViz 觀察 / status_tui / 下游 VO 避障規劃。
+> 移植與調校全紀錄見記憶 `lvdot-ros2-port.md` / `vo-interface-node.md`。
+
+### 一鍵啟動（lv-dot alias）
+
+```bash
+lv-dot          # = ros2 launch onboard_detector run_detector.launch.py use_yolo:=true
+lv-dot_stop     # 停掉 detector + yolo + vo + launch（已含全部）
+```
+
+`lv-dot` 一鍵起**完整一套**：遠端相機(SSH .13) + detector_node + YOLO(GPU venv) + **vo_interface**。
+- **防雙開**：launch 啟動前先 `pkill` 殘留 detector/yolo/vo（`stale_cleanup` + `OnProcessExit` 排序），
+  **不先 lv-dot_stop 直接重啟也不會雙開**。（舊問題：Ctrl+C 偶爾沒收乾淨 YOLO venv 子行程 → 殘留雙開。）
+- **enable_vo**（預設 true）：vo_interface 隨 lv-dot 一起起；`lv-dot ... enable_vo:=false` 可關。
+- **相機**：`use_camera:=true`（預設）SSH 到 humble@192.168.3.13 跑 `~/start_realsense.sh`；
+  關 lv-dot 連帶殺相機（見上方相機段）。
+- detector 終端 ~1Hz 印 `[動態障礙] N 個: #i pos(x,y) v(vx,vy)|spd 尺寸(...) [YOLO人]`，空場景印 `0 個`。
+
+### 關鍵輸出 topic
+
+| Topic | Type | 說明 |
+|---|---|---|
+| `/onboard_detector/dynamic_bboxes` | MarkerArray | 動態障礙框（藍，已分類為 dynamic），frame=**odom**（vis_frame）|
+| `/onboard_detector/dynamic_point_cloud` | PointCloud2 | 動態點雲 |
+| `/vo_interface/tracked_obstacles` | `vo_interface/TrackedObstacleArray` | **給 VO 規劃器**：持久 ID/平滑速度/協方差/age |
+| `/vo_interface/markers` | MarkerArray | RViz 視覺化（粉紅速度箭頭 + ID/age 文字）|
+
+`TrackedObstacle.msg` 欄位：`id`(持久) `age`(秒) `position` `velocity`(平滑絕對速度,odom frame)
+`size` `radius`(=0.5·hypot(x,y),Minkowski 用) `vel_confidence`(0~1) `position/velocity_covariance[4]`(PVO 用)。
+vo_interface 純訂閱 dynamic_bboxes、自做 CV-Kalman 重追蹤（LV-DOT 原生 box.id 是每幀索引非持久，
+且 LiDAR-only 速度偏跳）；KF coasting 還會補平 dynamic_bboxes 的斷續發布 → VO 拿到連續障礙物流。
+
+### RViz
+
+```bash
+ros2 run rviz2 rviz2 -d /home/aa/rviz/lvdot.rviz   # 或 lv-dot use_rviz:=true（X11 有 DISPLAY 時）
+```
+`lvdot.rviz` 已含 DynamicBBoxes(藍) / VO_TrackedObstacles(粉紅箭頭) / DynamicPoints / LidarClusters。
+
+### 偵測覆蓋與調校現況（2026-06-15）
+
+兩條分類路徑：**YOLO 快速通道**（`is_human`，相機 FOV ±43° 內，YOLO 認出人→直接判動態）vs
+**LiDAR-only**（側/後方，靠速度投票+位移+一致性，門檻較嚴）。實測各方位覆蓋率差異大：
+
+| 方位 | 覆蓋 | 狀態 |
+|---|---|---|
+| **前**（相機 FOV） | YOLO 看到人→**99%** 變動態框 | ✅ 基本解決 |
+| 側 | ~16% | LiDAR-only + 部分超出相機 FOV |
+| 後 | ~2% | 硬體盲區（無相機 + VLP-16 稀疏，疑遮蔽）|
+
+**前方兩個關鍵修正**（從 31%/4% 一路救到 99%）：
+1. **YOLO 模型 `yolo11n→yolo11s` + 推論解析度 `352→640`**（`yolov11_detector.py`；weights/yolo11s.pt 已入庫）
+   → YOLO person recall 55%→**100%**。推論 23→40ms（仍 < 67ms 相機週期）。
+2. **`is_human` 跳過尺寸約束**（`dynamicDetector.cpp` classificationCB）→ P(動態|YOLO人) 4%→**99%**。
+   原因：VLP-16 稀疏下人物融合框 z_width 常 <0.5（只掃到上半身），被人形尺寸 `target_constrain_size`
+   容差誤殺。YOLO 已確認是人不該再用尺寸濾；LiDAR-only 候選**仍受約束**濾家具（淨空誤報實測 0%）。
+
+**LiDAR-only（側/後方）救活的調校**（記憶 lvdot-ros2-port 有全紀錄）：外參改 TF 實測值、停用隨機降採樣/
+force_dynamic 自鎖閂、位移閘門隨可用歷史縮放、`max_match_range` 0.5→0.8、`image_cols` 848→640。
+側/後方仍受 VLP-16 稀疏硬體限制（YOLO 照不到），這是天花板。對 VO 避障，最該顧的前方扇區已穩。
+
+**⚠ 診斷覆蓋率的方法論教訓**：用「移動 LiDAR 簇」當 ground truth **嚴重低估**（給 39%）；用「YOLO 看到人」
+當 GT 才準（同場景 4%）。量覆蓋率務必選可靠 GT，否則會追錯瓶頸。
+
+### 故障排除（LV-DOT 專屬）
+
+| 症狀 | 真因 | 處置 |
+|---|---|---|
+| 藍框/traj 在 RViz 延遲 ~2 秒 | **RViz QoS `Depth:100` 訊息積壓**（非 pipeline！資料其實即時，粉紅箭頭即時可證）| lvdot.rviz 已改 `Depth:1`；重載 RViz。X11 轉送畫線框本身偏重，治本=RViz 跑 PC 本機走 zenoh |
+| 動態框抓固定點雜訊 / 真人難抓 | 外參範例值（已修為 TF 實測）/ 隨機降採樣假速度 / force_dynamic 自鎖閂 | 已全修，見記憶 lvdot-ros2-port |
+| 前方的人 YOLO 有抓到卻不變動態框 | `target_constrain_size` 把 YOLO 確認的人（z_width<0.5）誤殺 | 已修：is_human 跳過尺寸約束（見上「偵測覆蓋」段）|
+| 前方 YOLO recall 低（人在前卻常漏） | YOLO 用 nano 模型 + 352 低解析度 | 已改 yolo11s + 640（weights/yolo11s.pt）|
+| `[python-N] libEGL warning: DRI3: failed to query the version` | **無害警告**（libEGL 在無 GL 顯示脈絡下查 DRI3 失敗，matplotlib/GL python 節點都會印）| **忽略**，不影響偵測 |
+| YOLO 每幀洗版 `0: 352x352 N chairs` | ultralytics 預設 verbose | 已設 `verbose=False`（yolov11_detector.py:92）|
+| 重啟後 YOLO/vo 雙開 | 上次沒收乾淨殘留 | 已修（stale_cleanup）；直接 `lv-dot` 重啟即可 |
+| dynamic_bboxes frame 對不上 | vis_frame | odom mode 下發 odom frame（=LV-DOT world frame）；RViz Fixed Frame 用 odom |
+
 ## 安全條款（絕對遵守）
 
 1. **第一次跑：架空 + 遙控器隨時待命**

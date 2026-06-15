@@ -1,0 +1,6 @@
+# this is only used in simulation
+color_distance: 5.0                                          # 模擬中認定的障礙顏色距離(m)
+target_obstacle: ["person", "dynamic_box", "dynamic_cylinder"]  # 視為動態的物件類別
+# odom_topic: "mavros/local_position/odom"
+odom_topic: "/CERLAB/quadcopter/odom"                        # 模擬里程計 topic
+history_size: 100                                            # 每個 track 保留歷史幀數
