@@ -2247,7 +2247,8 @@ namespace onboardDetector{
             if (this->boxHist_[i].size() > 1){
                 visualization_msgs::msg::Marker traj;
                 traj.header.frame_id = this->visFrame_;
-                traj.header.stamp = this->now();
+                // 不設 stamp(=0)→ RViz 用「最新可用 TF」轉換，避免 Fixed Frame=map 時 marker 的
+                // now() 比 NDT map→odom(~10Hz 有延遲) 還新→暫時 transform 不出來閃錯(同 publish3dBox)
                 traj.ns = "dynamic_detector";
                 traj.id = countMarker;
                 traj.type = visualization_msgs::msg::Marker::LINE_LIST;
@@ -2291,7 +2292,7 @@ namespace onboardDetector{
             }
             visualization_msgs::msg::Marker velMarker;
             velMarker.header.frame_id = this->visFrame_;
-            velMarker.header.stamp = this->now();
+            // 不設 stamp(=0)→ 用最新 TF，避免 Fixed Frame=map 時閃 transform 錯（見 traj 同註解）
             velMarker.ns = "dynamic_detector";
             velMarker.id =  countMarker;
             velMarker.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
@@ -2346,8 +2347,7 @@ namespace onboardDetector{
             }
         }
         pcl::toROSMsg(*colored_cloud, lidarClustersMsg);
-        lidarClustersMsg.header.frame_id = this->visFrame_;
-        lidarClustersMsg.header.stamp = this->now();
+        lidarClustersMsg.header.frame_id = this->visFrame_;  // 不設 stamp→最新 TF，免 map frame 閃 transform 錯
         this->lidarClustersPub_->publish(lidarClustersMsg);
     }
 
@@ -2373,8 +2373,7 @@ namespace onboardDetector{
             }
         }
         pcl::toROSMsg(*colored_cloud, filteredPointsMsg);
-        filteredPointsMsg.header.frame_id = this->visFrame_;
-        filteredPointsMsg.header.stamp = this->now();
+        filteredPointsMsg.header.frame_id = this->visFrame_;  // 不設 stamp→最新 TF
         this->filteredPointsPub_->publish(filteredPointsMsg);
     }
 
@@ -2395,8 +2394,7 @@ namespace onboardDetector{
                 pcl::transformPointCloud(*tempCloud, *globalCloud, transform);
                 sensor_msgs::msg::PointCloud2 cloudMsg;
                 pcl::toROSMsg(*globalCloud, cloudMsg);
-                cloudMsg.header.frame_id = this->visFrame_;
-                cloudMsg.header.stamp = this->now();
+                cloudMsg.header.frame_id = this->visFrame_;  // 不設 stamp→最新 TF
                 this->rawLidarPointsPub_->publish(cloudMsg);
             }
             else {

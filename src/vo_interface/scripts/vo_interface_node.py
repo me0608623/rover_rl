@@ -225,6 +225,12 @@ class VOInterfaceNode(Node):
         header.stamp = self.get_clock().now().to_msg()
         header.frame_id = self.det_frame_id
 
+        # RViz marker 專用 header：不設 stamp(=0)→ RViz 用「最新可用 TF」轉換，避免 Fixed Frame=map 時
+        # marker 的 now() 比 NDT map→odom(~10Hz 有延遲) 新→暫時 transform 不出來閃錯。
+        # （TrackedObstacleArray 資料訊息仍用 now() header，給 VO 規劃器做精確時間對齊用。）
+        marker_header = Header()
+        marker_header.frame_id = self.det_frame_id
+
         out = TrackedObstacleArray()
         out.header = header
         markers = MarkerArray()
@@ -251,7 +257,7 @@ class VOInterfaceNode(Node):
             out.obstacles.append(ob)
 
             if self.marker_pub is not None:
-                markers.markers.extend(self._track_markers(trk, header, px, py, vx, vy, radius))
+                markers.markers.extend(self._track_markers(trk, marker_header, px, py, vx, vy, radius))
 
         self.pub.publish(out)
         if self.marker_pub is not None:
