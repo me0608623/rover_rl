@@ -28,6 +28,7 @@ from rclpy.node import Node
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from campusrover_msgs.srv import RoutingPath, ModuleInfo
 from campusrover_msgs.msg import WorkingFloor
@@ -73,6 +74,13 @@ class RoutingToPathNode(Node):
         # 2Hz 定期重發最後一條路徑 + 站序，避免晚啟動的訂閱者（RViz / TUI）漏接
         self.create_timer(0.5, self._repub_path)
 
+        # 監聽手動 2D Goal Pose：使用者手點單一目標 = 放棄目前 routing 路徑。
+        # 收到就清掉緩存並停止 2Hz 重發，否則重發的舊 path 會持續蓋過手點目標
+        # （policy_node 端 path 優先於 single goal）。下次明確再呼叫 routing 才重新發。
+        topic_goal = self.declare_parameter(
+            "topic_goal_pose", "/goal_pose").get_parameter_value().string_value
+        self.create_subscription(PoseStamped, topic_goal, self._on_manual_goal, 5)
+
         # 發布 working_floor 觸發 routing 載入
         self.pub_floor = self.create_publisher(WorkingFloor, "working_floor", 5)
 
@@ -107,6 +115,15 @@ class RoutingToPathNode(Node):
             msg = String()
             msg.data = json.dumps(self._last_stations)
             self.pub_stations.publish(msg)
+
+    def _on_manual_goal(self, _msg: PoseStamped) -> None:
+        # 手動 2D Goal Pose → 放棄 routing 路徑：清緩存、停止 2Hz 重發。
+        if self._last_path is None and self._last_stations is None:
+            return
+        with self._lock:
+            self._last_path = None
+            self._last_stations = None
+        self.get_logger().info("收到手動 goal_pose → 停止 republish routing 路徑（手點目標接管）")
 
     def _fetch_nodes(self):
         # routing 用具名節點（c1/e0…），先抓拓撲節點表把路徑 snap 成站序。

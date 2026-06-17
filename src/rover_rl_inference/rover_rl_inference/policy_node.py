@@ -385,6 +385,12 @@ class PolicyNode(Node):
         # 因為此部署的 ndt_localizer 發的 /ndt_pose 是 map→odom 變換、不是車姿（見下方註解）。
         self.localizer = MapOdomOffsetTracker(logger=self.get_logger())
         self.subgoals = SubgoalSelector(lookahead_m=self.path_lookahead)
+        # routing_to_path 以 2Hz 無限 republish 同一條 /global_path；記住上次「真正換過」的
+        # 路徑簽章(長度+頭尾座標)，用來分辨「新路徑」與「同路徑重發」：
+        #  - 新路徑 → 開新 episode(reset RNN/計時)、prefer_path=True
+        #  - 同路徑重發 → 只刷新座標，不每 0.5s 狂 reset hidden
+        #  - 手動 2D Goal Pose 後設回 None，讓下一條(即使座標相同)的 routing 重新生效
+        self._last_path_sig: tuple | None = None
         self.cmd_filter = CmdFilter(self.cmd_filter_params)
         # 延遲估計（送出 cmd ↔ odom 實測），線速度/角速度各一
         _cmd_dt = 1.0 / max(self.cmd_rate_hz, 1.0)
@@ -572,6 +578,14 @@ class PolicyNode(Node):
         # 並重置 elapsed 計時（episode_horizon 從 0 起算），對齊訓練時每 episode 的初始狀態
         frame = msg.header.frame_id or self.goal_frame
         self.subgoals.set_single_goal(msg.pose.position.x, msg.pose.position.y, frame)
+        # 手動 2D Goal Pose = 放棄正在 republish 的 routing 路徑，讓手點目標立即生效。
+        # 清掉舊 path + 取消 prefer_path（否則 select() 會持續回傳舊 path 的 path_final，
+        # 新 goal 永遠被忽略——這是「path_final 到達後按 2D Goal Pose 沒反應」的主因）。
+        # 同時把 _last_path_sig 設回 None：搭配 routing_to_path 收到 /goal_pose 會停止重發，
+        # 之後即使再請求「同一條」routing 路徑也能被視為新路徑重新生效。
+        self.subgoals.clear_path()
+        self.subgoals.prefer_path = False
+        self._last_path_sig = None
         self.runner.reset()
         self.cmd_filter.reset()
         self._reset_act_hist()
@@ -584,11 +598,24 @@ class PolicyNode(Node):
     def _cb_path(self, msg: NavPath) -> None:
         if not msg.poses:
             self.subgoals.clear_path()
+            self._last_path_sig = None
             return
         frame = msg.header.frame_id or self.goal_frame
         pts = [(p.pose.position.x, p.pose.position.y) for p in msg.poses]
+        sig = (
+            len(pts),
+            round(pts[0][0], 2), round(pts[0][1], 2),
+            round(pts[-1][0], 2), round(pts[-1][1], 2),
+        )
+        if sig == self._last_path_sig:
+            # routing_to_path 2Hz 重發同一條 path：只刷新座標即可，
+            # 不要每 0.5s reset RNN hidden / 重置 episode 計時（會毀掉 RNN 記憶連續性）。
+            self.subgoals.set_path(pts, frame)
+            return
+        # 真的換了一條新路徑（含手動 goal 後重新請求 routing）：開新 episode。
+        self._last_path_sig = sig
         self.subgoals.set_path(pts, frame)
-        # 一旦收到 path 就讓 path 蓋過單一 goal_pose（routing 規劃出的路徑優先於手點目標）
+        # 收到（新）path 就讓 path 蓋過單一 goal_pose（routing 規劃出的路徑優先於手點目標）
         self.subgoals.prefer_path = True
         self.runner.reset()
         self.cmd_filter.reset()
@@ -846,6 +873,13 @@ class PolicyNode(Node):
         # path_lookahead 的 carrot 會一直往前滑，不該因「接近 carrot」就判定到達；
         # 只有 single goal / path 終點等真正終點才用 goal_tolerance 判停
         if choice.source != "path_lookahead" and dist < self.goal_tolerance:
+            # 到達也要更新 subgoal_body，否則 status/marker 的 goal 凍結在停車前約
+            # goal_tolerance 的舊位置 → TUI 黃◆ 永遠差一個 tolerance、不與中心重疊
+            # （RViz 走真實 TF 正確重疊，兩邊對不上）。停車後續 tick 仍會用真實車姿
+            # 重算這裡的 (gx,gy)，讓 ◆ 收斂到真實殘餘距離。
+            with self._lock:
+                self._last_subgoal_body = (gx, gy)
+                self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
             return self._set_target_stop(
                 f"到達 {choice.source} (dist={dist:.2f})", warn=False,
             )
