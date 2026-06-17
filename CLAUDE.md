@@ -409,9 +409,15 @@ deploy_rl_stop       # 停止整個棧
 - `deploy_rl` = 純 `ros2 launch deploy_full`，前景滾動 log。**Claude / 非互動 shell 用這個**（curses 在 pipe 會卡死，故 deploy_rl 不含 TUI）。Claude 要看狀態改用 `ros2 topic echo /rover_rl_policy/status`（JSON）。
 - `deploy_rl_shell` → `bash ~/rover_rl/deploy_rl_shell.sh`（**給人在真實終端機用**）：
   1. **TTY 守門**：偵測非互動（`! -t 0/1`）→ 友善退出不硬跑 curses
-  2. `ros2 launch deploy_full` 丟**背景**，log 導到 `~/rover_rl/logs/deploy_<時間>.log`
-  3. 等 `rover_rl_policy` 起來 → 前景跑 `status_tui`（curses 取得真實 TTY）
-  4. 按 `q` 或 Ctrl+C → trap（`trap - EXIT INT TERM` 先解除自身避免重入，**不用 `''` 遮蔽訊號**）呼叫 `rover_rl_stop.sh` 收棧
+  2. **launch 前兩段互動詢問**（命令列已帶同名參數則各自跳過、尊重覆寫）：
+     - **選 checkpoint**：列 `~/rover_rl/models/*.ts`，Enter=沿用 yaml 預設；選到 `*v3c*` 自動帶 v3c config
+     - **是否啟用 VO 安全層**：`[Y/n]（Enter=啟用）`。選 Y→`enable_vo:=true`、n→`enable_vo:=false`。
+       預設啟用（沿用原行為）；啟用後 policy 改道 `/rover_rl/cmd_vel_desired`→vo_safety→mux，
+       且 TUI 多顯示「VO / VO參數」兩列。⚠ 此腳本預設不開 lv-dot → 即使選啟用，沒另開 `lv-dot`
+       時 VO 無障礙來源、退化為「放行 + ω 限幅」（TUI 顯示「放行（障礙源逾時/未偵測）」），這是正常安全退化。
+  3. `ros2 launch deploy_full` 丟**背景**（帶上選定的 model_path / `$VO_ARG`），log 導到 `~/rover_rl/logs/deploy_<時間>.log`
+  4. 等 `rover_rl_policy` 起來 → 前景跑 `status_tui`（curses 取得真實 TTY）
+  5. 按 `q` 或 Ctrl+C → trap（`trap - EXIT INT TERM` 先解除自身避免重入，**不用 `''` 遮蔽訊號**）呼叫 `rover_rl_stop.sh` 收棧
 
 **為何不把 TUI 放進 launch**：launch 子行程無 TTY，curses 會崩；故採「launch 背景 + TUI 前景」分離，且只在 `deploy_rl_shell` 提供。
 
@@ -620,6 +626,17 @@ ros2 run rover_rl_inference routing_click_bridge
 - **LV-DOT 動態障礙**：儀表板「動態」列**直接訂閱** `/onboard_detector/dynamic_bboxes`（MarkerArray，
   與 policy 解耦，policy 推論不吃此資料、obs 障礙欄仍補 0）。顯示動態障礙框數；未啟動→灰、
   >2s 無更新→黃「偵測器可能死」、0 個→綠。topic 可用 `topic_dynamic_bboxes` 參數改。
+- **VO 安全層（2026-06-16 加入）**：`vo_safety_node` 以 ~5Hz 發 `~/status`（`/vo_safety_node/status`,
+  std_msgs/String JSON，純觀察不影響控制）；TUI 訂閱後在「動態」列下多畫**兩列**，與 LV-DOT 同款解耦
+  （`enable_vo` 沒開 / 收不到 status → **自動隱藏這兩列**，topic 可用 `topic_vo_status` 參數改）：
+  - **「VO」列（介入狀態，依嚴重度上色）**：紅`⚠ 看門狗發 0（odom/RL 逾時）`、紅`⛔ 全堵死→停車（近障N）`、
+    黃粗`介入中 RL(v,w)→(v,w) 近障N 可行M`、黃`放行（障礙源逾時/未偵測，僅 ω 限幅）`、
+    青`監看中（近障N，未改寫放行）`、綠`✓ 放行（無近障）`。判據同 vo_safety 的 log
+    （`intervening = engaged 且 VO 解明顯偏離 RL 意圖`）。
+  - **「VO參數」列**：`ω≤{w_max} 預測{horizon}s 觸發{engage_range}m 餘裕{margin}m 追蹤{n_tracked}`，
+    對應 `vo_params.yaml`，現場確認 VO 用哪組參數。
+  - ⚠ `deploy_rl_shell` 詢問啟用 VO 但沒另開 `lv-dot` 時，VO 列固定顯示「放行（障礙源逾時/未偵測）」
+    （無 `vo_interface/tracked_obstacles` 障礙來源）——正常安全退化，要看到真正介入需同時 `lv-dot`。
 - **右側 LiDAR 雷達（2026-06-09 加入）**：主框右邊空白區多開一個子視窗，把 BEV 的極座標散點
   **用純文字重畫**（不把 `/rover_rl/bev_image` 點陣圖塞進 curses——curses 不支援影像、且吃終端機）。
   **直接訂閱 `/rover_rl/lidar_sweep_72`**（與 status JSON 解耦，狀態逾時也能看 LiDAR），反算公尺後

@@ -5,20 +5,27 @@ vo_safety_node:
     topic_cmd_in: "/rover_rl/cmd_vel_desired"   # RL 原始期望 cmd（VO 輸入）
     topic_cmd_out: "/input/nav_cmd_vel"         # VO 處理後送 mux 的 cmd
     topic_odom: "/odom"                          # 當前速度/朝向來源
-    service_obstacles: "onboard_detector/get_dynamic_obstacles"   # LV-DOT 動態障礙 service
+    topic_obstacles: "/vo_interface/tracked_obstacles"   # vo_interface KF 平滑追蹤（持久ID+平滑速度）
+    topic_goal_status: "/rover_rl_policy/status"   # policy status JSON → 取 goal_dist/goal_ang_deg 當 VO goal 導向
 
-    # --- 看門狗（fail-safe）---
-    timeout_desired_s: 0.5      # RL cmd 逾時 → 發 0
-    timeout_odom_s: 0.3         # odom 逾時 → 發 0
-    timeout_obstacles_s: 1.0    # 障礙快取逾時 → 視為無障礙（靜態仍由 RL sweep 擋）
+    # --- 看門狗（fail-safe）：盯每路輸入有沒有按時來，逾時就進安全行為 ---
+    # 逾時門檻 ≈ 正常週期的 2~3 倍，偶爾掉一兩幀不會誤判。
+    timeout_desired_s: 0.5      # RL 期望 cmd 斷線(>0.5s 沒新指令) → 發 0 停車（命脈，不能用舊指令亂跑）
+    timeout_odom_s: 0.3         # odom 斷線(>0.3s) → 發 0 停車（連自己車速都不知，碰撞預測算不了）
+    timeout_obstacles_s: 1.0    # 動態障礙源斷線(>1.0s) → 放行不停車（只是加分避障；靜態仍由 RL 的 LiDAR sweep 擋）
+    timeout_goal_s: 1.5         # goal(policy status) 斷線(>1.5s) → 視為無 goal，goal 導向項自動關（退回純貼近 RL）
+
+    # --- 障礙速度雜訊濾門（非看門狗）：障礙物的「速度」估得準不準才信 ---
+    min_vel_confidence: 0.0     # vo_interface 每個 track 附 vel_confidence(0~1)；低於此門檻 →
+                                # 丟掉該 track 速度、只當靜態位置避（仍會避，不會被假速度嚇到急煞）。
+                                # 0.0=全收不過濾；調高(如0.3)濾掉剛冒出、KF 未收斂的年輕 track 假速度，更不易亂煞。
 
     # --- 頻率 ---
     ctrl_rate_hz: 20.0          # 控制輸出（= dynamic window 可達時間 ctrl_dt 來源）
-    obstacle_poll_hz: 15.0      # 輪詢 LV-DOT service
 
     # --- 輸出硬上限（對齊底盤真實能力）---
     v_max: 1.0                  # 線速度輸出上限(m/s)
-    v_min: -1.0                 # 線速度輸出下限(m/s，允許倒退)
+    v_min: -0.2                 # 線速度輸出下限(m/s，允許倒退)
     w_max: 1.2                  # ★底盤真實上限；順便壓掉 RL 可能叫出的 2.0（sim-to-real gap #2）
     accel_v: 1.2               # 對齊底盤 acc_max（候選窗 + 輸出 slew 共用）
     accel_w: 3.0               # 角加速度上限(rad/s²)
@@ -30,17 +37,29 @@ vo_safety_node:
     n_w: 15                    # 角速度取樣數
 
     # --- 軌跡 rollout（碰撞預測）---
-    horizon: 2.0               # s，往前預測多久；振盪時可調小
+    # ⚠ horizon 是「VO 太保守」的最大旋鈕：rollout 假設機器人用同一組 (v,ω) 凍結直開
+    # horizon 秒，無法表達 RL 的動態繞行（先轉再拉直）→ horizon 太長會把 RL 可繞的候選
+    # 誤判成會撞、只剩停車。實測 3.0 過保守（RL 想轉繞卻被壓停），1.2 讓 RL 動態繞行有空間。
+    horizon: 0.8               # s，往前預測多久（1.2 過保守→轉彎弧線都判會撞只剩停車；0.8 讓繞行解可行，想更敢繞可再降 0.6）
     sim_dt: 0.1                # s，rollout 步長
 
     # --- 安全幾何 ---
     r_robot: 0.35              # 與訓練/底盤一致
-    margin: 0.10              # 額外安全餘裕；首次部署可調大到 0.2~0.3 更保守
+    margin: 0.10              # 額外安全餘裕（太大會膨脹障礙讓候選變不可行→愛停車；0.10 放行更多繞行弧線，激進可 0.08）
     obstacle_radius_max: 1.5  # bbox 換算半徑上限，防超大誤框把整條路擋死
 
     # --- 成本權重（越大越貼近 RL 該通道意圖）---
     w_v: 1.0                   # 線速度貼合 RL 意圖的權重
-    w_w: 0.3                   # 角速度貼合 RL 意圖的權重
+    w_w: 0.15                  # 角速度貼合 RL 意圖的權重（越小→轉彎越「便宜」，VO 更願繞而非慢/停；激進可 0.1）
+
+    # --- goal 導向項（解決「只停不繞」）---
+    # RL 看不到動態障礙(obs補0)→只會直走；VO 原本只「貼近 RL 直走」→被擋只能慢/停。
+    # 此項讓可行弧線多比一個「終點朝向 vs 終點→goal 方位」的夾角誤差：直走被擋時，
+    # VO 改偏好「繞過障礙又重新對準 goal」的弧線 = 主動繞行。goal 取自 policy status 的
+    # body-frame goal_dist/goal_ang_deg（frame-independent，配 odom_yaw 反推 odom 座標）。
+    # ⚠ 必須 < w_v：只在直走被擋、要選繞行側時主導；路徑暢通時 RL 命令仍勝出（零偏差放行）。
+    # 0=關（舊行為）；0.4=建議起點；想更敢繞拉到 0.6~0.8，太大會在障礙旁過度修正抽動。
+    w_goal: 0.4
 
     # --- 啟動距離（障礙進入此範圍才跑 VO）---
-    engage_range: 6.0
+    engage_range: 3.0          # 5.0：遠處障礙交給 RL，VO 只在較近時介入（7.0 過早搶 RL 的繞行）

@@ -54,6 +54,10 @@ class VOParams:
     # --- 成本權重（越大越貼近 RL 該通道；線速度通常較重要）---
     w_v: float = 1.0
     w_w: float = 0.3
+    # --- goal 導向項：可行弧線 rollout 終點朝向 vs 終點→goal 方位的夾角誤差權重 ---
+    # 0.0=關（純貼近 RL，遇障只會慢/停）；>0=被擋時偏好「繞過去又重新對準 goal」的弧線。
+    # ⚠ 應 < w_v：goal 項只在直走被擋、需要選繞行側時主導；路徑暢通時 RL 命令仍應勝出。
+    w_goal: float = 0.0
     # --- 啟動條件：障礙進入此距離才跑 VO（省運算、避免遠處誤煞）---
     engage_range: float = 6.0   # m
 
@@ -97,6 +101,15 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     return x
 
 
+def _ang_norm(a: float) -> float:
+    """把角度 wrap 到 [-π, π]。"""
+    while a > math.pi:
+        a -= 2.0 * math.pi
+    while a < -math.pi:
+        a += 2.0 * math.pi
+    return a
+
+
 def _linspace(lo: float, hi: float, n: int) -> list[float]:
     if n <= 1 or hi <= lo:
         return [lo]
@@ -104,13 +117,15 @@ def _linspace(lo: float, hi: float, n: int) -> list[float]:
     return [lo + step * i for i in range(n)]
 
 
-def _rollout_min_ttc(v: float, w: float, robot: RobotState,
-                     obstacles: list[Obstacle], p: VOParams) -> float:
-    """以等速 (v, w) rollout 機器人弧線，回傳 horizon 內最近碰撞時間；無碰撞回 inf.
+def _rollout(v: float, w: float, robot: RobotState,
+             obstacles: list[Obstacle], p: VOParams) -> tuple[float, float, float, float]:
+    """以等速 (v, w) rollout 機器人弧線，回 (min_ttc, end_x, end_y, end_yaw).
 
     機器人：θ(t)、x(t)、y(t) 由 (v, w) 積分（odom frame）。
     障礙：線性外推 p_i + v_i·t（假設等速，短 horizon 內合理）。
     碰撞：中心距 < r_robot + r_obs + margin。
+    - 無碰撞：min_ttc=inf，end_* 為 horizon 終點位姿（給 goal 導向成本用）。
+    - 有碰撞：min_ttc=碰撞時刻 t，end_* 為碰撞當下位姿（候選會被淘汰，end_* 不使用）。
     """
     steps = max(1, int(round(p.horizon / p.sim_dt)))
     x, y, yaw = robot.x, robot.y, robot.yaw
@@ -127,13 +142,19 @@ def _rollout_min_ttc(v: float, w: float, robot: RobotState,
             dx = x - ox
             dy = y - oy
             if dx * dx + dy * dy <= rr * rr:
-                return t  # 在 t 秒碰撞
-    return math.inf
+                return t, x, y, yaw  # 在 t 秒碰撞
+    return math.inf, x, y, yaw
 
 
 def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
-                     obstacles: list[Obstacle], p: VOParams) -> VOResult:
-    """VO 主入口：給 RL 期望速度 + 障礙，回最接近且安全的 (v, w)。"""
+                     obstacles: list[Obstacle], p: VOParams,
+                     goal: tuple[float, float] | None = None) -> VOResult:
+    """VO 主入口：給 RL 期望速度 + 障礙，回最接近且安全的 (v, w)。
+
+    goal（odom frame, 選填）：提供時且 p.w_goal>0，成本多加「弧線終點朝向 vs
+    終點→goal 方位」的夾角誤差項，讓直走被擋時 VO 偏好「繞過去又對準 goal」的弧線，
+    而非只挑最貼近 RL 直走的（常是慢/停）。不提供→退回純貼近 RL 行為。
+    """
     # 1) desired clamp 進上限（ω 壓到底盤真實 w_max）
     v_des = _clamp(v_des, p.v_min, p.v_max)
     w_des = _clamp(w_des, -p.w_max, p.w_max)
@@ -165,16 +186,24 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
     if w_lo <= 0.0 <= w_hi:
         w_cands.append(0.0)
 
-    # 4-5) 掃所有候選，挑「可行且最貼近 desired」者
+    # 4-5) 掃所有候選，挑「可行且成本最低」者
+    #   成本 = w_v·Δv² + w_w·Δω²（貼近 RL）+ w_goal·heading_err²（朝 goal 繞行，選填）
+    use_goal = goal is not None and p.w_goal > 0.0
     best: tuple[float, float] | None = None
     best_cost = math.inf
     best_ttc = math.inf
     n_feasible = 0
     for v in v_cands:
         for w in w_cands:
-            if _rollout_min_ttc(v, w, robot, near, p) == math.inf:  # horizon 內不撞
+            ttc, ex, ey, eyaw = _rollout(v, w, robot, near, p)
+            if ttc == math.inf:  # horizon 內不撞
                 n_feasible += 1
                 cost = p.w_v * (v - v_des) ** 2 + p.w_w * (w - w_des) ** 2
+                if use_goal:
+                    # 弧線終點朝向與「終點→goal」方位的夾角誤差（越小=越對準 goal）
+                    bearing = math.atan2(goal[1] - ey, goal[0] - ex)
+                    herr = _ang_norm(bearing - eyaw)
+                    cost += p.w_goal * herr * herr
                 if cost < best_cost:
                     best_cost = cost
                     best = (v, w)

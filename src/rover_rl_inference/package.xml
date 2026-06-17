@@ -15,7 +15,8 @@
   <depend>visualization_msgs</depend>
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
-  <depend>onboard_detector</depend>  <!-- VO 安全層用 GetDynamicObstacles service -->
+  <depend>onboard_detector</depend>  <!-- status_tui 用 onboard_detector 介面 -->
+  <depend>vo_interface</depend>      <!-- VO 安全層吃 vo_interface/tracked_obstacles -->
   <exec_depend>python3-matplotlib</exec_depend>
 
   <export>

@@ -434,8 +434,8 @@ def generate_launch_description():
 
     # ── Part 11: VO 安全層（夾在 RL policy 與底盤 mux 之間）──
     # policy → /rover_rl/cmd_vel_desired → [vo_safety] → /input/nav_cmd_vel → mux
-    # 用 LV-DOT 的 get_dynamic_obstacles service 做動態障礙預測式避障濾波。
-    # ⚠️ 預設 enable_vo=false：這是新的安全關鍵層，請先架空 + 單獨驗證行為後再開。
+    # 吃 vo_interface/tracked_obstacles（KF 平滑速度）做動態障礙預測式避障/煞停濾波。
+    # ⚠️ enable_vo 預設跟隨 enable_lvdot；首次仍請先架空 + 單獨驗證行為。
     vo_params = os.path.join(rl_pkg, "config", "vo_params.yaml")
     vo_safety_node = Node(
         package="rover_rl_inference",
@@ -504,10 +504,12 @@ def generate_launch_description():
                               description="LV-DOT 動態障礙物偵測（→ /onboard_detector/*）"),
         DeclareLaunchArgument("enable_lvdot_yolo", default_value="false",
                               description="LV-DOT YOLOv11 視覺輔助（需 ultralytics，預設關）"),
-        DeclareLaunchArgument("enable_vo", default_value="false",
-                              description="VO 安全層（RL→VO→mux，用 LV-DOT 動態障礙避障）。"
-                                          "新的安全關鍵層，驗證前預設關；開啟同時會把 "
-                                          "policy 輸出改道到 /rover_rl/cmd_vel_desired"),
+        DeclareLaunchArgument("enable_vo", default_value=LaunchConfiguration("enable_lvdot"),
+                              description="VO 安全層（RL→VO→mux，吃 vo_interface 動態障礙避障）。"
+                                          "預設跟隨 enable_lvdot（有 LV-DOT 才開 VO，因 VO 障礙來自 "
+                                          "vo_interface/tracked_obstacles，需 lv-dot 在跑）；開啟同時會把 "
+                                          "policy 輸出改道到 /rover_rl/cmd_vel_desired。"
+                                          "首次驗證可顯式 enable_vo:=false 關閉"),
         DeclareLaunchArgument("map_file",
                               default_value="/home/aa/maps/4v3F.yaml"),
         DeclareLaunchArgument("log_level", default_value="info"),

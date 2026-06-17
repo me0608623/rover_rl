@@ -63,11 +63,13 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_dynamic_bboxes", "/onboard_detector/dynamic_bboxes")
         self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
         self.declare_parameter("topic_route_stations", "/rover_rl/route_stations")
+        # VO 安全層狀態（enable_vo:=true 才有此 topic；收不到→自動隱藏 VO 列）
+        self.declare_parameter("topic_vo_status", "/vo_safety_node/status")
         # 右側 LiDAR 雷達（重畫 BEV 的極座標散點，不吃 bev_image 影像）
         self.declare_parameter("topic_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("enable_radar", True)
         self.declare_parameter("radar_style", "braille")   # braille / dots，可熱切換
-        self.declare_parameter("radar_range_m", 10.0)      # 雷達顯示半徑（>此距離貼邊）
+        self.declare_parameter("radar_range_m", 5.0)       # 雷達顯示半徑（>此距離貼邊）
         self.declare_parameter("r_max", 20.0)              # 與 preprocessor 正規化對齊
         self.declare_parameter("r_robot", 0.35)
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
@@ -76,6 +78,7 @@ class StatusTuiNode(Node):
         topic_diag = self.get_parameter("topic_diag_event").get_parameter_value().string_value
         topic_stations = self.get_parameter(
             "topic_route_stations").get_parameter_value().string_value
+        topic_vo = self.get_parameter("topic_vo_status").get_parameter_value().string_value
         topic_sweep = self.get_parameter("topic_sweep").get_parameter_value().string_value
         self._radar_range = float(self.get_parameter("radar_range_m").value)
         self._r_max = float(self.get_parameter("r_max").value)
@@ -89,12 +92,15 @@ class StatusTuiNode(Node):
         self._diag_event_t = 0.0
         self._stations: dict | None = None    # routing 具名站序 {stations, wp_idx, n_wp}
         self._stations_t = 0.0
+        self._vo: dict | None = None           # VO 安全層狀態；None=VO 未啟動/沒收到
+        self._vo_t = 0.0
         self._sweep: list | None = None        # 72-bin 正規化 sweep（畫雷達用）
         self._sweep_t = 0.0
         self.create_subscription(String, topic, self._cb_status, 10)
         self.create_subscription(MarkerArray, topic_dyn, self._cb_dyn, 10)
         self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
         self.create_subscription(String, topic_stations, self._cb_stations, 10)
+        self.create_subscription(String, topic_vo, self._cb_vo, 10)
         self.create_subscription(Float32MultiArray, topic_sweep, self._cb_sweep, 10)
         self._topic = topic
 
@@ -133,6 +139,15 @@ class StatusTuiNode(Node):
             self._stations = data
             self._stations_t = time.monotonic()
 
+    def _cb_vo(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._vo = data
+            self._vo_t = time.monotonic()
+
     def _cb_sweep(self, msg: Float32MultiArray) -> None:
         with self._lock:
             self._sweep = list(msg.data)
@@ -143,7 +158,8 @@ class StatusTuiNode(Node):
             return (self._status, self._last_t, self._lvdot_n, self._lvdot_t,
                     self._diag_event, self._diag_event_t,
                     self._stations, self._stations_t,
-                    self._sweep, self._sweep_t)
+                    self._sweep, self._sweep_t,
+                    self._vo, self._vo_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -224,12 +240,13 @@ class Dashboard:
 
     def _render(self, stdscr) -> None:
         (status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t,
-         stations, stations_t, sweep, sweep_t) = self.node.snapshot()
+         stations, stations_t, sweep, sweep_t, vo, vo_t) = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
         age = now - last_t if last_t else float("inf")
         lvdot_age = now - lvdot_t if lvdot_t else float("inf")
+        vo_age = now - vo_t if vo_t else float("inf")
         stale = age > 1.5
 
         stdscr.erase()
@@ -256,7 +273,7 @@ class Dashboard:
                     and diag_event.get("event") == "goal_reached"
                     and (now - diag_event_t) < 10.0))
             rows = self._build_rows(status, lvdot_n, lvdot_age, station_info,
-                                    goal_reached)
+                                    goal_reached, vo, vo_age)
             # 有具名站序 → 畫站名地鐵線；否則退回幾何進度條（起→O→終）
             show_route = station_info is not None
             show_subway = (not show_route and is_path and pn and pn >= 2
@@ -424,7 +441,7 @@ class Dashboard:
                 continue
             d = real if real < rng else rng  # 超出顯示半徑 → 貼邊
             ang = math.radians(-180.0 + i * (360.0 / n))
-            dx = int(round(cx + d * math.sin(ang) * scale))   # +右
+            dx = int(round(cx - d * math.sin(ang) * scale))   # 左(+y)畫左
             dy = int(round(cy - d * math.cos(ang) * scale))   # +上（前方）
             if not (0 <= dx < wd and 0 <= dy < hd):
                 continue
@@ -441,7 +458,7 @@ class Dashboard:
                 pass
         self._radar_overlays(win, rows, cols, status,
                              lambda sx, sy: ((cy - sy * scale) // 4,
-                                             (cx + sx * scale) // 2))
+                                             (cx - sx * scale) // 2))
 
     def _radar_dots(self, win, rows: int, cols: int, sweep, status) -> None:
         r_max, r_robot = self.node._r_max, self.node._r_robot
@@ -455,7 +472,7 @@ class Dashboard:
                 continue
             d = real if real < rng else rng
             ang = math.radians(-180.0 + i * (360.0 / n))
-            col = int(round(hx + (d * math.sin(ang) / rng) * hx))
+            col = int(round(hx - (d * math.sin(ang) / rng) * hx))
             row = int(round(hy - (d * math.cos(ang) / rng) * hy))
             if not (0 <= col < cols and 0 <= row < rows):
                 continue
@@ -465,7 +482,7 @@ class Dashboard:
                 pass
         self._radar_overlays(win, rows, cols, status,
                              lambda sx, sy: (hy - (sy / rng) * hy,
-                                             hx + (sx / rng) * hx))
+                                             hx - (sx / rng) * hx))
 
     def _radar_overlays(self, win, rows: int, cols: int, status, w2c) -> None:
         """疊上機器人（中心↑）與 goal（黃◆）。w2c: (sx,sy)世界→(row,col)格映射。"""
@@ -612,8 +629,41 @@ class Dashboard:
             return 2   # 黃：注意
         return 1       # 綠
 
+    @staticmethod
+    def _vo_rows(vo: dict) -> list[tuple[str, str, int, bool]]:
+        """VO 安全層兩列：①介入狀態 ②參數狀況。enable_vo 才有資料，否則整段不畫。"""
+        fail = vo.get("fail") or ""
+        if fail:
+            reason = {"odom": "odom 逾時", "desired": "RL 逾時"}.get(fail, fail)
+            vo_txt, vo_pair, vo_bold = f"⚠ 看門狗發 0（{reason}）", 3, True
+        elif vo.get("blocked"):
+            vo_txt = f"⛔ 全堵死 → 停車（近障 {vo.get('n_obs', 0)}）"
+            vo_pair, vo_bold = 3, True
+        elif vo.get("intervening"):
+            vo_txt = (
+                f"介入中 RL({_fmt(vo.get('des_v'), '+.2f')},{_fmt(vo.get('des_w'), '+.2f')})"
+                f"→({_fmt(vo.get('vo_v'), '+.2f')},{_fmt(vo.get('vo_w'), '+.2f')}) "
+                f"近障{vo.get('n_obs', 0)} 可行{vo.get('n_feasible', 0)}")
+            vo_pair, vo_bold = 2, True
+        elif vo.get("obs_stale"):
+            vo_txt, vo_pair, vo_bold = "放行（障礙源逾時/未偵測，僅 ω 限幅）", 2, False
+        elif vo.get("engaged"):
+            vo_txt, vo_pair, vo_bold = f"監看中（近障 {vo.get('n_obs', 0)}，未改寫放行）", 4, False
+        else:
+            vo_txt, vo_pair, vo_bold = "✓ 放行（無近障）", 1, False
+
+        params_txt = (
+            f"ω≤{_fmt(vo.get('w_max'), '.1f')} 預測{_fmt(vo.get('horizon'), '.1f')}s "
+            f"觸發{_fmt(vo.get('engage_range'), '.0f')}m 餘裕{_fmt(vo.get('margin'), '.2f')}m "
+            f"追蹤{vo.get('n_tracked', 0)}")
+        return [
+            ("VO", vo_txt, vo_pair, vo_bold),
+            ("VO參數", params_txt, 5, False),
+        ]
+
     def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf"),
-                    station_info=None, goal_reached=False
+                    station_info=None, goal_reached=False,
+                    vo=None, vo_age=float("inf")
                     ) -> list[tuple[str, str, int, bool]]:
         # 把 status JSON 整理成儀表板每一列 (標籤, 數值字串, 顏色pair, 粗體)。
         # 渲染層只負責畫，所有「該紅該黃」的健康度判斷都集中在這裡。
@@ -733,7 +783,7 @@ class Dashboard:
         else:
             lvdot_txt, lvdot_pair = f"{lvdot_n} 個動態障礙", 2
 
-        return [
+        rows = [
             ("模式", mode_txt, mode_pair, True),
             ("速度v", v_txt, v_pair, False),
             ("速度ω", w_txt, w_pair, w_over),
@@ -741,6 +791,11 @@ class Dashboard:
             ("RNN", rnn_txt, rnn_pair, False),
             ("障礙", obst_txt, obst_pair, obst_pair == 3),
             ("動態", lvdot_txt, lvdot_pair, False),
+        ]
+        # VO 安全層（enable_vo 才有 status；收不到/逾時就不畫，自動隱藏）
+        if vo is not None and vo_age < 1.5:
+            rows.extend(self._vo_rows(vo))
+        rows += [
             ("LiDAR", lidar_txt, 3 if not lidar_ok else 1, False),
             ("里程計", odom_txt, 1 if odom_ok else 3, False),
             ("NDT", ndt_txt, 1 if ndt_ok else 2, False),
@@ -750,6 +805,7 @@ class Dashboard:
             ("目標", goal_txt, goal_pair, goal_bold),
             ("模型", model_txt, 5, False),
         ]
+        return rows
 
 
 def main(args=None) -> None:
