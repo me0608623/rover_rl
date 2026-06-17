@@ -178,6 +178,15 @@ class PolicyNode(Node):
         self.declare_parameter("act_stack_size", 2)
         self.declare_parameter("act_stack_a_max", 0.2)
         self.declare_parameter("act_stack_omega_max", math.pi / 15.0)
+        # v3d/v3e: act_hist 編碼模式 + action_error err 來源
+        #   act_hist_mode: "auto"=讀模型 <model>.obs_spec.json 的 act_hist_mode；
+        #                  "raw"/"action_error"/"delta" 可顯式覆寫。
+        #   act_hist_err_source: action_error 模式下 obs[81:83] err 來源
+        #                  "measured"=(上拍指令 − odom 實測)/v_max；"zero"=填 0（穩態近似）。
+        self.declare_parameter("act_hist_mode", "auto")
+        self.declare_parameter("act_hist_err_source", "measured")
+        self.declare_parameter("act_err_v_max", 1.0)   # err_v 正規化分母（訓練 max_linear_velocity）
+        self.declare_parameter("act_err_w_max", 1.2)   # err_w 正規化分母（訓練 max_angular_vel）
         # goal / localization
         self.declare_parameter("goal_frame", "map")
         self.declare_parameter("base_frame", "base_footprint")
@@ -260,6 +269,10 @@ class PolicyNode(Node):
         self.act_stack_size = max(1, int(gp("act_stack_size").value))
         self.act_stack_a_max = max(float(gp("act_stack_a_max").value), 1e-6)
         self.act_stack_omega_max = max(float(gp("act_stack_omega_max").value), 1e-6)
+        self.act_hist_mode_param = str(gp("act_hist_mode").value).strip().lower()
+        self.act_hist_err_source = str(gp("act_hist_err_source").value).strip().lower()
+        self.act_err_v_max = max(float(gp("act_err_v_max").value), 1e-6)
+        self.act_err_w_max = max(float(gp("act_err_w_max").value), 1e-6)
         self.cmd_delay_comp_s = self._clamp_comp(float(gp("cmd_delay_comp_s").value))
         self.cmd_delay_comp_enable = bool(gp("cmd_delay_comp_enable").value)
         self.cmd_delay_comp_src = self._clamp_src(
@@ -292,6 +305,31 @@ class PolicyNode(Node):
         self.runner = PolicyRunner(self.bundle)
         # 83D bundle → 啟用 action stacking（mirror 訓練端 action history）
         self.use_act_stack = (self.bundle.raw_obs_dim == 83)
+        self._act_hist_mode = (self._resolve_act_hist_mode(self._model_path)
+                               if self.use_act_stack else "raw")
+        if self.use_act_stack:
+            self.get_logger().info(
+                f"[act_hist] mode={self._act_hist_mode}"
+                + (f" err_source={self.act_hist_err_source}"
+                   if self._act_hist_mode == "action_error" else ""))
+
+    def _resolve_act_hist_mode(self, model_path: str) -> str:
+        """決定 act_hist 編碼模式：param 顯式覆寫優先，否則讀模型旁 <model>.obs_spec.json
+        的 act_hist_mode。找不到 sidecar → 預設 "raw"（向後相容 v3c/v2 舊模型）。
+        語義隨模型走，避免換 checkpoint 後車端用錯 act_hist 填法。"""
+        if self.act_hist_mode_param in ("raw", "action_error", "delta"):
+            return self.act_hist_mode_param
+        try:
+            spec_path = os.path.splitext(model_path)[0] + ".obs_spec.json"
+            if os.path.isfile(spec_path):
+                with open(spec_path, "r", encoding="utf-8") as fh:
+                    return str(json.load(fh).get("act_hist_mode", "raw")).strip().lower()
+            else:
+                self.get_logger().warn(
+                    f"[act_hist] 無 {os.path.basename(spec_path)}，退回 raw 模式")
+        except Exception as e:
+            self.get_logger().warn(f"[act_hist] 讀 obs_spec.json 失敗，退回 raw: {e}")
+        return "raw"
 
     # ──────────────────────────── 狀態與元件 ────────────────────────────
 
@@ -311,6 +349,12 @@ class PolicyNode(Node):
         self._odom_w = 0.0
         self._odom_t = 0.0
         self._last_accel = 0.0
+        # action_error 模式狀態：上一拍 policy-frame 指令速度 + 本拍要嵌入的 err（2D）
+        self._last_cmd_v_pf = 0.0
+        self._last_cmd_w_pf = 0.0
+        self._act_hist_err = np.zeros(2, dtype=np.float32)
+        if not hasattr(self, "_act_hist_mode"):
+            self._act_hist_mode = "raw"   # 正常已由 _load_model 設好；防呆
         # action stacking buffer（v3c）：存近 N 步「正規化後動作 [a,ω]」，appendleft 最新。
         # 79/139D 模型不會用到（use_act_stack=False），但仍維護以簡化重置邏輯。
         self._act_hist: collections.deque = collections.deque(
@@ -599,6 +643,8 @@ class PolicyNode(Node):
             self.cmd_filter.reset()
             # 換模型可能換 obs 維度 → 重判 action stacking 是否啟用並清空 history
             self.use_act_stack = (new_bundle.raw_obs_dim == 83)
+            self._act_hist_mode = (self._resolve_act_hist_mode(new_path)
+                                   if self.use_act_stack else "raw")
             self._reset_act_hist()
             self._model_path = new_path
             res.success = True
@@ -689,10 +735,19 @@ class PolicyNode(Node):
                 [np.zeros(2, dtype=np.float32) for _ in range(self.act_stack_size)],
                 maxlen=self.act_stack_size,
             )
+            self._last_cmd_v_pf = 0.0
+            self._last_cmd_w_pf = 0.0
+            self._act_hist_err = np.zeros(2, dtype=np.float32)
 
     def _act_hist_flat(self) -> np.ndarray:
-        """把 deque 攤平成 [a_t-1, ω_t-1, a_t-2, ω_t-2, ...]（最新在前）。"""
+        """攤平成 4D obs[79:83]。
+        raw/delta:   [a_t-1, ω_t-1, a_t-2, ω_t-2]（最新在前）。
+        action_error:[a_t-1, ω_t-1, err_v, err_w]——後 2 維換成致動追蹤誤差
+                     （訓練端 v3d/v3e 語義；err 由 _tick_inference 先算好存 _act_hist_err）。"""
         with self._lock:
+            if self._act_hist_mode == "action_error":
+                a_tm1 = self._act_hist[0]   # [a_t-1, ω_t-1]（上一拍已 push）
+                return np.concatenate([a_tm1, self._act_hist_err]).astype(np.float32)
             return np.concatenate(list(self._act_hist)).astype(np.float32)
 
     def _push_act_hist(self, accel: float, cmd_w: float) -> None:
@@ -844,6 +899,18 @@ class PolicyNode(Node):
             g_inflate_y *= s
 
         # RL 推論（餵入「感知世界」的放大量）
+        # action_error 模式：先算「上一拍指令 vs 本拍 odom 實測」的致動追蹤誤差（policy-frame，
+        # 與 ego 速度同樣 ×inv）。1 步延遲 = odom 實測本身就是上一拍指令的實現結果。
+        if self.use_act_stack and self._act_hist_mode == "action_error":
+            if self.act_hist_err_source == "zero":
+                self._act_hist_err = np.zeros(2, dtype=np.float32)
+            else:  # measured（預設）
+                with self._lock:
+                    ov, ow = self._odom_v, self._odom_w
+                    lcv, lcw = self._last_cmd_v_pf, self._last_cmd_w_pf
+                err_v = float(np.clip((lcv - ov * inv) / self.act_err_v_max, -1.0, 1.0))
+                err_w = float(np.clip((lcw - ow * inv) / self.act_err_w_max, -1.0, 1.0))
+                self._act_hist_err = np.array([err_v, err_w], dtype=np.float32)
         # action stacking（v3c）：83D bundle 才帶 action history，否則 builder 忽略此參數
         act_hist = self._act_hist_flat() if self.use_act_stack else None
         obs = build_obs_raw(
@@ -884,6 +951,10 @@ class PolicyNode(Node):
         # 與 obs 端 ego 速度同樣放大 inv 一致；sim 無 speed_rate 故存 policy-frame 才對齊。
         if self.use_act_stack:
             self._push_act_hist(accel * inv, cmd_w * inv)
+            # 存 policy-frame 指令速度，供下一拍 action_error err 計算（指令 − odom 實測）
+            with self._lock:
+                self._last_cmd_v_pf = cmd_v * inv
+                self._last_cmd_w_pf = cmd_w * inv
 
         if self.pub_obs is not None:
             m = Float32MultiArray()

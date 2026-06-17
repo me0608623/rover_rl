@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -189,6 +191,98 @@ def _autodetect(ckpt: dict, overrides: dict) -> dict:
     return cfg
 
 
+# act_stack 正規化常數（與訓練 obs term + 車端 policy_node 一致；勿改）
+_ACT_STACK_A_MAX = 0.2          # 線加速度正規化分母
+_ACT_STACK_OMEGA_MAX = math.pi / 15.0   # 角速度正規化分母 ≈0.2094
+_ACT_MAX_LINEAR_VELOCITY = 1.0  # err_v 正規化分母（=訓練 max_linear_velocity）
+_ACT_MAX_ANGULAR_VELOCITY = 1.2  # err_w 正規化分母（=訓練 max_angular_vel）
+
+
+def _infer_act_hist_mode(ckpt: dict, override: str | None) -> str:
+    """決定 act_hist 編碼模式（raw / action_error / delta）。
+
+    模式不存於 checkpoint['args']（訓練端靠環境變數 CHARGE_ACT_HIST_MODE 設定，
+    預設 "raw"），但 experiment_config 有存。v3d/v3e 系列要求 action_error，其餘
+    （v3c/v3/v2…）為 raw。可用 --act-hist-mode 顯式覆寫。
+    """
+    if override and override != "auto":
+        return override
+    exp = str((ckpt.get("args", {}) or {}).get("experiment_config", "")).lower()
+    if "v3d" in exp or "v3e" in exp:
+        return "action_error"
+    return "raw"
+
+
+def _build_obs_spec(cfg: dict, act_hist_mode: str) -> dict:
+    """產生此 checkpoint 的「觀測維度語義」spec（機器可讀）。
+
+    描述車端 obs_builder 要餵給 .ts 的 raw obs 每段語義；act_hist 4D 的後 2 維
+    依 act_hist_mode 不同。車端 policy_node 讀此 spec 決定如何填 act_hist。
+    """
+    raw = cfg["raw_obs_dim"]
+    fields = [
+        {"range": [0, 4], "name": "ego",
+         "desc": "[accel_norm, speed_norm, omega_norm, radius_norm] 機器人本體狀態"},
+        {"range": [4, 6], "name": "goal", "desc": "[goal_x_body, goal_y_body] 目標 body-frame 方向"},
+        {"range": [6, 78], "name": "lidar", "desc": "72-bin sweep，r_min~r_max 正規化 [0,1]"},
+    ]
+    if raw == 139:
+        fields.append({"range": [78, 138], "name": "obstacles",
+                       "desc": "Top-10×6D 障礙物 ground truth（部署補 0，policy 不看）"})
+        fields.append({"range": [138, 139], "name": "time", "desc": "episode 時間 ramp [0,1]"})
+    else:
+        fields.append({"range": [78, 79], "name": "time", "desc": "episode 時間 ramp [0,1]"})
+    if raw == 83:
+        # act_hist 4D：前 2 維恆為上一步指令，後 2 維依 mode
+        ch01 = ("a_{t-1}/0.2, ω_{t-1}/(π/15)  clamp[-2,2]")
+        if act_hist_mode == "action_error":
+            ch23 = ("err_v=(cmd_v−v_meas)/1.0, err_w=(cmd_w−ω_meas)/1.2  clamp[-1,1]"
+                    "（致動追蹤誤差，1 步延遲）")
+        elif act_hist_mode == "delta":
+            ch23 = "Δa=(a_{t-1}−a_{t-2})/0.2, Δω=(ω_{t-1}−ω_{t-2})/(π/15)  clamp[-2,2]"
+        else:  # raw
+            ch23 = "a_{t-2}/0.2, ω_{t-2}/(π/15)  clamp[-2,2]"
+        fields.append({"range": [79, 83], "name": "act_hist",
+                       "desc": f"[{ch01}, {ch23}]  (mode={act_hist_mode})"})
+    return {
+        "raw_obs_dim": raw,
+        "used_obs_dim": cfg["used_obs_dim"],
+        "hidden_dim": cfg["hidden_dim"],
+        "preprocess_dim": cfg["preprocess_dim"],
+        "act_hist_mode": act_hist_mode,
+        "act_stack_a_max": _ACT_STACK_A_MAX,
+        "act_stack_omega_max": _ACT_STACK_OMEGA_MAX,
+        "act_err_v_max": _ACT_MAX_LINEAR_VELOCITY,
+        "act_err_w_max": _ACT_MAX_ANGULAR_VELOCITY,
+        "fields": fields,
+    }
+
+
+def _spec_to_markdown(spec: dict, model_name: str) -> str:
+    lines = [
+        f"# Obs spec — {model_name}",
+        "",
+        f"- raw_obs_dim: **{spec['raw_obs_dim']}** → used: {spec['used_obs_dim']}",
+        f"- hidden_dim: {spec['hidden_dim']}, preprocess_dim: {spec['preprocess_dim']}",
+        f"- **act_hist_mode: `{spec['act_hist_mode']}`**",
+        "",
+        "| dims | name | 語義 |",
+        "|------|------|------|",
+    ]
+    for f in spec["fields"]:
+        a, b = f["range"]
+        rng = f"[{a}:{b}]" if b - a > 1 else f"[{a}]"
+        lines.append(f"| {rng} | {f['name']} | {f['desc']} |")
+    if spec["act_hist_mode"] == "action_error":
+        lines += [
+            "",
+            "> ⚠️ **action_error 模式**：obs[81:83] = 致動追蹤誤差（指令 − 實測速度）。",
+            "> 車端 policy_node 須以 `act_hist_mode=action_error` 填入；err 來源由 "
+            "`act_hist_err_source`（measured/zero）控制。穩態時 err≈0。",
+        ]
+    return "\n".join(lines) + "\n"
+
+
 def export(args):
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     for k in ("extractor", "preprocess_rnn", "policy_head"):
@@ -302,6 +396,18 @@ def export(args):
     print(f"     raw_obs={cfg['raw_obs_dim']} → used={cfg['used_obs_dim']}, "
           f"hidden={cfg['hidden_dim']}, preprocess={cfg['preprocess_dim']}, logits=38")
 
+    # ── 產生 obs-spec sidecar（self-describing：語義隨模型走，避免車端誤填） ──
+    act_hist_mode = _infer_act_hist_mode(ckpt, args.act_hist_mode)
+    spec = _build_obs_spec(cfg, act_hist_mode)
+    spec["model_file"] = out_path.name
+    spec["experiment_config"] = str((ckpt.get("args", {}) or {}).get("experiment_config", ""))
+    stem = out_path.with_suffix("")          # 去掉 .ts
+    json_path = stem.with_name(stem.name + ".obs_spec.json")
+    md_path = stem.with_name(stem.name + ".obs_spec.md")
+    json_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    md_path.write_text(_spec_to_markdown(spec, out_path.name), encoding="utf-8")
+    print(f"     act_hist_mode={act_hist_mode}  spec→ {json_path.name} / {md_path.name}")
+
 
 def build_parser():
     p = argparse.ArgumentParser(description="Export checkpoint → TorchScript bundle (auto-detect)")
@@ -315,6 +421,10 @@ def build_parser():
     p.add_argument("--predict-dim", type=int, default=None,
                    help="7=SA5/6/7 (WD default), 13=SA1_v2")
     p.add_argument("--rnn-type", choices=["RNN", "GRU"], default=None)
+    p.add_argument("--act-hist-mode",
+                   choices=["auto", "raw", "action_error", "delta"], default="auto",
+                   help="obs[79:83] 編碼模式；auto=由 experiment_config 推斷"
+                        "（v3d/v3e→action_error，其餘→raw）")
     return p
 
 

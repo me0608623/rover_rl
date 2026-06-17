@@ -1,0 +1,55 @@
+{
+  "raw_obs_dim": 83,
+  "used_obs_dim": 83,
+  "hidden_dim": 64,
+  "preprocess_dim": 12,
+  "act_hist_mode": "action_error",
+  "act_stack_a_max": 0.2,
+  "act_stack_omega_max": 0.20943951023931953,
+  "act_err_v_max": 1.0,
+  "act_err_w_max": 1.2,
+  "fields": [
+    {
+      "range": [
+        0,
+        4
+      ],
+      "name": "ego",
+      "desc": "[accel_norm, speed_norm, omega_norm, radius_norm] 機器人本體狀態"
+    },
+    {
+      "range": [
+        4,
+        6
+      ],
+      "name": "goal",
+      "desc": "[goal_x_body, goal_y_body] 目標 body-frame 方向"
+    },
+    {
+      "range": [
+        6,
+        78
+      ],
+      "name": "lidar",
+      "desc": "72-bin sweep，r_min~r_max 正規化 [0,1]"
+    },
+    {
+      "range": [
+        78,
+        79
+      ],
+      "name": "time",
+      "desc": "episode 時間 ramp [0,1]"
+    },
+    {
+      "range": [
+        79,
+        83
+      ],
+      "name": "act_hist",
+      "desc": "[a_{t-1}/0.2, ω_{t-1}/(π/15)  clamp[-2,2], err_v=(cmd_v−v_meas)/1.0, err_w=(cmd_w−ω_meas)/1.2  clamp[-1,1]（致動追蹤誤差，1 步延遲）]  (mode=action_error)"
+    }
+  ],
+  "model_file": "sa1_v3e_60000.ts",
+  "experiment_config": "wd_sa1_v3e"
+}
