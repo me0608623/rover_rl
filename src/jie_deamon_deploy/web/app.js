@@ -47,8 +47,15 @@ let canvas, ctx;                  // LiDAR 視覺化 Canvas 及其 2D 繪圖上�
 let canvasWidth = 800;            // Canvas 寬度（像素，會動態調整）
 let canvasHeight = 800;           // Canvas 高度（像素，會動態調整）
 let metersToPixels = 100;         // 每公尺對應的像素數
-// 機器人在 Canvas 上的中心位置（底部偏上）
-let robotCenter = { x: canvasWidth / 2, y: canvasHeight - CONFIG.DISPLAY_RANGE_BACK * metersToPixels };
+// 機器人在 Canvas 上的中心位置（始終置中）
+let robotCenter = { x: canvasWidth / 2, y: canvasHeight / 2 };
+
+// 跟隨模式：是否已雙擊設過目標（防止沒選目標就按開始運動亂衝）
+let followTargetSet = false;
+
+// 目前底盤 mux 模式（0=放鬆 1=停止 2=手把 3=Web）。
+// 運動只允許在 Web 模式(3)下啟動，避免放鬆/手把模式誤觸亂動。
+let currentMuxMode = 0;
 
 // ======================== 當前資料 ========================
 // 由 WebSocket 接收並更新的雷達及目標資訊
@@ -68,7 +75,8 @@ let navState = {
     selectedOrigin: null,    // 已選起點 (node name)
     selectedDest: null,      // 已選終點 (node name)
     selectionStep: 0,        // 0=等起點, 1=等終點
-    goalMarker: null,        // 單點導航目標 {x, y} (地圖原始像素)
+    goalMarker: null,        // 單點導航目標 marker {x, y} (地圖原始像素)
+    pendingGoal: null,       // 單點導航待送目標 {x, y} (世界座標)，按開始才送
 };
 
 // ======================== Toast 通知 ========================
@@ -303,10 +311,10 @@ function resizeCanvas() {
     const horizontalRange = 4.0;
     metersToPixels = canvasWidth / horizontalRange;
 
-    // 機器人位置：距離 Canvas 底部 DISPLAY_RANGE_BACK 公尺
+    // 機器人本體（藍色箭頭）始終置於畫面正中央
     robotCenter = {
         x: canvasWidth / 2,
-        y: canvasHeight - CONFIG.DISPLAY_RANGE_BACK * metersToPixels
+        y: canvasHeight / 2
     };
 }
 
@@ -356,12 +364,13 @@ function initTabSwitching() {
                 mode: mode
             });
 
-            // 跟隨 tab：啟用追蹤 + 切底盤到 Web 模式，但【不自動運動】
-            // 運動要等使用者在雷達圖上雙擊目標後才開始（setTarget 內觸發 set_moving）
+            // 跟隨 tab：只啟用追蹤可視化，【不自動切 Web 模式、不自動運動】
+            // 安全流程：使用者要自己按「🌐 Web」切模式 → 雙擊選目標 → 按「開始運動」
+            // （之前切 tab 就自動 set_mux_mode:3，導致放鬆模式下誤觸也會動）
+            followTargetSet = false;  // 每次進/出跟隨都重置，強制重新選目標
             if (tab.dataset.tab === 'follow') {
                 sendCommand({ type: 'set_active', active: true });
-                sendCommand({ type: 'set_moving', enabled: false });  // 先停，等雙擊目標
-                sendCommand({ type: 'set_mux_mode', mode: 3 });
+                sendCommand({ type: 'set_moving', enabled: false });  // 先停，等切Web+選目標+按開始
             } else {
                 sendCommand({ type: 'set_active', active: false });
                 sendCommand({ type: 'set_moving', enabled: false });  // 離開跟隨即停
@@ -703,7 +712,7 @@ function handleCanvasTouch(e) {
 
 /**
  * 設定跟隨目標位置：將像素座標轉換為機器人座標後發送給後端
- * 雙擊目標 = 使用者確認要跟隨 → 同時啟動運動（set_moving:true）
+ * 雙擊只設目標【不自動運動】，要按「開始運動」按鈕才啟動跟隨。
  */
 function setTarget(pixelX, pixelY) {
     const robot = toRobot(pixelX, pixelY);
@@ -712,9 +721,8 @@ function setTarget(pixelX, pixelY) {
         x: robot.x,
         y: robot.y
     });
-    // 雙擊目標後才開始跟隨運動
-    sendCommand({ type: 'set_moving', enabled: true });
-    showToast(`🎯 開始跟隨目標 (${robot.x.toFixed(1)}, ${robot.y.toFixed(1)})`);
+    followTargetSet = true;  // 已設目標，允許按開始運動
+    showToast(`🎯 已設定目標 (${robot.x.toFixed(1)}, ${robot.y.toFixed(1)})，按「開始運動」啟動`);
 }
 
 // ======================== WebSocket 連線管理 ========================
@@ -1042,6 +1050,19 @@ function updateButtonState(id, isActive, activeText, inactiveText, activeIcon, i
  */
 function initControls() {
     document.getElementById('movingToggle').addEventListener('click', () => {
+        // 啟動運動的雙重前提（避免誤觸亂動）：
+        if (!lidarData.isMovingEnabled) {
+            // 1. 底盤必須在 Web 模式(3)，放鬆/停止/手把模式下禁止啟動
+            if (currentMuxMode !== 3) {
+                showToast('⚠️ 請先切到「🌐 Web」模式才能啟動運動');
+                return;
+            }
+            // 2. 必須先雙擊設過跟隨目標
+            if (!followTargetSet) {
+                showToast('⚠️ 請先在雷達圖上雙擊選定跟隨目標');
+                return;
+            }
+        }
         sendCommand({
             type: 'set_moving',
             enabled: !lidarData.isMovingEnabled
@@ -1052,11 +1073,23 @@ function initControls() {
     document.querySelectorAll('.mode-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             const mode = parseInt(btn.dataset.mode);
-            sendCommand({ type: 'set_mux_mode', mode: mode });
-            // 更新 UI：移除其他按鈕的 active，加上自己的
-            document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
-            btn.classList.add('active');
+            setMuxMode(mode);
+            // 切離 Web 模式時，順手停止運動（安全）
+            if (mode !== 3) {
+                sendCommand({ type: 'set_moving', enabled: false });
+            }
         });
+    });
+}
+
+/**
+ * 切換底盤 mux 模式 + 同步前端狀態與按鈕高亮
+ */
+function setMuxMode(mode) {
+    currentMuxMode = mode;
+    sendCommand({ type: 'set_mux_mode', mode: mode });
+    document.querySelectorAll('.mode-btn').forEach(b => {
+        b.classList.toggle('active', parseInt(b.dataset.mode) === mode);
     });
 }
 
@@ -1396,48 +1429,41 @@ function initNavPanel() {
             navState.selectedOrigin = null;
             navState.selectedDest = null;
             navState.selectionStep = 0;
+            navState.pendingGoal = null;
+            navState.goalMarker = null;
+            renderGoalMarker();
+            renderRouteLine();
+            renderMapNodes();
             updateNavUI();
         });
     });
 
-    // 地圖單擊 tap → 選擇路由節點（用延遲區分單擊/雙擊）
+    // 地圖雙擊/雙 tap → 依模式分流（route=選節點, goal=放目標）
+    // 統一用 pointerup 偵測快速連點（滑鼠 + 觸控都走 pointer）
     let pointerDownPos = null;
-    let singleTapTimer = null;
+    let lastTapTime = 0;
+    let lastTapPos = { x: 0, y: 0 };
     const viewer = document.getElementById('mapViewer');
+
     viewer.addEventListener('pointerdown', e => {
-        if (e.target.closest('.map-node')) return;
         if (e.target.closest('.zoom-btn')) return;
         pointerDownPos = { x: e.clientX, y: e.clientY };
     });
-    viewer.addEventListener('pointerup', e => {
-        if (!pointerDownPos) return;
-        const dx = e.clientX - pointerDownPos.x;
-        const dy = e.clientY - pointerDownPos.y;
-        pointerDownPos = null;
-        // 移動 > 8px 視為 drag，不觸發 tap
-        if (Math.hypot(dx, dy) > 8) return;
-        // 延遲 300ms 再觸發單擊（雙擊會取消它）
-        const cx = e.clientX, cy = e.clientY;
-        clearTimeout(singleTapTimer);
-        singleTapTimer = setTimeout(() => {
-            handleMapTap(cx, cy);
-        }, 300);
-    });
 
-    // 地圖雙擊/雙 tap → 單點導航（兩種模式都能用）
-    let lastTapTime = 0;
-    let lastTapPos = { x: 0, y: 0 };
-
-    // 統一用 pointerup 偵測快速連點（滑鼠 + 觸控都走 pointer）
     viewer.addEventListener('pointerup', e => {
-        if (e.target.closest('.map-node')) return;
         if (e.target.closest('.zoom-btn')) return;
+        // 拖曳超過 8px 不算點擊（避免平移誤觸）
+        if (pointerDownPos) {
+            const ddx = e.clientX - pointerDownPos.x;
+            const ddy = e.clientY - pointerDownPos.y;
+            pointerDownPos = null;
+            if (Math.hypot(ddx, ddy) > 8) { lastTapTime = 0; return; }
+        }
         const now = Date.now();
         const dx = Math.abs(e.clientX - lastTapPos.x);
         const dy = Math.abs(e.clientY - lastTapPos.y);
         // 400ms 內同位置連擊 = 雙擊
         if (now - lastTapTime < 400 && dx < 30 && dy < 30) {
-            clearTimeout(singleTapTimer);  // 取消待發的單擊
             handleMapDblTap(e.clientX, e.clientY);
             lastTapTime = 0;  // 重置避免三連擊
         } else {
@@ -1446,14 +1472,7 @@ function initNavPanel() {
         lastTapPos = { x: e.clientX, y: e.clientY };
     });
 
-    // 節點 marker 點擊（事件代理）
-    document.getElementById('mapOverlay').addEventListener('click', e => {
-        const node = e.target.closest('.map-node');
-        if (!node) return;
-        selectNode(node.dataset.name);
-    });
-
-    // 開始導航按鈕
+    // 路徑導航：開始按鈕
     document.getElementById('startRouteNav').addEventListener('click', () => {
         if (navState.selectedOrigin && navState.selectedDest) {
             sendCommand({
@@ -1461,55 +1480,86 @@ function initNavPanel() {
                 origin: navState.selectedOrigin,
                 destination: navState.selectedDest
             });
-            console.log(`路徑導航: ${navState.selectedOrigin} → ${navState.selectedDest}`);
-            sendCommand({ type: 'set_mux_mode', mode: 3 });
+            showToast(`🚀 開始導航: ${navState.selectedOrigin} → ${navState.selectedDest}`);
+            setMuxMode(3);  // 自主導航需 Web 模式
         }
     });
 
-    // 取消按鈕
+    // 路徑導航：取消按鈕
     document.getElementById('cancelRouteNav').addEventListener('click', () => {
         navState.selectedOrigin = null;
         navState.selectedDest = null;
         navState.selectionStep = 0;
+        renderMapNodes();
+        renderRouteLine();
+        updateNavUI();
+    });
+
+    // 單點導航：開始按鈕（按下才真的送 goal）
+    document.getElementById('startGoalNav').addEventListener('click', () => {
+        if (navState.pendingGoal) {
+            sendCommand({ type: 'goal_nav', x: navState.pendingGoal.x, y: navState.pendingGoal.y });
+            showToast(`🚀 開始導航至 (${navState.pendingGoal.x.toFixed(1)}, ${navState.pendingGoal.y.toFixed(1)})`);
+            setMuxMode(3);  // 自主導航需 Web 模式
+        }
+    });
+
+    // 單點導航：取消按鈕
+    document.getElementById('cancelGoalNav').addEventListener('click', () => {
+        navState.pendingGoal = null;
+        navState.goalMarker = null;
+        renderGoalMarker();
         updateNavUI();
     });
 }
 
 /**
- * 單次 tap → 路徑導航選節點
+ * 雙擊 / 雙 tap → 依模式分流
+ *   route 模式：第一次雙擊選最近節點當起點(綠)，第二次當終點(紅)
+ *   goal 模式：放目標 marker，等「開始導航」按鈕才送
  */
-function handleMapTap(cx, cy) {
-    if (navState.navMode !== 'route') return;
-    if (navState.routeNodes.length === 0) {
-        showToast('節點載入中，請稍候…');
-        return;
-    }
-
+function handleMapDblTap(cx, cy) {
     const mp = mapView.clientToMapPixel(cx, cy);
+    // 超出圖片範圍就忽略
+    if (mp.x < 0 || mp.x > CONFIG.MAP.imgWidth || mp.y < 0 || mp.y > CONFIG.MAP.imgHeight) return;
 
-    // 找最近的節點（地圖原始像素距離）
-    let minDist = Infinity, nearest = null;
-    for (const node of navState.routeNodes) {
-        const np = worldToMapPixel(node.x, node.y);
-        const d = Math.hypot(np.x - mp.x, np.y - mp.y);
-        if (d < minDist) { minDist = d; nearest = node; }
+    if (navState.navMode === 'route') {
+        // 路徑導航：雙擊 snap 到最近節點
+        if (navState.routeNodes.length === 0) {
+            showToast('節點載入中，請稍候…');
+            return;
+        }
+        let minDist = Infinity, nearest = null;
+        for (const node of navState.routeNodes) {
+            const np = worldToMapPixel(node.x, node.y);
+            const d = Math.hypot(np.x - mp.x, np.y - mp.y);
+            if (d < minDist) { minDist = d; nearest = node; }
+        }
+        const threshold = Math.max(40, 40 / mapView.scale);
+        if (!nearest || minDist > threshold) {
+            showToast('請雙擊靠近藍色節點處');
+            return;
+        }
+        selectNode(nearest.name);
+    } else {
+        // 單點導航：只放目標 marker，不自動導航
+        const world = mapPixelToWorld(mp.x, mp.y);
+        navState.goalMarker = { x: mp.x, y: mp.y };
+        navState.pendingGoal = { x: world.x, y: world.y };
+        renderGoalMarker();
+        updateNavUI();
+        showToast(`🎯 目標已設定，按「開始導航」啟動`);
     }
-    // 門檻：地圖原始像素 30px / 當前縮放
-    const threshold = 30 / mapView.scale * 2;
-    if (!nearest || minDist > Math.max(30, threshold)) {
-        showToast('請點選藍色節點');
-        return;
-    }
-    selectNode(nearest.name);
 }
 
 /**
- * 節點 marker 點擊或 tap 選到 → 更新選擇狀態
+ * 路徑導航選到節點 → 更新起/終點狀態
  */
 function selectNode(name) {
     if (navState.navMode !== 'route') return;
     if (navState.selectionStep === 0) {
         navState.selectedOrigin = name;
+        navState.selectedDest = null;   // 重選起點時清掉舊終點
         navState.selectionStep = 1;
         showToast(`🟢 起點: ${name}`);
     } else {
@@ -1519,22 +1569,42 @@ function selectNode(name) {
     }
     updateNavUI();
     renderMapNodes();
+    renderRouteLine();
 }
 
 /**
- * 雙擊 / 雙 tap → 單點導航（任何模式都能用）
+ * 畫起點→終點的路徑連線（SVG）
  */
-function handleMapDblTap(cx, cy) {
-    const mp = mapView.clientToMapPixel(cx, cy);
-    // 超出圖片範圍就忽略
-    if (mp.x < 0 || mp.x > CONFIG.MAP.imgWidth || mp.y < 0 || mp.y > CONFIG.MAP.imgHeight) return;
+function renderRouteLine() {
+    const old = document.getElementById('routeLine');
+    if (old) old.remove();
+    if (!navState.selectedOrigin || !navState.selectedDest) return;
 
-    const world = mapPixelToWorld(mp.x, mp.y);
-    navState.goalMarker = { x: mp.x, y: mp.y };
-    renderGoalMarker();
-    showToast(`🎯 目標: (${world.x.toFixed(1)}, ${world.y.toFixed(1)})`);
-    sendCommand({ type: 'goal_nav', x: world.x, y: world.y });
-    sendCommand({ type: 'set_mux_mode', mode: 3 });
+    const o = navState.routeNodes.find(n => n.name === navState.selectedOrigin);
+    const d = navState.routeNodes.find(n => n.name === navState.selectedDest);
+    if (!o || !d) return;
+
+    const op = worldToMapPixel(o.x, o.y);
+    const dp = worldToMapPixel(d.x, d.y);
+
+    const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    svg.id = 'routeLine';
+    svg.setAttribute('width', CONFIG.MAP.imgWidth);
+    svg.setAttribute('height', CONFIG.MAP.imgHeight);
+    svg.style.cssText = `position:absolute;left:0;top:0;width:${CONFIG.MAP.imgWidth}px;` +
+        `height:${CONFIG.MAP.imgHeight}px;pointer-events:none;z-index:1;`;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', op.x); line.setAttribute('y1', op.y);
+    line.setAttribute('x2', dp.x); line.setAttribute('y2', dp.y);
+    line.setAttribute('stroke', '#22d3ee');
+    line.setAttribute('stroke-width', '6');
+    line.setAttribute('stroke-dasharray', '12 8');
+    line.setAttribute('stroke-linecap', 'round');
+    svg.appendChild(line);
+
+    // 插在 overlay 最前面（節點 marker 之下）
+    const overlay = document.getElementById('mapOverlay');
+    overlay.insertBefore(svg, overlay.firstChild);
 }
 
 /**
@@ -1598,6 +1668,16 @@ function updateNavUI() {
     destEl.textContent = navState.selectedDest || '—';
     startBtn.disabled = !(navState.selectedOrigin && navState.selectedDest);
 
+    // 單點導航的座標 + 開始按鈕
+    const goalCoordEl = document.getElementById('goalCoord');
+    const startGoalBtn = document.getElementById('startGoalNav');
+    if (goalCoordEl) {
+        goalCoordEl.textContent = navState.pendingGoal
+            ? `(${navState.pendingGoal.x.toFixed(1)}, ${navState.pendingGoal.y.toFixed(1)})`
+            : '未設定';
+    }
+    if (startGoalBtn) startGoalBtn.disabled = !navState.pendingGoal;
+
     if (navState.navMode === 'route') {
         routeCtrl.style.display = 'flex';
         goalCtrl.style.display = 'none';
@@ -1606,14 +1686,14 @@ function updateNavUI() {
             hint.textContent = '⏳ 節點載入中…';
         } else {
             hint.textContent = navState.selectionStep === 0
-                ? '📍 點選節點選起點'
-                : '📍 再點選節點選終點';
+                ? '📍 雙擊節點選起點'
+                : '📍 再雙擊節點選終點';
         }
     } else {
         routeCtrl.style.display = 'none';
         goalCtrl.style.display = 'flex';
         hint.style.display = 'block';
-        hint.textContent = '📍 雙擊地圖任意位置設定目標';
+        hint.textContent = '📍 雙擊地圖設定目標，按開始導航';
     }
 
     // 更新節點 marker 的選中狀態

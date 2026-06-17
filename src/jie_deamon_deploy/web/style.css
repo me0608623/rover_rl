@@ -1016,9 +1016,20 @@ body {
     border: 1px solid rgba(255, 255, 255, 0.1);
 }
 
-/* 單點導航提示 */
+/* 單點導航控制（與路徑導航同一排佈局） */
 .goal-controls {
-    padding: 8px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+}
+
+.goal-info {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 1;
+    min-width: 0;
 }
 
 .goal-hint {

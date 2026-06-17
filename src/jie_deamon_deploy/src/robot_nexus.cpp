@@ -27,6 +27,9 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>   // 單點導航目標
 #include <campusrover_msgs/srv/routing_path.hpp> // 路徑導航服務
 #include <campusrover_msgs/srv/module_info.hpp>  // 拓撲節點查詢服務
+#include <tf2_ros/transform_listener.h>          // TF 監聽（取機器人在 map 的位置）
+#include <tf2_ros/buffer.h>                       // TF buffer
+#include <tf2/utils.h>                            // tf2::getYaw
 #include <thread>                                // 標準執行緒支援
 #include <chrono>                                // 時間工具（用於定時器週期）
 
@@ -195,6 +198,14 @@ public:
         fetch_nodes_timer_ = this->create_wall_timer(
             std::chrono::seconds(2), [this]() { fetchRouteNodes(); });
 
+        // === 機器人定位（TF map→base_footprint，NDT 提供）===
+        // 車姿走 TF（map→odom∘odom→base 由 tf2 正確合成），不用 /ndt_pose（那是 map→odom）
+        tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
+        tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+        // 2Hz 查 TF + 廣播機器人位置（給地圖導航顯示 robot icon）
+        robot_pose_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(500), [this]() { broadcastRobotPose(); });
+
         // 配置 Android 通訊模組
         android_comm_.setLogCallback(log_cb);  // 設定日誌回呼
         android_comm_.start();                  // 啟動 UDP 接收執行緒
@@ -251,6 +262,11 @@ private:
     rclcpp::TimerBase::SharedPtr direct_control_timer_;                            // 10Hz 定時器
     rclcpp::TimerBase::SharedPtr broadcast_timer_;                                 // 10Hz Web 廣播定時器
     rclcpp::TimerBase::SharedPtr fetch_nodes_timer_;                               // 拓撲節點抓取定時器
+    rclcpp::TimerBase::SharedPtr robot_pose_timer_;                                // 2Hz 機器人位置廣播
+
+    // TF 監聽（取機器人在 map 的位置，NDT 定位）
+    std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
+    std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
 
     // 路由節點列表（從 /get_route_info 取得）
     struct RouteNode { std::string name; double x, y; };
@@ -377,6 +393,30 @@ private:
         }
         oss << "]}";
         web_comm_.broadcastRouteNodes(oss.str());
+    }
+
+    /*
+     * broadcastRobotPose — 查 TF map→base_footprint，廣播機器人在地圖的位置
+     * 給地圖導航前端畫 robot icon。用 TF（非 /ndt_pose，那是 map→odom 不是車姿）。
+     */
+    void broadcastRobotPose() {
+        geometry_msgs::msg::TransformStamped tf;
+        try {
+            // Time() = 取最新可用，避免跨機時鐘不同步
+            tf = tf_buffer_->lookupTransform("map", "base_footprint", tf2::TimePointZero);
+        } catch (const tf2::TransformException&) {
+            return;  // TF 還沒好（NDT 未收斂）就先不發
+        }
+
+        double x = tf.transform.translation.x;
+        double y = tf.transform.translation.y;
+        double yaw = tf2::getYaw(tf.transform.rotation);
+
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(3);
+        oss << "{\"type\":\"robot_pose\",\"x\":" << x << ",\"y\":" << y
+            << ",\"yaw\":" << yaw << "}";
+        web_comm_.broadcastRouteNodes(oss.str());  // 複用 raw JSON 廣播通道
     }
 };
 

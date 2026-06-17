@@ -36,6 +36,8 @@ find_package(geometry_msgs REQUIRED)   # 幾何訊息型別（Twist、Pose 等�
 find_package(std_msgs REQUIRED)        # 標準訊息型別（String、Bool 等）
 find_package(campusrover_msgs REQUIRED) # 校園車訊息（RoutingPath、ModuleInfo）
 find_package(nav_msgs REQUIRED)         # 導航訊息（Path）
+find_package(tf2_ros REQUIRED)          # TF 監聽（機器人定位）
+find_package(tf2 REQUIRED)              # tf2::getYaw 等工具
 find_package(OpenCV REQUIRED)          # OpenCV 電腦視覺函式庫
 find_package(Threads REQUIRED)         # POSIX 執行緒（pthread）
 
@@ -60,6 +62,8 @@ ament_target_dependencies(robot_nexus
   std_msgs
   campusrover_msgs
   nav_msgs
+  tf2_ros
+  tf2
 )
 # 連結 OpenCV 和執行緒函式庫
 target_link_libraries(robot_nexus

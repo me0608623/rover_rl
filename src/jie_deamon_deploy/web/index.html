@@ -121,9 +121,16 @@
                         <button class="nav-btn cancel-btn" id="cancelRouteNav">✖</button>
                     </div>
                 </div>
-                <!-- 單點導航提示 -->
+                <!-- 單點導航控制 -->
                 <div class="goal-controls" id="goalControls" style="display: none;">
-                    <div class="goal-hint">雙擊地圖任意位置設定導航目標</div>
+                    <div class="goal-info">
+                        <span class="point-label">🎯 目標</span>
+                        <span class="point-value" id="goalCoord">未設定</span>
+                    </div>
+                    <div class="nav-buttons">
+                        <button class="nav-btn start-btn" id="startGoalNav" disabled>🚀 開始導航</button>
+                        <button class="nav-btn cancel-btn" id="cancelGoalNav">✖</button>
+                    </div>
                 </div>
             </div>
 
