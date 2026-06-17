@@ -7,13 +7,13 @@ rover_rl_policy:
     #   1. model_path        → sa3_v3c_240000.ts（83D obs，action stacking 自動啟用）
     #   2. lidar_r_min_m     0.9 → 0.25（v3c 訓練值；preprocessor 同步見
     #                        lidar_preprocessor_params_v3c.yaml）
-    #   3. act_max_angular_velocity 2.0 → 0.7853981634（v3c 訓練 ω_max = 0.25π）
+    #   3. act_max_angular_velocity 2.0 → 1.2（v3c 訓練 ω_max=1.2，env cfg 覆寫值；非 class default 0.25π）
     #   4. act_max_angular_accel    0.0 → 3.0（v3c 角速度 α slew，對齊訓練端；PC 合併補上）
     #   5. speed_rate        0.35 → 1.0（v3c 延遲感知重訓，不需時間膨脹）
     #   cmd_max_accel_angular 維持 3.0（cmd filter slew，與動作端 slew 不同層）
     # ✅ obs_max_angular_velocity = 1.5 是正確值（PC 端已查證：訓練 ObsTerm
     #   base_angular_velocity_z 的 max_angular_velocity=1.5，見 charge_env_cfg_vlp16.py:389）。
-    #   三個 ω 各司其職、勿混：obs[2]正規化=1.5、動作上限=0.25π、act_stack正規化=π/15。
+    #   三個 ω 各司其職、勿混：obs[2]正規化=1.5、動作上限=1.2、act_stack正規化=π/15。
     # ════════════════════════════════════════════════════════════════
 
     # --- Model ---
@@ -52,12 +52,12 @@ rover_rl_policy:
     # --- Action limits（鎖在 v3c 訓練分布內） ---
     act_max_linear_velocity: 1.0      # v3c v_max = 1.0 m/s
     act_max_linear_accel: 0.5         # v3c a_max = 0.5 m/s²
-    act_max_angular_velocity: 0.7853981634   # ★ v3c ω_max = 0.25π rad/s（≠ v2 的 2.0）
+    act_max_angular_velocity: 1.2            # ★ v3c ω_max = 1.2 rad/s（修正 bug：env cfg 2026-06-02 由 2.0→1.2，對齊底盤 profile_omega_max=1.2；先前誤抄 class default 0.785）
     act_max_angular_accel: 3.0               # ★ v3c 角速度 α slew（每步 Δω≤3.0×dt=0.6；0=舊模型不 slew）
 
     # --- 全域速度縮放 ---
     # ★ v3c 建議 1.0：延遲感知重訓已取代時間膨脹這個治標手段
-    speed_rate: 1.0
+    speed_rate: 0.5
 
     # --- Action stacking（v3c）：raw_obs_dim==83 自動啟用 ---
     # 正規化分母 = v3c 訓練 action history 尺度（obs_spec [79:83]：a÷0.2、ω÷π/15）
