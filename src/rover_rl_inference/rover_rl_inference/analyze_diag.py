@@ -73,6 +73,9 @@ def _print_params(csv_path: str) -> None:
             "require_ndt", "deterministic", "model_path"]
     shown = [(k, p[k]) for k in keys if k in p]
     print("-" * 60)
+    model = meta.get("model") or p.get("model_path")
+    if model:
+        print(f"【本次使用 model】{model}")
     print(f"【當時 policy 參數】(來自 {os.path.basename(side)})")
     for k, v in shown:
         print(f"  {k:24s}= {v}")

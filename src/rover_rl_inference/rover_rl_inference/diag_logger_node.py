@@ -43,7 +43,9 @@ from nav_msgs.msg import Odometry, Path as NavPath
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.time import Time
 from std_msgs.msg import Float32MultiArray, String
+from tf2_ros import Buffer, TransformException, TransformListener
 
 
 def _pv_to_py(pv):
@@ -69,9 +71,10 @@ CSV_FIELDS = [
     "t_wall", "t_rel",                                       # 牆鐘時間 / 相對開錄秒數
     "goal_seq", "has_goal",                                  # 第幾個 goal / 當下是否有 goal
     "odom_x", "odom_y", "odom_yaw_deg", "odom_v", "odom_w",  # 里程計位姿與實測速度
-    "ndt_x", "ndt_y", "ndt_yaw_deg", "ndt_age",             # NDT map-frame 定位（ground truth）
+    "ndt_x", "ndt_y", "ndt_yaw_deg", "ndt_age",             # NDT /ndt_pose（此部署=map→odom 變換，非車姿！僅供活性判定）
+    "map_x", "map_y", "map_yaw_deg", "pose_src",            # 車在 goal_frame 的真實位姿（TF goal_frame→base，與 policy 同源）；pose_src=tf/odom_only
     "goal_x", "goal_y", "goal_frame",
-    "dist_to_goal", "heading_err_deg",                       # 衍生：到 goal 距離 / 車頭朝向誤差
+    "dist_to_goal", "heading_err_deg",                       # 衍生：到 goal 距離 / 車頭朝向誤差（用 map_* 算，非 /ndt_pose）
     "cmd_v", "cmd_w", "cmd_age",                             # 實際發出的 cmd_vel
     "policy_goal_bx", "policy_goal_by", "policy_goal_ang_deg",  # policy obs 內的 goal body 方向
     "policy_v_norm", "policy_w_norm", "obs_age",
@@ -140,6 +143,9 @@ class DiagLoggerNode(Node):
         self.declare_parameter("policy_node_name", "rover_rl_policy")
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("robot_radius_m", 0.35)
+        # 車姿來源 frame：與 policy_node 同名參數一致（dist/heading 走 TF goal_frame→base）
+        self.declare_parameter("goal_frame", "map")
+        self.declare_parameter("base_frame", "base_footprint")
         # false(預設)=啟動即待錄，發 goal 即開始；true=需送 record start 才開錄
         self.declare_parameter("require_start", False)
         # true(預設)=收到 goal 後還要等「真正有速度輸出」才開檔+wandb（避免發了 goal 但車
@@ -182,6 +188,8 @@ class DiagLoggerNode(Node):
         self.policy_node_name = sv("policy_node_name")
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
+        self.goal_frame = sv("goal_frame") or "map"
+        self.base_frame = sv("base_frame") or "base_footprint"
         self.require_start = bool(gp("require_start").value)
         self.start_on_motion = bool(gp("start_on_motion").value)
         self.start_motion_eps = float(gp("start_motion_eps").value)
@@ -206,6 +214,7 @@ class DiagLoggerNode(Node):
         self._obs = None
         self._sweep_min = None
         self._status = None        # dict（三層速度 + 延遲）
+        self._model_name = None    # 本次使用的 model .ts 檔名（從 status 的 "model" 欄即時抓）
         self._goal_close_ticks = 0  # dist_to_goal < tol 連續 tick 計數
         self._all_csv_paths = []   # 本次 session 建立的所有 CSV（finalize 時全部列出）
         # 實驗 / 檔案
@@ -253,6 +262,22 @@ class DiagLoggerNode(Node):
         self.create_subscription(String, self.topic_ctrl, self._cb_ctrl, 10)
         self.create_subscription(String, self.topic_status, self._cb_status, 10)
         self._pub_event = self.create_publisher(String, self.topic_diag_event, 10)
+        # TF：以 goal_frame→base_frame 取車在 map 的真實位姿（與 policy_node 同一條鏈，
+        # tf2 正確合成 map→odom(NDT)∘odom→base）。不可用 /ndt_pose 當車姿（它是 map→odom）。
+        self._tf_buffer = Buffer()
+        self._tf_listener = TransformListener(self._tf_buffer, self)
+
+    def _robot_pose_in_map(self, frame: str):
+        """車在 `frame` 的真實位姿，取自 TF frame→base_frame（與 policy_node 同源）。
+        回傳 (x, y, yaw, "tf")；查不到 TF 回 (None, None, None, "")。
+        用 Time()（最新可用）避免跨機時鐘不同步造成 extrapolation 失敗。"""
+        try:
+            tf = self._tf_buffer.lookup_transform(frame, self.base_frame, Time())
+            t = tf.transform.translation
+            q = tf.transform.rotation
+            return t.x, t.y, _yaw_from_quat(q.x, q.y, q.z, q.w), "tf"
+        except TransformException:
+            return None, None, None, ""
 
     # ── 實驗開關 ──
     def start_experiment(self, label: str) -> None:
@@ -291,7 +316,10 @@ class DiagLoggerNode(Node):
         self._init_wandb(name)
         self._armed = False
         self._started = True
-        self.get_logger().info(f"▶ 開始實驗 '{name}' → {self.csv_path}")
+        self.get_logger().info(
+            f"▶ 開始實驗 '{name}' → {self.csv_path}\n"
+            f"  使用 model：{self._model_name or '（尚未收到 policy status，稍後補記）'}"
+        )
         self._schedule_param_capture()
 
     # ── 擷取 policy_node 參數（speed_rate 等）→ sidecar json + wandb config ──
@@ -346,6 +374,8 @@ class DiagLoggerNode(Node):
             "csv": os.path.basename(self._params_csv_path or ""),
             "policy_node": self.policy_node_name,
             "captured_wall": time.time(),
+            # 本次使用的 model：優先 status 的即時檔名，退回 params 的 model_path
+            "model": self._model_name or params.get("model_path"),
             "params": params,
         }
         try:
@@ -440,7 +470,11 @@ class DiagLoggerNode(Node):
         try:
             self._status = json.loads(msg.data)
         except (ValueError, TypeError):
-            pass
+            return
+        # 即時抓本次使用的 model 檔名（status 5Hz 發、比 param service 更早可用）
+        m = self._status.get("model")
+        if m:
+            self._model_name = m
 
     # ── callbacks ──
     def _cb_odom(self, msg: Odometry) -> None:
@@ -561,7 +595,6 @@ class DiagLoggerNode(Node):
         row["goal_seq"] = self._goal_seq
         row["has_goal"] = int(has_goal)
 
-        robot_x = robot_y = robot_yaw = None
         if self._odom is not None:
             ox, oy, oyaw, ov, ow, ot = self._odom
             row["odom_x"] = f"{ox:.3f}"
@@ -570,17 +603,25 @@ class DiagLoggerNode(Node):
             row["odom_v"] = f"{ov:.3f}"
             row["odom_w"] = f"{ow:.3f}"
 
+        # /ndt_pose 僅記錄供活性判定（ndt_age）；⚠ 此部署它是 map→odom 變換、非車姿，不拿來算 dist/heading
         if self._ndt is not None:
             nx, ny, nyaw, nt = self._ndt
             row["ndt_x"] = f"{nx:.3f}"
             row["ndt_y"] = f"{ny:.3f}"
             row["ndt_yaw_deg"] = f"{math.degrees(nyaw):.2f}"
             row["ndt_age"] = f"{now - nt:.2f}"
-            robot_x, robot_y, robot_yaw = nx, ny, nyaw   # 優先用 NDT(map frame) 算 dist/heading
 
-        # NDT 還沒來時退回 odom，至少 dist/heading 有個近似值（odom 會漂但短時間可用）
+        # 車在 goal_frame 的真實位姿：走 TF goal_frame→base（與 policy_node._robot_pose_in_map 同源）。
+        # 查不到 TF 才退回 odom（odom frame 非 map，dist/heading 僅近似）。
+        robot_x, robot_y, robot_yaw, pose_src = self._robot_pose_in_map(self.goal_frame)
         if robot_x is None and self._odom is not None:
-            robot_x, robot_y, robot_yaw = self._odom[0], self._odom[1], self._odom[2]
+            robot_x, robot_y, robot_yaw, pose_src = (
+                self._odom[0], self._odom[1], self._odom[2], "odom_only")
+        if robot_x is not None:
+            row["map_x"] = f"{robot_x:.3f}"
+            row["map_y"] = f"{robot_y:.3f}"
+            row["map_yaw_deg"] = f"{math.degrees(robot_yaw):.2f}"
+            row["pose_src"] = pose_src
 
         if has_goal:
             gx, gy, gframe = self._goal
@@ -588,7 +629,7 @@ class DiagLoggerNode(Node):
             row["goal_y"] = f"{gy:.3f}"
             row["goal_frame"] = gframe
             if robot_x is not None:
-                # heading_err = 「指向 goal 的方向」減「車頭實際朝向」（NDT ground truth）；
+                # heading_err = 「指向 goal 的方向」減「車頭實際朝向」，車姿走 TF（與 policy 同源）；
                 # 應與 policy_goal_ang_deg 一致，不一致代表定位/TF/座標出問題
                 dx, dy = gx - robot_x, gy - robot_y
                 dist = math.hypot(dx, dy)
@@ -679,6 +720,7 @@ class DiagLoggerNode(Node):
         head_abs = self._heading_abs_sum / max(self._heading_n, 1)
         self.get_logger().info(
             "================ 診斷摘要 ================\n"
+            f"  使用 model  : {self._model_name or '未知（未收到 policy status）'}\n"
             f"  CSV: {self.csv_path}  ({self._n_rows} 列)\n"
             f"  角速度晃動  : Δω RMS={dw_std:.3f} rad/s/step, |ω|平均={cmd_w_abs:.3f}\n"
             f"  朝向誤差    : |heading_err|平均={head_abs:.1f}°  (理想<20°)\n"
