@@ -35,3 +35,7 @@ src/bag/
 # OS
 .DS_Store
 Thumbs.db
+
+# LV-DOT 大檔不入庫（上游 demo gif + 標準可下載 YOLO 模型；車上已有，依 models/*.ts 慣例）
+src/LV-DOT/media/
+src/LV-DOT/onboard_detector/scripts/yolo_detector/weights/*.pt
