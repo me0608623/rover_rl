@@ -55,6 +55,82 @@ def _stats(xs):
             "min": min(xs), "max": max(xs), "median": median}
 
 
+def _dominant_str(rows, key):
+    """回傳某字串欄出現最多次的非空值（用於 nav_type 這種整段固定的標籤）."""
+    counts: dict[str, int] = {}
+    for r in rows:
+        v = (r.get(key) or "").strip()
+        if v:
+            counts[v] = counts.get(v, 0) + 1
+    return max(counts, key=counts.get) if counts else ""
+
+
+def _print_goal_speed_tracking(nav_type, true_d, perc_d, cmd_v, cmd_w,
+                               far_thr=5.0, lookahead_hint=2.0) -> None:
+    """重點追蹤：goal 型態 × 距離 × 速度。檢驗「遠 single goal → OOD/全速延遲極限環」假設。
+
+    true_d  = dist_to_goal     真實剩餘距離（到終點）
+    perc_d  = policy_goal_dist  policy 實際吃到的 goal 距離（clamp 18m + ×1/rate）
+    依 policy 感知距離把每拍分「遠 / 近」兩段，比較 v 與 |Δω| 抖動。
+    """
+    print("【goal 型態 × 距離 × 速度 追蹤】(遠 single goal OOD 假設)")
+    nt_desc = {"single_goal": "單一 goal (RViz 2D Goal Pose)",
+               "routing_path": "路徑導航 (Publish Point → routing)"}.get(
+        nav_type, nav_type or "未知")
+    print(f"  goal 型態: {nt_desc}")
+
+    tv = [d for d in true_d if d is not None]
+    pv = [d for d in perc_d if d is not None]
+    if tv:
+        print(f"  真實距離(到終點): 起 {tv[0]:.1f}m → 終 {tv[-1]:.1f}m  max {max(tv):.1f}m")
+    if pv:
+        pmean = sum(pv) / len(pv)
+        pmax = max(pv)
+        tag = ""
+        if pmax > 17.0:
+            tag = " ← 觸 18m clamp（goal 超出，被截斷餵入）"
+        elif nav_type == "routing_path" and pmean < lookahead_hint * 1.6:
+            tag = " ← carrot 限幅在 lookahead（近、分布內）"
+        print(f"  policy 感知距離: 平均 {pmean:.1f}m  max {pmax:.1f}m{tag}")
+        # 感知 vs 真實 是否脫節（path carrot 的關鍵特徵 / single goal 的 OOD 風險）
+        if tv and max(tv) > far_thr:
+            t0 = sum(tv[:max(1, len(tv) // 10)]) / max(1, len(tv) // 10)
+            p0 = sum(pv[:max(1, len(pv) // 10)]) / max(1, len(pv) // 10)
+            if t0 - p0 > far_thr:
+                print(f"    脫節: 開頭真實 {t0:.1f}m 但 policy 只看到 {p0:.1f}m"
+                      "（carrot 把遠 goal 切近 → 這正是 path 平順的原因）")
+            elif p0 > far_thr:
+                print(f"    直給: policy 開頭就吃到 {p0:.1f}m 的遠 goal（single goal OOD 風險）")
+
+    # 依 policy 感知距離分「遠/近」兩段，比較速度與角速度抖動
+    far_v, near_v, far_jit, near_jit = [], [], [], []
+    prev_w = None
+    for i, d in enumerate(perc_d):
+        v = cmd_v[i] if i < len(cmd_v) else None
+        w = cmd_w[i] if i < len(cmd_w) else None
+        if d is not None and v is not None:
+            (far_v if d > far_thr else near_v).append(v)
+        if d is not None and w is not None and prev_w is not None:
+            (far_jit if d > far_thr else near_jit).append(abs(w - prev_w))
+        if w is not None:
+            prev_w = w
+    _m = lambda xs: (sum(xs) / len(xs)) if xs else None
+    fv, nv, fj, nj = _m(far_v), _m(near_v), _m(far_jit), _m(near_jit)
+    print(f"  以 policy 感知 {far_thr:.0f}m 為界分段:")
+    if fv is not None:
+        print(f"    遠(>{far_thr:.0f}m): v={fv:.2f} m/s  |Δω|={fj:.3f} rad/s/拍  (n={len(far_v)})")
+    if nv is not None:
+        print(f"    近(≤{far_thr:.0f}m): v={nv:.2f} m/s  |Δω|={nj:.3f} rad/s/拍  (n={len(near_v)})")
+    if fj is not None and nj is not None:
+        if fj > nj * 1.5 and fj > 0.08:
+            print("    → 遠距抖動明顯較大 = 與『遠 goal→全速→延遲極限環/OOD』一致 ✓")
+        else:
+            print("    → 遠近抖動相近，遠 goal 未顯著惡化（此段證據不足，需更遠 goal 對比）")
+    elif fj is None:
+        print("    → 本段 policy 全程在近距（無遠段可比，多半是 path carrot 或近 goal）")
+    print("-" * 60)
+
+
 def _step_jitter(xs, wrap_deg=False):
     """相鄰兩筆的變化量統計（抖動指標）。wrap_deg=True 時把角度差包回 (-180,180]，
     避免 ±360° 假跳。回傳 _stats(|Δ|) 或 None。"""
@@ -230,6 +306,71 @@ def _o(x):
     return f"{x:.3f}" if x is not None else "—"
 
 
+def _print_vo_approach(t, dist, n_obs, des_v, out_v, blocked, min_ttc) -> None:
+    """VO 逼近減速分析：抓「障礙進入 engage 範圍」(n_obs 0→≥1) 的時刻，印當下
+    des_v→out_v、後續減速斜率，並驗 out_v 有沒有超過 des_v（speedup bug 回歸測試）。"""
+    print("【VO 逼近減速】障礙進範圍→VO 怎麼減速")
+    na = [x for x in n_obs if x is not None]
+    if not na or max(na) < 1:
+        print("  本段 VO 從未偵測到 engage_range 內障礙（vo_n_obs 全 0）→ 無逼近事件")
+        print("    （人沒進 engage_range / 本段沒走 VO / 無動態障礙；首測那種「直直衝過來」屬此類）")
+        print("-" * 60)
+        return
+
+    # 安全層回歸測試：介入(n_obs≥1)期間 out_v 是否曾超過 des_v（修好後應 ≤0）
+    over = [out_v[i] - des_v[i] for i in range(len(n_obs))
+            if (n_obs[i] or 0) >= 1 and out_v[i] is not None and des_v[i] is not None]
+    if over:
+        mx = max(over)
+        if mx > 0.05:
+            print(f"  ⚠ 介入時 out_v 一度超過 des_v 達 +{mx:.2f} m/s → 安全層在「加速」！"
+                  "(v 鉗位失效，檢查 vo_layer v_hi=min(v_hi,des_v))")
+        else:
+            print(f"  ✓ 介入時 out_v 始終 ≤ des_v（最大超出 {mx:+.2f} m/s）→ 安全層只減速不加速")
+
+    # 找 n_obs 0→≥1 的上升緣 = 逼近事件起點
+    episodes = []
+    prev = 0
+    for i, x in enumerate(n_obs):
+        cur = int(x) if x is not None else 0
+        if prev == 0 and cur >= 1:
+            episodes.append(i)
+        prev = cur
+    print(f"  偵測到 {len(episodes)} 次「障礙進入 engage 範圍」事件：")
+
+    for k, i0 in enumerate(episodes[:4]):     # 最多印 4 段
+        t0, d0, dv0, ov0, ttc0 = t[i0], dist[i0], des_v[i0], out_v[i0], min_ttc[i0]
+        # 往後掃到 n_obs 退回 0 = 本事件區間；記錄最低 out_v 與其時刻
+        j = i0
+        ov_min, j_min = (ov0 if ov0 is not None else float("inf")), i0
+        while j < len(n_obs) and (n_obs[j] or 0) >= 1:
+            if out_v[j] is not None and out_v[j] < ov_min:
+                ov_min, j_min = out_v[j], j
+            j += 1
+        head = f"  #{k + 1} t={_o(t0)}s"
+        if d0 is not None:
+            head += f"  (距goal {d0:.2f}m)"
+        if ttc0 is not None:
+            head += f"  進範圍時 min_ttc={ttc0:.2f}s"
+        print(head)
+        print(f"      進範圍當下: des_v={_o(dv0)} → out_v={_o(ov0)} m/s")
+        dt = (t[j_min] - t0) if (t[j_min] is not None and t0 is not None) else None
+        if dt is not None and dt > 1e-3 and ov0 is not None and ov_min < ov0:
+            rate = (ov0 - ov_min) / dt
+            kind = ("逐步平順減速" if dt >= 0.5 else
+                    "偏急" if dt >= 0.2 else "⚠ 懸崖式急煞(最後一秒才反應)")
+            print(f"      減速到最低 out_v={ov_min:.2f} 歷時 {dt:.2f}s → 平均 {rate:.2f} m/s²  ({kind})")
+        elif ov0 is not None and ov_min >= ov0 - 1e-3:
+            print("      進範圍後 out_v 未下降（VO 判定可直接通過/未介入減速）")
+        # 區間內是否堵死(煞停)
+        bl = [blocked[x] for x in range(i0, j) if blocked[x] is not None]
+        if bl and any(b > 0.5 for b in bl):
+            print(f"      期間堵死(blocked) {sum(1 for b in bl if b > 0.5)}/{len(bl)} 拍 → 一度全候選不可行=煞停")
+    print("    判讀: 斜率小+歷時長=逐步減速(好)；懸崖式=engage太晚或horizon太短，"
+          "考慮調大 engage_range/horizon 或補管線延遲")
+    print("-" * 60)
+
+
 def analyze(path: str) -> None:
     rows = _load(path)
     if not rows:
@@ -247,6 +388,8 @@ def analyze(path: str) -> None:
     heading = _col(rows, "heading_err_deg")
     dist = _col(rows, "dist_to_goal")
     pol_ang = _col(rows, "policy_goal_ang_deg")
+    perc_d = _col(rows, "policy_goal_dist")   # policy 感知的 goal 距離（clamp 18m + ×1/rate）
+    nav_type = _dominant_str(rows, "nav_type")
     # 三層速度 + 延遲
     rl_w = _col(rows, "rl_w")
     sent_w = _col(rows, "sent_w")
@@ -260,6 +403,11 @@ def analyze(path: str) -> None:
     vo_active = _col(rows, "vo_active")
     vo_interv = _col(rows, "vo_intervening")
     vo_blocked = _col(rows, "vo_blocked")
+    # VO 逼近量化欄：障礙進範圍數 / RL 期望 vs VO 輸出線速度 / 最近碰撞時間
+    vo_n_obs = _col(rows, "vo_n_obs")
+    vo_des_v = _col(rows, "vo_des_v")
+    vo_out_v = _col(rows, "vo_out_v")
+    vo_min_ttc = _col(rows, "vo_min_ttc")
     # goal 方向角抖動歸因：NDT(map→odom) yaw 與合成車姿 yaw 的每拍跳動
     ndt_yaw = _col(rows, "ndt_yaw_deg")
     map_yaw = _col(rows, "map_yaw_deg")
@@ -318,6 +466,7 @@ def analyze(path: str) -> None:
             print("    判讀: 晃動時段 vo_intervening≈0 → 非 VO 繞行造成（VO 僅放行+slew），"
                   "病根在 policy/底盤；intervening 高才是 VO 在左右搖")
     print("-" * 60)
+    _print_goal_speed_tracking(nav_type, dist, perc_d, cmd_v, cmd_w)
     _print_jump_attribution(pol_ang, ndt_yaw, map_yaw)
     print("【是否朝 goal 前進】")
     if hd_st:
@@ -341,6 +490,7 @@ def analyze(path: str) -> None:
     print("-" * 60)
     _print_speed_tracking(rl_w, sent_w, act_w, rl_v, sent_v, act_v)
     print("-" * 60)
+    _print_vo_approach(t, dist, vo_n_obs, vo_des_v, vo_out_v, vo_blocked, vo_min_ttc)
     _print_latency(t, sent_w, act_w, sent_v, act_v, lag_ms, lag_corr)
     print("=" * 60)
 

@@ -77,6 +77,10 @@ CSV_FIELDS = [
     "dist_to_goal", "heading_err_deg",                       # 衍生：到 goal 距離 / 車頭朝向誤差（用 map_* 算，非 /ndt_pose）
     "cmd_v", "cmd_w", "cmd_age",                             # 實際發出的 cmd_vel
     "policy_goal_bx", "policy_goal_by", "policy_goal_ang_deg",  # policy obs 內的 goal body 方向
+    # policy 實際吃到的 goal 距離 = hypot(obs[4],obs[5])，已 clamp 18m + ×1/speed_rate。
+    # 與 dist_to_goal（真實剩餘距離）對照：path 走 lookahead carrot ≈2m、single goal 給真實距離
+    # → 兩者脫節時 = policy 感知距離 ≠ 真實距離（遠 single goal OOD 假設的核心證據）。
+    "policy_goal_dist",
     "policy_v_norm", "policy_w_norm", "obs_age",
     "sweep_min_m", "sweep_age",                              # 72-bin sweep 還原成公尺後的最近障礙
     # 三層速度 + 延遲（來自 /rover_rl_policy/status）：rl=RL意圖, sent=濾波後送出, act=odom實測
@@ -86,6 +90,12 @@ CSV_FIELDS = [
     # vo_active=0 整段 → 這次 policy 沒接 VO（enable_vo:=false），cmd 即 RL 直出；
     # vo_active=1 但 vo_intervening=0 → VO 在線但只放行+slew（前方無障礙時的起步 sin 波屬此類）。
     "vo_active", "vo_intervening", "vo_blocked",
+    # VO 量化欄（逼近過程診斷用）：vo_n_obs=engage_range 內障礙數（0→VO 沒看到/沒介入）、
+    # vo_des_*=RL 給 VO 的期望、vo_out_*=VO slew 後實際送 mux 的、vo_engaged=有障進範圍、
+    # vo_n_feasible=可行候選數、vo_min_ttc=選定候選最近碰撞時間。
+    # 看「逼近時 des_v 與 out_v 怎麼變」可判 VO 是逐步減速還是最後一秒才反應。
+    "vo_engaged", "vo_n_obs", "vo_n_feasible",
+    "vo_des_v", "vo_des_w", "vo_out_v", "vo_out_w", "vo_min_ttc",
     # 此次 goal 的決定方式：single_goal=RViz 2D Goal Pose 單點(/goal_pose)；
     # routing_path=RViz Publish Point 兩點選起點/終點 → routing → /global_path。
     "nav_type",
@@ -761,6 +771,7 @@ class DiagLoggerNode(Node):
             row["policy_goal_bx"] = f"{bx:.3f}"
             row["policy_goal_by"] = f"{by:.3f}"
             row["policy_goal_ang_deg"] = f"{math.degrees(math.atan2(by, bx)):.2f}"
+            row["policy_goal_dist"] = f"{math.hypot(bx, by):.3f}"   # policy 感知的 goal 距離
             row["policy_v_norm"] = f"{obs[1]:.3f}"
             row["policy_w_norm"] = f"{obs[2]:.3f}"
             row["obs_age"] = f"{now - obt:.2f}"
@@ -786,9 +797,18 @@ class DiagLoggerNode(Node):
         if vo_active:
             row["vo_intervening"] = int(bool(self._vo.get("intervening")))
             row["vo_blocked"] = int(bool(self._vo.get("blocked")))
+            row["vo_engaged"] = int(bool(self._vo.get("engaged")))
+            for src, dst in (("n_obs", "vo_n_obs"), ("n_feasible", "vo_n_feasible"),
+                             ("des_v", "vo_des_v"), ("des_w", "vo_des_w"),
+                             ("out_v", "vo_out_v"), ("out_w", "vo_out_w"),
+                             ("min_ttc", "vo_min_ttc")):
+                v = self._vo.get(src)
+                if v is not None:          # min_ttc 可能為 null → 留空
+                    row[dst] = v
         else:
             row["vo_intervening"] = 0
             row["vo_blocked"] = 0
+            row["vo_engaged"] = 0
 
         row["nav_type"] = self._goal_method
 
@@ -798,10 +818,18 @@ class DiagLoggerNode(Node):
             self._fh.flush()          # 每秒(20Hz)落盤一次，意外斷電也保住大部分資料
 
         if self.wandb_run is not None:
-            # 同步到 wandb：只送可轉 float 的數值欄，排除字串欄(goal_frame/lag_ch)與
-            # 牆鐘時間(t_wall，數值太大會壓壞圖表 x 軸)
-            metrics = {k: float(v) for k, v in row.items()
-                       if v != "" and k not in ("goal_frame", "t_wall", "lag_ch", "nav_type")}
+            # 同步到 wandb：只送可轉 float 的數值欄。⚠ 用 try/except 跳過所有不可轉字串欄
+            # （pose_src='tf'/goal_frame/lag_ch/nav_type…）—— 硬 float() 黑名單一漏掉某欄
+            # 就會 ValueError 讓整個 node 當場死掉（曾因 pose_src 漏列，每段只寫 1 行就崩）。
+            # t_wall 牆鐘時間數值太大會壓壞圖表 x 軸，明確排除。
+            metrics = {}
+            for k, v in row.items():
+                if v == "" or k == "t_wall":
+                    continue
+                try:
+                    metrics[k] = float(v)
+                except (TypeError, ValueError):
+                    continue
             self.wandb.log(metrics)
 
     # ── 摘要 ──
