@@ -82,6 +82,13 @@ CSV_FIELDS = [
     # 三層速度 + 延遲（來自 /rover_rl_policy/status）：rl=RL意圖, sent=濾波後送出, act=odom實測
     "rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
     "v_over", "w_over", "lag_ms", "lag_corr", "lag_ch",      # 飽和旗標 / 延遲估計值
+    # VO 安全層（來自 /vo_safety_node/status）：本次有沒有走 VO + 本拍 VO 有沒有在動手。
+    # vo_active=0 整段 → 這次 policy 沒接 VO（enable_vo:=false），cmd 即 RL 直出；
+    # vo_active=1 但 vo_intervening=0 → VO 在線但只放行+slew（前方無障礙時的起步 sin 波屬此類）。
+    "vo_active", "vo_intervening", "vo_blocked",
+    # 此次 goal 的決定方式：single_goal=RViz 2D Goal Pose 單點(/goal_pose)；
+    # routing_path=RViz Publish Point 兩點選起點/終點 → routing → /global_path。
+    "nav_type",
 ]
 
 
@@ -138,11 +145,14 @@ class DiagLoggerNode(Node):
         self.declare_parameter("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
         self.declare_parameter("topic_record_ctrl", "/rover_rl/record")
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
+        self.declare_parameter("topic_vo_status", "/vo_safety_node/status")
         self.declare_parameter("topic_diag_event", "/rover_rl/diag_event")
         # 開錄時抓此節點的全部參數（speed_rate 等）寫進 sidecar + wandb config
         self.declare_parameter("policy_node_name", "rover_rl_policy")
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("robot_radius_m", 0.35)
+        # 開錄前輸入新鮮度門檻：任一輸入 *_age 超過此值 → 紅字警告「記錄可能被阻塞」
+        self.declare_parameter("stale_warn_s", 0.5)
         # 車姿來源 frame：與 policy_node 同名參數一致（dist/heading 走 TF goal_frame→base）
         self.declare_parameter("goal_frame", "map")
         self.declare_parameter("base_frame", "base_footprint")
@@ -184,10 +194,12 @@ class DiagLoggerNode(Node):
         self.topic_sweep = sv("topic_lidar_sweep")
         self.topic_ctrl = sv("topic_record_ctrl")
         self.topic_status = sv("topic_status")
+        self.topic_vo_status = sv("topic_vo_status")
         self.topic_diag_event = sv("topic_diag_event")
         self.policy_node_name = sv("policy_node_name")
         self.r_max = float(gp("lidar_r_max_m").value)
         self.r_robot = float(gp("robot_radius_m").value)
+        self.stale_warn_s = float(gp("stale_warn_s").value)
         self.goal_frame = sv("goal_frame") or "map"
         self.base_frame = sv("base_frame") or "base_footprint"
         self.require_start = bool(gp("require_start").value)
@@ -208,12 +220,17 @@ class DiagLoggerNode(Node):
         self._odom = None          # (x, y, yaw, v, w, t)
         self._ndt = None           # (x, y, yaw, t)
         self._goal = None          # (x, y, frame)
+        self._goal_method = ""     # 此次 goal 決定方式：single_goal / routing_path（見 CSV nav_type）
         self._goal_seq = 0
         self._last_done_goal = None  # (x, y) 剛 auto-stop 完成的終點，用來擋 stale path 殘留發布
         self._cmd = None
         self._obs = None
         self._sweep_min = None
         self._status = None        # dict（三層速度 + 延遲）
+        self._status_t = 0.0       # 最近一次收到 policy status 的 monotonic 時間（開錄新鮮度檢查用）
+        self._vo = None            # dict（VO 安全層 status；None=從未收到）
+        self._vo_t = 0.0           # 最近一次收到 VO status 的 monotonic 時間
+        self._vo_seen_run = False  # 本段紀錄期間是否曾收到 VO status（→ params.json vo_enabled）
         self._model_name = None    # 本次使用的 model .ts 檔名（從 status 的 "model" 欄即時抓）
         self._goal_close_ticks = 0  # dist_to_goal < tol 連續 tick 計數
         self._all_csv_paths = []   # 本次 session 建立的所有 CSV（finalize 時全部列出）
@@ -239,6 +256,7 @@ class DiagLoggerNode(Node):
 
     def _reset_run_stats(self) -> None:
         self._n_rows = 0
+        self._vo_seen_run = False   # 每段重置：是否走 VO 是 per-run 屬性
         self._cmd_w_prev = None
         self._dw_sq = 0.0
         self._dw_n = 0
@@ -261,6 +279,8 @@ class DiagLoggerNode(Node):
         self.create_subscription(Float32MultiArray, self.topic_sweep, self._cb_sweep, be)
         self.create_subscription(String, self.topic_ctrl, self._cb_ctrl, 10)
         self.create_subscription(String, self.topic_status, self._cb_status, 10)
+        # VO 安全層 status（純觀察）：node 沒起 → 整段收不到 → vo_active 恆 0 = 本次沒走 VO
+        self.create_subscription(String, self.topic_vo_status, self._cb_vo_status, 10)
         self._pub_event = self.create_publisher(String, self.topic_diag_event, 10)
         # TF：以 goal_frame→base_frame 取車在 map 的真實位姿（與 policy_node 同一條鏈，
         # tf2 正確合成 map→odom(NDT)∘odom→base）。不可用 /ndt_pose 當車姿（它是 map→odom）。
@@ -288,6 +308,7 @@ class DiagLoggerNode(Node):
         self._reset_run_stats()
         self._goal_seq = 0
         self._goal = None
+        self._goal_method = ""
         self._pending_motion = False
         self._last_done_goal = None
         if self.log_only_with_goal:
@@ -297,8 +318,40 @@ class DiagLoggerNode(Node):
         else:
             self._open_run_files(label)   # 不挑 goal → 立即開檔
 
+    def _check_input_freshness(self) -> None:
+        """開錄前檢查各輸入快取新鮮度：任一 *_age > stale_warn_s → 紅字（error）警告。
+        抓兩種會讓整段 CSV 報廢的情境：①開錄當下 topic 已掉線（odom/sweep/preprocessor 死）；
+        ②上一拍有東西卡住單執行緒 executor（如 wandb online 阻塞）讓所有訂閱一起 stale。
+        純診斷提示，不擋開錄（仍照常記錄，只是讓你當場知道這段恐不可用）。"""
+        now = time.monotonic()
+        thr = self.stale_warn_s
+        checks = (
+            ("odom", self._odom[5] if self._odom else None),
+            ("cmd", self._cmd[2] if self._cmd else None),
+            ("status", self._status_t if self._status is not None else None),
+            ("sweep", self._sweep_min[1] if self._sweep_min else None),
+            ("obs", self._obs[1] if self._obs else None),
+            ("ndt", self._ndt[3] if self._ndt else None),
+        )
+        bad = []
+        for name, t in checks:
+            if t is None:
+                bad.append(f"{name}=未收到")
+            elif (age := now - t) > thr:
+                bad.append(f"{name}={age:.2f}s")
+        if bad:
+            # logger.error → rcl console 紅字
+            self.get_logger().error(
+                f"⚠ 記錄可能被阻塞：開錄時輸入不新鮮（>{thr:.1f}s）→ {', '.join(bad)}；"
+                "這段 CSV 恐只寫得出零星 stale 列。查 odom hz / preprocessor / "
+                "wandb 是否 online 阻塞 executor"
+            )
+        else:
+            self.get_logger().info("✓ 開錄輸入新鮮度 OK（odom/cmd/status/sweep/obs/ndt 皆 <門檻）")
+
     def _open_run_files(self, label: str) -> None:
         """真正建立 run 資料夾並開 CSV（由 start 或第一個 goal 觸發）."""
+        self._check_input_freshness()   # 開錄前先確認輸入沒 stale（阻塞/掉線即紅字示警）
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         lab = _safe_label(label)
         name = f"diag_{stamp}" + (f"_{lab}" if lab else "")
@@ -376,6 +429,10 @@ class DiagLoggerNode(Node):
             "captured_wall": time.time(),
             # 本次使用的 model：優先 status 的即時檔名，退回 params 的 model_path
             "model": self._model_name or params.get("model_path"),
+            # 本次 policy 是否走 VO 安全層（截至擷取參數當下是否已收到 VO status）
+            "vo_enabled": bool(self._vo_seen_run),
+            # 此次 goal 的決定方式：single_goal=2D Goal Pose 單點；routing_path=Publish Point 兩點 routing
+            "goal_method": self._goal_method or None,
             "params": params,
         }
         try:
@@ -384,10 +441,14 @@ class DiagLoggerNode(Node):
                 json.dump(meta, f, indent=2, ensure_ascii=False)
         except Exception as e:
             self.get_logger().warn(f"寫 params sidecar 失敗：{e}")
-        # wandb config
+        # wandb config：除 policy 參數外，補推 meta 級欄位（vo_enabled / goal_method / model），
+        # 與 sidecar 對齊，確保 wandb 端也完整可查本 run 的 goal 決定方式與是否走 VO。
         if self.wandb_run is not None:
             try:
                 self.wandb_run.config.update(params, allow_val_change=True)
+                self.wandb_run.config.update(
+                    {k: meta[k] for k in ("vo_enabled", "goal_method", "model")},
+                    allow_val_change=True)
             except Exception as e:
                 self.get_logger().warn(f"wandb config 更新失敗：{e}")
         key = {k: params.get(k) for k in (
@@ -410,7 +471,12 @@ class DiagLoggerNode(Node):
             self.wandb_run = wandb.init(
                 project=self.wandb_project, name=run_name,
                 mode=self.wandb_mode,
-                config={"rate_hz": self.rate_hz},
+                # goal_method 此時已由 _handle_target 設好（goal/path 觸發開檔），放進 config
+                # 確保 wandb 端也記得本 run 是 2D Goal Pose 還是 routing（時間序列無法存字串）。
+                # model 補記；vo_enabled 在 param 擷取後由 config.update 補（見 _on_get_params）。
+                config={"rate_hz": self.rate_hz,
+                        "goal_method": self._goal_method or None,
+                        "model": self._model_name},
             )
         except Exception as e:
             self.get_logger().warn(f"wandb 初始化失敗，改用純 CSV：{e}")
@@ -442,6 +508,7 @@ class DiagLoggerNode(Node):
         self._reset_run_stats()
         self._goal_seq = 0
         self._goal = None
+        self._goal_method = ""
         self._pending_motion = False
         self._goal_close_ticks = 0
         self._armed = True
@@ -471,10 +538,21 @@ class DiagLoggerNode(Node):
             self._status = json.loads(msg.data)
         except (ValueError, TypeError):
             return
+        self._status_t = time.monotonic()
         # 即時抓本次使用的 model 檔名（status 5Hz 發、比 param service 更早可用）
         m = self._status.get("model")
         if m:
             self._model_name = m
+
+    def _cb_vo_status(self, msg: String) -> None:
+        # VO 安全層 5Hz status；收到即代表 VO 在線。只在記錄中標記本段「走過 VO」。
+        try:
+            self._vo = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        self._vo_t = time.monotonic()
+        if self._started:
+            self._vo_seen_run = True
 
     # ── callbacks ──
     def _cb_odom(self, msg: Odometry) -> None:
@@ -512,6 +590,8 @@ class DiagLoggerNode(Node):
     def _handle_target(self, x: float, y: float, frame: str, kind: str, extra: str) -> None:
         """goal_pose / global_path 的共用入口：判斷是新目標還是同目標重複發布，
         並在 armed / started / 已停 三種狀態下做對的事。"""
+        # 記下此次 goal 的決定方式（kind: goal=2D Goal Pose 單點, path=Publish Point 兩點 routing）
+        self._goal_method = "single_goal" if kind == "goal" else "routing_path"
         new_xy = (x, y)
         if self._started:
             # 進行中：path 2Hz republish 同終點 → 只刷新座標，不重置 close_ticks、不 ++seq
@@ -700,6 +780,18 @@ class DiagLoggerNode(Node):
             row["v_over"] = int(bool(st.get("v_over")))
             row["w_over"] = int(bool(st.get("w_over")))
 
+        # VO 安全層：node 在線(<1s 內有 status)=active；用其 status 旗標標記本拍有沒有動手
+        vo_active = self._vo is not None and (now - self._vo_t) < 1.0
+        row["vo_active"] = int(vo_active)
+        if vo_active:
+            row["vo_intervening"] = int(bool(self._vo.get("intervening")))
+            row["vo_blocked"] = int(bool(self._vo.get("blocked")))
+        else:
+            row["vo_intervening"] = 0
+            row["vo_blocked"] = 0
+
+        row["nav_type"] = self._goal_method
+
         self._writer.writerow(row)
         self._n_rows += 1
         if self._n_rows % 20 == 0:
@@ -709,7 +801,7 @@ class DiagLoggerNode(Node):
             # 同步到 wandb：只送可轉 float 的數值欄，排除字串欄(goal_frame/lag_ch)與
             # 牆鐘時間(t_wall，數值太大會壓壞圖表 x 軸)
             metrics = {k: float(v) for k, v in row.items()
-                       if v != "" and k not in ("goal_frame", "t_wall", "lag_ch")}
+                       if v != "" and k not in ("goal_frame", "t_wall", "lag_ch", "nav_type")}
             self.wandb.log(metrics)
 
     # ── 摘要 ──
@@ -718,9 +810,14 @@ class DiagLoggerNode(Node):
         dw_std = math.sqrt(self._dw_sq / self._dw_n) if self._dw_n > 0 else 0.0
         cmd_w_abs = self._cmd_w_abs_sum / max(self._dw_n + 1, 1)
         head_abs = self._heading_abs_sum / max(self._heading_n, 1)
+        nav_desc = {
+            "single_goal": "單一 goal（RViz 2D Goal Pose 單點）",
+            "routing_path": "路徑導航（RViz Publish Point 兩點選起點/終點 → routing）",
+        }.get(self._goal_method, "未知（未收到 goal/path）")
         self.get_logger().info(
             "================ 診斷摘要 ================\n"
             f"  使用 model  : {self._model_name or '未知（未收到 policy status）'}\n"
+            f"  goal 決定方式: {nav_desc}\n"
             f"  CSV: {self.csv_path}  ({self._n_rows} 列)\n"
             f"  角速度晃動  : Δω RMS={dw_std:.3f} rad/s/step, |ω|平均={cmd_w_abs:.3f}\n"
             f"  朝向誤差    : |heading_err|平均={head_abs:.1f}°  (理想<20°)\n"

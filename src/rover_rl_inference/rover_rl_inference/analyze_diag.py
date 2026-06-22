@@ -55,6 +55,50 @@ def _stats(xs):
             "min": min(xs), "max": max(xs), "median": median}
 
 
+def _step_jitter(xs, wrap_deg=False):
+    """相鄰兩筆的變化量統計（抖動指標）。wrap_deg=True 時把角度差包回 (-180,180]，
+    避免 ±360° 假跳。回傳 _stats(|Δ|) 或 None。"""
+    ds = []
+    prev = None
+    for x in xs:
+        if x is None:
+            continue
+        if prev is not None:
+            d = x - prev
+            if wrap_deg:
+                d = (d + 180.0) % 360.0 - 180.0
+            ds.append(abs(d))
+        prev = x
+    return _stats(ds)
+
+
+def _print_jump_attribution(pol_ang, ndt_yaw, map_yaw) -> None:
+    """goal 方向角抖動 + 跳動歸因：policy 追的 goal 角抖不抖，是 NDT 還是車姿在跳。"""
+    print("【goal 方向角抖動 / NDT·車姿跳動歸因】")
+    pj = _step_jitter(pol_ang, wrap_deg=True)
+    if pj:
+        v = ("平順" if pj["mean"] < 1.0 else
+             "中等" if pj["mean"] < 3.0 else "明顯抖")
+        print(f"  policy_goal_ang 每拍|Δ| = 平均 {pj['mean']:.2f}° / max {pj['max']:.1f}°  ({v})")
+        print("    判讀: >3°/拍 = policy 看到的 goal 方向一直跳 → 會驅動 ω 來回修 = sin 波源")
+    # 把抖動往上游拆：NDT(map→odom) yaw 跳？合成車姿 yaw 跳？
+    nyawj = _step_jitter(ndt_yaw, wrap_deg=True)
+    myawj = _step_jitter(map_yaw, wrap_deg=True)
+    if nyawj:
+        print(f"  NDT(map→odom) yaw 每拍|Δ| = 平均 {nyawj['mean']:.2f}° / max {nyawj['max']:.1f}°"
+              "   (>2° = NDT 重定位在跳)")
+    if myawj:
+        print(f"  合成車姿 map yaw 每拍|Δ| = 平均 {myawj['mean']:.2f}° / max {myawj['max']:.1f}°"
+              "   (車姿朝向跳 → goal body 角直接跟著跳)")
+    if pj and (nyawj or myawj):
+        upstream = max((nyawj or {}).get("mean", 0), (myawj or {}).get("mean", 0))
+        if pj["mean"] > 3.0 and upstream > 2.0:
+            print("    → goal 角抖動與 NDT/車姿跳動同步 = 你的假設成立：定位跳 → goal 方向跳 → 晃")
+        elif pj["mean"] > 3.0:
+            print("    → goal 角抖但 NDT/車姿穩 → 抖動另有源（policy 內部/obs），非定位跳")
+    print("-" * 60)
+
+
 def _print_params(csv_path: str) -> None:
     """印出 sidecar _params.json 內的 policy 設定（若有）."""
     side = csv_path.rsplit(".", 1)[0] + "_params.json"
@@ -76,6 +120,12 @@ def _print_params(csv_path: str) -> None:
     model = meta.get("model") or p.get("model_path")
     if model:
         print(f"【本次使用 model】{model}")
+    nav_desc = {
+        "single_goal": "單一 goal（RViz 2D Goal Pose 單點）",
+        "routing_path": "路徑導航（RViz Publish Point 兩點 → routing）",
+    }.get(meta.get("goal_method"))
+    if nav_desc:
+        print(f"【goal 決定方式】{nav_desc}")
     print(f"【當時 policy 參數】(來自 {os.path.basename(side)})")
     for k, v in shown:
         print(f"  {k:24s}= {v}")
@@ -206,6 +256,13 @@ def analyze(path: str) -> None:
     act_v = _col(rows, "act_v")
     lag_ms = _col(rows, "lag_ms")
     lag_corr = _col(rows, "lag_corr")
+    # VO 安全層：本段是否走 VO（vo_active）+ 各拍有沒有介入/堵死
+    vo_active = _col(rows, "vo_active")
+    vo_interv = _col(rows, "vo_intervening")
+    vo_blocked = _col(rows, "vo_blocked")
+    # goal 方向角抖動歸因：NDT(map→odom) yaw 與合成車姿 yaw 的每拍跳動
+    ndt_yaw = _col(rows, "ndt_yaw_deg")
+    map_yaw = _col(rows, "map_yaw_deg")
 
     # Δω（相鄰列）：相鄰兩筆角速度的差分，std 越大代表 cmd_w 抖動越劇烈＝晃動。
     # 用差分而非 ω 本身，是因為穩定大轉彎的 ω 也很大但不算「晃」。
@@ -245,7 +302,23 @@ def analyze(path: str) -> None:
         print(f"    判讀: <0.05 平順 / 0.05~0.15 中等 / >0.15 明顯晃動")
     if cw_st:
         print(f"  |ω| 平均 = {cw_st['mean']:.3f} rad/s  max={cw_st['max']:.3f}")
+    # VO 在不在線 → 判斷這段晃動「是不是 VO 造成」的關鍵脈絡
+    va = [x for x in vo_active if x is not None]
+    if va:
+        on = sum(1 for x in va if x > 0.5)
+        frac = on / len(va)
+        if frac < 0.05:
+            print("  VO: 本段未走 VO（vo_active≈0）→ cmd 即 RL 直出，晃動屬 policy/底盤")
+        else:
+            iv = [x for x in vo_interv if x is not None]
+            bl = [x for x in vo_blocked if x is not None]
+            iv_f = (sum(1 for x in iv if x > 0.5) / len(iv)) if iv else 0.0
+            bl_f = (sum(1 for x in bl if x > 0.5) / len(bl)) if bl else 0.0
+            print(f"  VO: 在線 {frac:.0%} 的列；其中介入(改寫cmd) {iv_f:.0%}、堵死停車 {bl_f:.0%}")
+            print("    判讀: 晃動時段 vo_intervening≈0 → 非 VO 繞行造成（VO 僅放行+slew），"
+                  "病根在 policy/底盤；intervening 高才是 VO 在左右搖")
     print("-" * 60)
+    _print_jump_attribution(pol_ang, ndt_yaw, map_yaw)
     print("【是否朝 goal 前進】")
     if hd_st:
         print(f"  |朝向誤差| 平均 = {hd_st['mean']:.1f}°  max={hd_st['max']:.1f}°")
