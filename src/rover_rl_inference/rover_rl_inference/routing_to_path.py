@@ -46,6 +46,12 @@ class RoutingToPathNode(Node):
         self.declare_parameter("default_destination", ["e0"])
         # waypoint snap 到具名節點的距離門檻（公尺）；超過視為「不在任一站」
         self.declare_parameter("station_snap_m", 1.5)
+        # 到達路徑終點自動清除：避免到點後紅色路徑一直 republish 留在 RViz。
+        # 訂閱 policy status，當 goal_src=path_final 且 goal_dist < tol 連續 N 拍 → 清路徑。
+        self.declare_parameter("topic_status", "/rover_rl_policy/status")
+        self.declare_parameter("auto_clear_on_arrival", True)
+        self.declare_parameter("arrival_clear_tol_m", 0.7)
+        self.declare_parameter("arrival_clear_ticks", 5)   # status 5Hz × 5 = 1s
 
         building = self.get_parameter("building").get_parameter_value().string_value
         floor = self.get_parameter("floor").get_parameter_value().string_value
@@ -80,6 +86,16 @@ class RoutingToPathNode(Node):
         topic_goal = self.declare_parameter(
             "topic_goal_pose", "/goal_pose").get_parameter_value().string_value
         self.create_subscription(PoseStamped, topic_goal, self._on_manual_goal, 5)
+
+        # 到達終點自動清除：訂閱 policy status 偵測「走到 path 終點」→ 清路徑 + 清 RViz 紅線。
+        self._auto_clear = bool(self.get_parameter("auto_clear_on_arrival").value)
+        self._arrival_tol = float(self.get_parameter("arrival_clear_tol_m").value)
+        self._arrival_ticks = int(self.get_parameter("arrival_clear_ticks").value)
+        self._arrival_count = 0
+        if self._auto_clear:
+            topic_status = self.get_parameter(
+                "topic_status").get_parameter_value().string_value
+            self.create_subscription(String, topic_status, self._on_status, 5)
 
         # 發布 working_floor 觸發 routing 載入
         self.pub_floor = self.create_publisher(WorkingFloor, "working_floor", 5)
@@ -120,10 +136,48 @@ class RoutingToPathNode(Node):
         # 手動 2D Goal Pose → 放棄 routing 路徑：清緩存、停止 2Hz 重發。
         if self._last_path is None and self._last_stations is None:
             return
+        self._clear_path("收到手動 goal_pose → 停止 republish routing 路徑（手點目標接管）",
+                         publish_empty=False)
+
+    def _on_status(self, msg: String) -> None:
+        # 到達 path 終點自動清除：policy 走到 path_final 且 goal_dist < tol 連續 N 拍 → 清路徑。
+        # 用 path_final（非 lookahead carrot）+ 距離雙條件，確保是真的到終點才清，不是中途。
+        if self._last_path is None:
+            self._arrival_count = 0
+            return
+        try:
+            st = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        src = st.get("goal_src") or ""
+        dist = st.get("goal_dist")
+        if str(src).startswith("path_final") and dist is not None and dist < self._arrival_tol:
+            self._arrival_count += 1
+            if self._arrival_count >= self._arrival_ticks:
+                self._clear_path(
+                    f"到達 path 終點（goal_dist={dist:.2f}m < {self._arrival_tol}m"
+                    f" 連續 {self._arrival_count} 拍）→ 清除 routing 路徑 + RViz 紅線",
+                    publish_empty=True)
+        else:
+            self._arrival_count = 0
+
+    def _clear_path(self, reason: str, publish_empty: bool) -> None:
+        """清掉緩存路徑/站序並停止 2Hz republish（手動 goal 接管 或 到達終點）。
+        publish_empty=True 時補發一條空 Path，主動清掉 RViz latched 的紅色路徑顯示。"""
+        frame = self._last_path.header.frame_id if self._last_path is not None else "map"
         with self._lock:
             self._last_path = None
             self._last_stations = None
-        self.get_logger().info("收到手動 goal_pose → 停止 republish routing 路徑（手點目標接管）")
+            self._arrival_count = 0
+        if publish_empty:
+            empty = Path()
+            empty.header.frame_id = frame
+            empty.header.stamp = self.get_clock().now().to_msg()
+            self.pub_path.publish(empty)
+            # 站序也清空，TUI 退回無路線狀態
+            self.pub_stations.publish(String(data=json.dumps(
+                {"stations": [], "wp_idx": [], "n_wp": 0})))
+        self.get_logger().info(reason)
 
     def _fetch_nodes(self):
         # routing 用具名節點（c1/e0…），先抓拓撲節點表把路徑 snap 成站序。
@@ -223,6 +277,7 @@ class RoutingToPathNode(Node):
             result = result_holder[0]
             path = result.routing[0]
             self._last_path = path
+            self._arrival_count = 0      # 新路徑 → 重置到達計數，避免沿用舊段殘值
             self.pub_path.publish(path)
             # 推導具名站序並發布（節點表未載入時 stations 為空，TUI 自動退回幾何進度條）
             self._last_stations = self._derive_stations(path)
