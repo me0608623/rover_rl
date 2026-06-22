@@ -63,9 +63,7 @@ class VOSafetyNode(Node):
         gp("timeout_obstacles_s", 1.0) # 障礙超過此值沒更新 → 視為無障礙
         gp("timeout_goal_s", 1.5)      # goal 超過此值沒更新 → 視為無 goal（VO 退回純貼近 RL）
         # --- 年輕 track 過濾：速度尚未收斂的 track 不參與 rollout（避免亂煞）---
-        gp("min_vel_confidence", 0.0)  # vo_interface vel_confidence 低於此值的 track 忽略其速度
-        # --- 最小障礙速度：站著不動的人(speed≈0)整顆 drop，交給 RL sweep，避雙重處理凍結 ---
-        gp("min_obstacle_speed", 0.2)  # speed 低於此值的 track 不加進 VO 障礙清單（0=關）
+        gp("min_vel_confidence", 0.3)  # vel_confidence 低於此值的 track 當靜態位置避（不外推跳動速度，但不 drop）
         # --- 頻率 ---
         gp("ctrl_rate_hz", 20.0)
         # --- VO 演算法參數（對應 vo_layer.VOParams）---
@@ -98,7 +96,6 @@ class VOSafetyNode(Node):
         self.timeout_obs = float(g("timeout_obstacles_s").value)
         self.timeout_goal = float(g("timeout_goal_s").value)
         self.min_vel_conf = float(g("min_vel_confidence").value)
-        self.min_obs_speed = float(g("min_obstacle_speed").value)
         ctrl_hz = float(g("ctrl_rate_hz").value)
         self.r_obs_max = float(g("obstacle_radius_max").value)
 
@@ -175,15 +172,14 @@ class VOSafetyNode(Node):
     def _cb_obstacles(self, msg: TrackedObstacleArray) -> None:
         obstacles: list[Obstacle] = []
         for ob in msg.obstacles:
-            # 站著不動的人(含 YOLO 標 dynamic 但 speed≈0)整顆 drop：交給 RL 的 72-bin sweep
-            # 自己繞，VO 只管移動中的人。避免「固定阻擋 + 正面對衝邏輯」誤觸原地凍結。
-            speed = math.hypot(float(ob.velocity.x), float(ob.velocity.y))
-            if speed < self.min_obs_speed:
-                continue
+            # ⚠ 不對任何障礙做「整顆 drop」——drop 等於製造安全洞（曾加 min_obstacle_speed
+            # 速度門檻，會把近前小碎步的人、KF 速度未收斂的新闖入者整顆丟掉 → 已收回）。
+            # 每顆障礙都進 VO；只在「速度估得準不準」這層做保守處理（見下）。
             # vo_interface 已給等效半徑；仍封頂防超大框把整條路擋死
             r = min(float(ob.radius), self.r_obs_max)
-            # 速度尚未收斂的年輕 track：忽略其速度（vx=vy=0），只靠位置 + 機器人自身運動
-            # 做碰撞預測，避免拿跳動速度亂外推（保守）
+            # 速度尚未收斂的年輕 track（含剛冒出的快速闖入者、站著小碎步的人）：
+            # 忽略其跳動速度（vx=vy=0），當「靜態位置」避——VO 仍看得到會減速/停，只是不拿
+            # 沒收斂的速度亂外推。比 drop 安全（不漏看），比硬信跳動速度穩（不亂煞）。
             if ob.vel_confidence < self.min_vel_conf:
                 vx, vy = 0.0, 0.0
             else:

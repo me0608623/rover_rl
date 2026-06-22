@@ -6,13 +6,17 @@
 #        → 左右緩弧都會撞 → 只剩停/猛轉 → 減速「停止」
 #   ② 人走過來但偏一側（例如偏左、右邊有縫）
 #        → 只有右側弧線 rollout 不撞 → 往「有縫那側繞行」通過
-#   ③ 人站著不動（speed < min_obstacle_speed）
-#        → 從 VO 整顆 drop，交給 RL 的 72-bin LiDAR sweep 自己繞（避免雙重處理凍結）
+#   ③ 人站著不動（收斂後 vel≈0）
+#        → 當「靜態位置」避：正對近距→停(=①)、偏側有空間→放行(=②)。VO 不 drop 任何障礙。
+#
+# ⚠ 不做「speed 門檻 drop」：曾加 min_obstacle_speed 把慢障礙整顆丟給 RL，但會漏看近前
+#    小碎步的人 + KF 收斂期的快速闖入者(速度暫讀≈0)→ 已收回。年輕 track 的保守處理改走
+#    min_vel_confidence「速度歸零當靜態」（不漏看、不亂煞），見該參數。
 #
 # 調校旋鈕對照（要改行為先看這張表，數字意義詳見各參數行）：
 #   「該停 vs 該繞」的分界    → w_w（轉彎成本，大→偏停）、horizon（大→偏停）
 #   「繞哪一側」             → 可行性為主；w_goal 只在兩側皆可行時當選邊提示
-#   「站著的人停不停」        → min_obstacle_speed（站著的人交給 RL，VO 不插手）
+#   「年輕 track 信不信速度」  → min_vel_confidence（低於門檻當靜態位置避，不外推、不 drop）
 #   「多近才介入」           → engage_range
 #   「障礙膨脹/安全餘裕」      → margin（大→愛停，小→敢繞）
 #   輸出上限/平滑           → v_max/w_max（硬上限）、accel_v/accel_w（slew）
@@ -37,16 +41,14 @@ vo_safety_node:
     timeout_obstacles_s: 1.0    # 動態障礙源斷線(>1.0s) → 放行不停車（只是加分避障；靜態仍由 RL 的 LiDAR sweep 擋）
     timeout_goal_s: 1.5         # goal(policy status) 斷線(>1.5s) → 視為無 goal，goal 導向項自動關（退回純貼近 RL）
 
-    # --- 障礙速度雜訊濾門（非看門狗）：障礙物的「速度」估得準不準才信 ---
-    min_vel_confidence: 0.0     # vo_interface 每個 track 附 vel_confidence(0~1)；低於此門檻 →
-                                # 丟掉該 track 速度、只當靜態位置避（仍會避，不會被假速度嚇到急煞）。
-                                # 0.0=全收不過濾；調高(如0.3)濾掉剛冒出、KF 未收斂的年輕 track 假速度，更不易亂煞。
-
-    # --- 最小障礙速度門檻：站著不動的人(含 YOLO 標 dynamic 但 speed≈0)整顆從 VO 丟掉 ---
-    # VO 只該管「移動中」的人；站著不動的人有 LiDAR 回波，交給 RL 的 72-bin sweep 自己繞，
-    # 避免「YOLO 標動態 + vel≈0 固定阻擋」與 RL 雙重處理 → 正面對衝邏輯誤觸 → 原地凍結。
-    # speed < 此值的 track 直接 drop（不是歸零位置，是整顆移除）。0=關閉(舊行為)；0.2 為建議起點。
-    min_obstacle_speed: 0.2
+    # --- 障礙速度信心門檻（年輕 track 的保守處理；不 drop、只決定信不信它的速度）---
+    # vo_interface 每個 track 附 vel_confidence(0~1)，KF 約 0.5s 收斂到滿。低於此門檻 →
+    # 把該 track「當靜態位置」避（速度歸零、不外推），但**仍進 VO 會減速/停**。
+    # ⚠ 為何是「歸零」不是「drop」：drop=整顆漏看=安全洞（近前小碎步、KF 收斂期的快速闖入者
+    #    都會被誤丟）。歸零=不漏看(位置照避)+不亂煞(不信跳動速度)，是正確的保守處理。
+    # 0.3：濾掉剛冒出、速度未收斂的年輕 track 假速度；站著不動的人(收斂後 vel≈0、conf高)
+    #    本就只當靜態位置避，正對近距會停(=正對停需求)、偏側有空間會放行(=偏側繞需求)。
+    min_vel_confidence: 0.3
 
     # --- 頻率 ---
     ctrl_rate_hz: 20.0          # 控制輸出（= dynamic window 可達時間 ctrl_dt 來源）
