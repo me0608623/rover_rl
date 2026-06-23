@@ -8,7 +8,6 @@
 |---|---|
 | **平台** | Jetson AGX Orin · Ubuntu 22.04 · ROS 2 Humble |
 | **LiDAR** | Velodyne VLP-16（`/velodyne_points`, 10 Hz） |
-| **相機** | Intel RealSense D435i（LV-DOT 視覺用，非 policy 輸入） |
 | **定位** | NDT localizer（`map→odom` TF）+ 底盤 odom（`odom→base` TF） |
 | **通訊** | `rmw_zenoh_cpp`，`ROS_DOMAIN_ID=55`，zenoh router hub |
 | **最新模型** | `sa4_v3f_240000`（79D, 2026-06-22） |
@@ -26,8 +25,8 @@ VLP-16 ─► lidar_preprocessor ─► 72-bin sweep ─► policy_node ─► (
    NDT/odom/goal/path ─────────────────────────► (組 obs, 5Hz RNN)   └─► lcr_cmd_vel_mux ─► /output/cmd_vel ─► 底盤
 ```
 
-**policy 完全不看相機**；policy 的 obs 障礙欄位目前**補 0**（RL 看不到 LV-DOT 追蹤的動態物），
-動態障礙的預測避障交由夾在 policy 與底盤之間的 **VO 安全層**（`vo_safety_node`）處理。
+policy 的 obs 障礙欄位目前**補 0**（看不到動態物），動態障礙的預測避障交由夾在 policy 與底盤之間的
+**VO 安全層**（`vo_safety_node`）處理。
 
 ---
 
@@ -78,7 +77,7 @@ ros2 service call /rover_rl_policy/load_model std_srvs/srv/Trigger
               │  VO 開：/rover_rl/cmd_vel_desired
               │  VO 關：直接 /input/nav_cmd_vel
               ▼
-   (vo_safety_node)  ◄── /vo_interface/tracked_obstacles (LV-DOT 動態障礙)
+   (vo_safety_node)  ◄── /vo_interface/tracked_obstacles (動態障礙追蹤)
         (DWA rollout 預測避障 + 卡死逃脫)
               │
               └─► /input/nav_cmd_vel ─► lcr_cmd_vel_mux ─► /output/cmd_vel ─► 底盤
@@ -100,7 +99,7 @@ world ─(static)─ map ─(NDT 動態)─ odom ─(底盤 driver)─ base_link
 | 關 (`enable_vo:=false`) | `/input/nav_cmd_vel` | — | → mux → 底盤 |
 | 開 (`enable_vo:=true`) | `/rover_rl/cmd_vel_desired` | → 預測避障濾波 → | `/input/nav_cmd_vel` → mux → 底盤 |
 
-`deploy_full` 的 `enable_vo` **預設跟隨 `enable_lvdot`**（VO 沒有障礙來源會退化為「放行 + ω 限幅」，正常安全退化）。
+VO 沒有動態障礙來源時會退化為「放行 + ω 限幅」（正常安全退化）。
 
 ---
 
@@ -112,11 +111,11 @@ world ─(static)─ map ─(NDT 動態)─ odom ─(底盤 driver)─ base_link
 |---|---|
 | `policy_node` | 主推論：72-bin sweep + odom/goal → 79D obs → RNN → `cmd_vel`（5 Hz 推論 / 20 Hz cmd） |
 | `lidar_preprocessor` | PointCloud2 → 72-bin 正規化 sweep（獨立節點，與 policy 解耦） |
-| `vo_safety` | VO 安全層：LV-DOT 動態障礙做 DWA 預測避障 + 卡死後退逃脫 |
+| `vo_safety` | VO 安全層：動態障礙做 DWA 預測避障 + 卡死後退逃脫 |
 | `bev_play` | BEV 極座標可視化 → `/rover_rl/bev_image`（純 debug） |
 | `diag_logger` | 被動診斷：訂閱各 topic 逐列寫 CSV（每個 goal/path 一段） |
 | `analyze_diag` | 離線分析 diag CSV（速度三層對比、延遲、晃動報告） |
-| `status_tui` | 繁中 curses 即時儀表板（三層速度 + 延遲 + RNN + LV-DOT + LiDAR 雷達） |
+| `status_tui` | 繁中 curses 即時儀表板（三層速度 + 延遲 + RNN + 動態障礙 + LiDAR 雷達） |
 | `routing_to_path` | campusrover_routing service → `/global_path` 橋接（2Hz republish + 站序） |
 | `routing_click_bridge` | RViz「Publish Point」兩點 → 呼叫 routing service |
 | `ros_smoke_test` | 上電前 ROS 通訊冒煙測試（不需 torch） |
@@ -127,8 +126,7 @@ world ─(static)─ map ─(NDT 動態)─ odom ─(底盤 driver)─ base_link
 | 套件 | 用途 |
 |---|---|
 | `rover_rl_bringup` | launch + config（`deploy*.launch.py`、`config/*.yaml`） |
-| `vo_interface` | LV-DOT → VO 介面（CV-Kalman 重追蹤，輸出持久 ID / 平滑速度） |
-| `LV-DOT/onboard_detector` | LiDAR + 視覺融合動態障礙偵測（移植自上游） |
+| `vo_interface` | 動態障礙追蹤介面（CV-Kalman 重追蹤，輸出持久 ID / 平滑速度） |
 | `jie_deamon_deploy` | Web 地圖導航（`jie_deamon`，顯示機器人位置） |
 
 ---
@@ -147,11 +145,10 @@ world ─(static)─ map ─(NDT 動態)─ odom ─(底盤 driver)─ base_link
 
 | Alias | 行為 | 適用 |
 |---|---|---|
-| `deploy_rl` | 前景純 `ros2 launch deploy_full`（滾動 log），**預設不開 NDT/LV-DOT，`enable_vo:=true`** | **Claude / 非互動 shell** |
+| `deploy_rl` | 前景純 `ros2 launch deploy_full`（滾動 log），**預設不開 NDT，`enable_vo:=true`** | **Claude / 非互動 shell** |
 | `deploy_rl_shell` | 背景 launch + 前景繁中 TUI 儀表板，launch 前互動選 model + 啟用 VO | **人（真實終端機）** |
 | `deploy_rl_stop` | 停止整個棧 | — |
-| `deploy_all` | `deploy_full` + LV-DOT 全背景啟動 | 一次全開 |
-| `lv-dot` / `lv-dot_stop` | 動態障礙偵測（detector + YOLO + vo_interface + 遠端相機） | 與 RL 分開啟 |
+| `deploy_all` | `deploy_full` 完整棧 + 動態障礙偵測，全部背景啟動 | 一次全開 |
 
 ```bash
 # 人用（真實終端機）：互動選 model + VO，背景 launch + 前景 TUI
@@ -160,11 +157,11 @@ deploy_rl_shell initial_mode:=idle
 # Claude / 非互動：純前景 launch（跳過選單走預設）
 deploy_rl initial_mode:=nav
 
-# 一次全開（NDT + RL + LV-DOT 都背景）
+# 一次全開（NDT + RL + 動態偵測都背景）
 deploy_all initial_mode:=idle
 ```
 
-> ⚠ `deploy_rl` 預設不開 NDT/LV-DOT（用 `ndt` / `lv-dot` alias 分開啟）；要一鍵全開用 `deploy_all`。
+> ⚠ `deploy_rl` 預設不開 NDT（用 `ndt` alias 分開啟）；要一鍵全開用 `deploy_all`。
 
 ### 5.3 首次部署（完整步驟見 [`DEPLOY_CAMPUSROVER.md`](DEPLOY_CAMPUSROVER.md)）
 
@@ -220,17 +217,17 @@ ros2 service call /rover_rl_policy/reset_hidden std_srvs/srv/Trigger
 
 ---
 
-## 7. VO 安全層 + LV-DOT 動態障礙
+## 7. VO 安全層
 
-> 完整移植/調校記錄見 [`docs/LV-DOT整合部署筆記.md`](docs/LV-DOT整合部署筆記.md)。
+夾在 policy 與底盤之間的預測式避障濾波（`vo_safety_node`）。policy 的 obs 障礙欄補 0、
+看不到動態物，故動態障礙（如走動的人）的閃避由 VO 處理。
 
-- **LV-DOT**（`lv-dot` alias）：LiDAR + 視覺融合偵測追蹤動態障礙，與 RL **完全解耦**（policy obs 障礙欄仍補 0）。
-  前方（相機 FOV）靠 YOLO (`yolo11s`, 640 解析) 達 ~99% 動態分類；側/後方受 VLP-16 稀疏硬體限制。
-- **vo_interface**：LV-DOT box → CV-Kalman 重追蹤，輸出持久 ID / 平滑速度 / 協方差 → `/vo_interface/tracked_obstacles`。
-- **vo_safety_node**：DWA 式 rollout 預測避障。實車調校真值見 `config/vo_params.yaml`：
-  - `margin 0.30`（至少距人 30cm 才繞）、`obstacle_radius_max 0.6`（封 LV-DOT 假巨框）、
+- **障礙來源**：訂閱 `/vo_interface/tracked_obstacles`（持久 ID / 平滑速度 / 協方差）。
+- **演算法**：DWA 式 rollout，障礙線性外推；可行弧線中選最貼近 RL 意圖 + 朝 goal 推進者。
+- **實車調校真值**（`config/vo_params.yaml`）：
+  - `margin 0.30`（至少距人 30cm 才繞）、`obstacle_radius_max 0.6`（封偶發假巨框）、
     `w_goal 0.6`（DWA 進展獎勵主動繞）、`stuck_escape`（堵死 + 後方淨空 → 慢退開空間）。
-  - 參數現場熱調：`ros2 param set /vo_safety_node w_goal 0.4`；status 見 `/vo_safety_node/status`。
+- **熱調**：`ros2 param set /vo_safety_node w_goal 0.4`；status 見 `/vo_safety_node/status`。
 
 ---
 
@@ -238,7 +235,7 @@ ros2 service call /rover_rl_policy/reset_hidden std_srvs/srv/Trigger
 
 | 工具 | 用途 |
 |---|---|
-| `status_tui` | 即時儀表板：模式 / 三層速度(想/送/實) / 延遲 / RNN hidden / LV-DOT / VO 介入 / 右側 LiDAR 雷達 |
+| `status_tui` | 即時儀表板：模式 / 三層速度(想/送/實) / 延遲 / RNN hidden / 動態障礙 / VO 介入 / 右側 LiDAR 雷達 |
 | `diag_logger` | 被動寫 CSV，**每個 goal/path 一段獨立紀錄**（到終點自動停 + 自動 re-arm）。資料在 `~/rover_rl/logs/diag/diag_<時間>/` |
 | `analyze_diag` | 離線報告：速度三層對比、延遲、goal 型態×距離×速度、晃動歸因 |
 
@@ -320,6 +317,6 @@ LiDAR sweep 公式兩端**完全相同**，避免 sim-to-real obs mismatch：
 | [`V3C_DEPLOY.md`](V3C_DEPLOY.md) / [`V3E_DEPLOY.md`](V3E_DEPLOY.md) | v3c(83D) / v3e(83D) 模型部署細節 |
 | [`DEPLOY_CAMPUSROVER.md`](DEPLOY_CAMPUSROVER.md) | CampusRover 實車首次部署完整步驟 |
 | [`RNN_HANDLING.md`](RNN_HANDLING.md) | RNN hidden state 生命週期處理 |
-| [`docs/`](docs/) | 測試筆記、開發日記、啟動指令、LV-DOT 整合記錄 |
+| [`docs/`](docs/) | 測試筆記、開發日記、啟動指令 |
 
 PC 端訓練 repo：`/home/aa/IsaacLab/rover_rl`（需重訓 model / 匯出新 `.ts` / 改 obs 規格時找 PC 端訓練組）。
