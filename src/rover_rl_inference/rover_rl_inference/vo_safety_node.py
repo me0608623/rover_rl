@@ -83,6 +83,15 @@ class VOSafetyNode(Node):
         gp("w_w", 0.3)
         gp("w_goal", 0.0)   # goal 導向項權重（0=關，純貼近 RL；>0 被擋時偏好繞向 goal）
         gp("engage_range", 6.0)
+        gp("clearance_fallback", False)  # 無可行候選時改慢爬向縫隙（True）或急停（False, 預設）
+        gp("v_creep", 0.3)               # clearance 退化時的線速度上限
+        gp("goaround_v_cap", 0.0)        # RL 縮手時 VO 繞行前進速度地板（0=純守 v_des；0.3=能慢繞）
+        # --- 卡死逃脫（opt-in）：blocked+停住超過 N 秒且後方有空間 → 慢退開出空間再繞 ---
+        gp("stuck_escape_enable", False) # True=啟用卡死後退逃脫；False(預設)=堵死就停在原地
+        gp("stuck_timeout_s", 3.0)       # blocked+停住連續多久才觸發後退（設長避免有人只是路過就亂退）
+        gp("rear_clear_min_m", 1.2)      # 後方 LiDAR 淨空(policy status back_m)需大於此才敢退（防倒退撞牆）
+        gp("escape_reverse_v", -0.2)     # 逃脫後退速度（m/s，負值；慢退）
+        gp("escape_max_dist_m", 1.0)     # 後退距離上限：退這麼多仍堵死→放棄停車（防前方一直逼→無限後退）
         gp("obstacle_radius_max", 1.5)   # bbox 換算半徑的上限（防超大框把路全擋死）
 
         g = self.get_parameter
@@ -112,7 +121,16 @@ class VOSafetyNode(Node):
             w_v=float(g("w_v").value), w_w=float(g("w_w").value),
             w_goal=float(g("w_goal").value),
             engage_range=float(g("engage_range").value),
+            clearance_fallback=bool(g("clearance_fallback").value),
+            v_creep=float(g("v_creep").value),
+            goaround_v_cap=float(g("goaround_v_cap").value),
         )
+        # 卡死逃脫參數（node 層狀態機，不進 vo_layer 純函式）
+        self.stuck_escape_enable = bool(g("stuck_escape_enable").value)
+        self.stuck_timeout_s = float(g("stuck_timeout_s").value)
+        self.rear_clear_min = float(g("rear_clear_min_m").value)
+        self.escape_reverse_v = float(g("escape_reverse_v").value)
+        self.escape_max_dist = float(g("escape_max_dist_m").value)
 
         # --- 狀態 ---
         self._des_v = 0.0
@@ -129,6 +147,12 @@ class VOSafetyNode(Node):
         self._goal_t = 0.0
         self._out_v = 0.0            # 上次輸出（輸出端 slew 限速用）
         self._out_w = 0.0
+        # 卡死逃脫狀態
+        self._back_m: float | None = None   # 後方 LiDAR 淨空（取自 policy status back_m）
+        self._stuck_since: float | None = None  # 開始 blocked+停住的 monotonic 時間
+        self._escaping = False       # 是否正在後退逃脫
+        self._escape_start_xy = (0.0, 0.0)  # 後退起點 odom（量後退距離）
+        self._escape_exhausted = False  # 已退滿上限仍堵死→放棄，待前方有解才重置
         # status 節流：control loop 20Hz，狀態只需 ~5Hz（對齊 policy_node ~/status）
         self._status_every = max(1, int(round(ctrl_hz / 5.0)))
         self._status_tick = 0
@@ -195,6 +219,10 @@ class VOSafetyNode(Node):
             d = json.loads(msg.data)
         except (ValueError, TypeError):
             return
+        # 後方淨空（72-bin sweep 還原的後方最近障礙）：卡死逃脫倒退前的安全判據。
+        # goal 為 None（待命）時也要更新，故放在 goal 判斷之前。
+        bm = d.get("back_m")
+        self._back_m = float(bm) if bm is not None else None
         gd = d.get("goal_dist")
         ga = d.get("goal_ang_deg")
         if gd is None or ga is None:
@@ -259,9 +287,53 @@ class VOSafetyNode(Node):
                 f"目標({res.v:+.2f},{res.w:+.2f}) 近障{res.n_obstacles} 可行{res.n_feasible}",
                 throttle_duration_sec=0.5)
 
+        # 卡死逃脫（opt-in）：blocked+停住超過 stuck_timeout 且後方有空間 → 慢退開出空間，
+        # 邊退邊重算 VO；前方繞行弧一變可行(res.blocked=False)就自動退出 → 正常繞行接手。
+        # 後方淨空(back_m)掉到門檻下立刻中止後退（防倒退撞牆，安全優先）。
+        rear_ok = self._back_m is not None and self._back_m > self.rear_clear_min
+        if self.stuck_escape_enable:
+            if self._escaping:
+                # 已後退距離（從起點 odom 量）
+                rev_dist = math.hypot(self._robot.x - self._escape_start_xy[0],
+                                      self._robot.y - self._escape_start_xy[1])
+                if not res.blocked:
+                    self._escaping = False           # 前方有解 → 退出，正常繞行接手
+                    self._stuck_since = None
+                elif not rear_ok:                    # 後方被擋（有人故意擋/退到牆）→ 立刻中止 → 停
+                    self._escaping = False
+                    self._stuck_since = None
+                    self.get_logger().warn(
+                        f"VO 逃脫中止：後方淨空 {self._back_m:.1f}m≤{self.rear_clear_min:.1f}m"
+                        "（有人擋後方/接近牆）→ 停車")
+                elif rev_dist >= self.escape_max_dist:   # 退滿上限仍堵 → 放棄、停著等障礙離開
+                    self._escaping = False
+                    self._stuck_since = None
+                    self._escape_exhausted = True
+                    self.get_logger().warn(
+                        f"VO 逃脫：已後退 {rev_dist:.1f}m 仍堵死 → 放棄、停車等障礙離開")
+            elif res.blocked and abs(self._out_v) < 0.05:
+                if self._stuck_since is None:
+                    self._stuck_since = now
+                if ((now - self._stuck_since) >= self.stuck_timeout_s and rear_ok
+                        and not self._escape_exhausted):
+                    self._escaping = True
+                    self._escape_start_xy = (self._robot.x, self._robot.y)
+                    self.get_logger().warn(
+                        f"VO 卡死逃脫：堵死 {self.stuck_timeout_s:.0f}s 且後方淨空 "
+                        f"{self._back_m:.1f}m → 慢退 {self.escape_reverse_v:.1f}m/s（上限 "
+                        f"{self.escape_max_dist:.1f}m）開空間繞")
+            else:
+                self._stuck_since = None
+            # 前方一旦有解（障礙離開）→ 重置「退滿放棄」狀態，允許日後再逃脫
+            if not res.blocked:
+                self._escape_exhausted = False
+
         # 輸出端 slew 限速：候選窗較寬，靠這裡把輸出每拍限在 accel×ctrl_dt 內，
         # 保證實際送底盤的 cmd 平滑可達（不會因 VO 切解而跳階）。
-        self._publish_slew(res.v, res.w)
+        if self._escaping:
+            self._publish_slew(self.escape_reverse_v, 0.0)   # 直退（w=0），重算後前方可行即退出
+        else:
+            self._publish_slew(res.v, res.w)
         self._publish_status(res=res, intervening=intervening, obs_stale=obs_stale)
 
     def _publish_slew(self, target_v: float, target_w: float) -> None:
@@ -274,6 +346,9 @@ class VOSafetyNode(Node):
     def _publish_hard_zero(self) -> None:
         self._out_v = 0.0
         self._out_w = 0.0
+        self._escaping = False       # 看門狗發 0 → 取消逃脫
+        self._stuck_since = None
+        self._escape_exhausted = False
         self._emit(0.0, 0.0)
 
     def _emit(self, v: float, w: float) -> None:
@@ -302,6 +377,9 @@ class VOSafetyNode(Node):
             "window_time": self.vo.window_time,
             # goal 導向項：w_goal>0 且本拍有有效 goal → 繞行方向由 goal 主導
             "w_goal": self.vo.w_goal, "goal_active": bool(self._goal_active),
+            # 卡死逃脫：是否正在後退 + 後方淨空（供 TUI/debug）
+            "escaping": bool(self._escaping),
+            "back_m": (None if self._back_m is None else round(self._back_m, 2)),
         }
         if res is not None:
             d.update({

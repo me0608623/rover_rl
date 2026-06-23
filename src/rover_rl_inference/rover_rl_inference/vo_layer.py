@@ -17,8 +17,9 @@
   3. 視窗內撒候選 (v, ω)，並把 clamp 後的 desired 也塞進候選（可行時零偏差直接放行）。
   4. 每個候選以等速弧線 rollout（horizon T），障礙線性外推 p_i + v_i·t；
      任一時刻距離 < r_robot + r_obs + margin → 該候選在 horizon 內碰撞 = 不可行。
-  5. 可行候選中選 cost = w_v·Δv² + w_ω·Δω² 最小者（最貼近 RL 意圖）。
-  6. 全部不可行 → fallback：停車 (0, 0)（安全優先，對應使用者選定行為）。
+  5. 可行候選中選 cost 最小者：cost = w_v·Δv² + w_ω·Δω²（貼近 RL）+ w_goal·(d_end−d_now)
+     （朝 goal 推進獎勵）。進展項讓「靜止障礙在前」時主動繞過去往 goal 走，而非慢爬卡在障礙前。
+  6. 全部不可行 → fallback：clearance_fallback 開→慢爬向碰撞最晚方向；關→停車 (0,0)。
 
 座標系：robot 與 obstacle 一律在 **odom frame**（LV-DOT localization_mode:1 用 odom）。
 """
@@ -54,12 +55,28 @@ class VOParams:
     # --- 成本權重（越大越貼近 RL 該通道；線速度通常較重要）---
     w_v: float = 1.0
     w_w: float = 0.3
-    # --- goal 導向項：可行弧線 rollout 終點朝向 vs 終點→goal 方位的夾角誤差權重 ---
-    # 0.0=關（純貼近 RL，遇障只會慢/停）；>0=被擋時偏好「繞過去又重新對準 goal」的弧線。
-    # ⚠ 應 < w_v：goal 項只在直走被擋、需要選繞行側時主導；路徑暢通時 RL 命令仍應勝出。
+    # --- goal 進展獎勵（DWA 式）：可行弧線 rollout「終點離 goal 的距離」獎勵權重 ---
+    # 0.0=關（純貼近 RL，遇障只會慢/停在障礙前）；>0=偏好「rollout 終點更接近 goal」的弧線
+    #   → 靜止障礙在前時主動往側邊繞過去再朝 goal 推進，而非慢爬到障礙前卡住。
+    # ⚠ 舊版用「終點朝向 vs goal 方位」的夾角誤差，會懲罰必要的閃避轉向(轉開=暫時背離 goal)→
+    #   反而卡死不繞，已改為「終點離 goal 距離」進展獎勵（cost += w_goal·(d_end−d_now)）。
+    # 為何能分流「靜止→繞 / 對衝→停」：移動逼近的人會走進側弧 → 側弧 rollout 撞 → 不可行 →
+    #   只剩停/倒退（正確讓行）；靜止的人側弧不撞 → 進展獎勵讓繞行弧勝出。分流靠可行性，非權重。
     w_goal: float = 0.0
     # --- 啟動條件：障礙進入此距離才跑 VO（省運算、避免遠處誤煞）---
     engage_range: float = 6.0   # m
+    # --- clearance 退化（解「全候選不可行就急停、不繞」）---
+    # False（預設）=舊行為：無可行候選 → hard-stop (0,0)。
+    # True = 無可行候選時不急停，改選「碰撞時刻最晚」(=最往縫隙挪) 的候選，
+    #        速度封到 v_creep 慢爬、保留其轉向 → 逐拍(20Hz)往空檔擠，自然湧現繞行。
+    #        仍回報 blocked=True（status 照顯示「全堵死」），只是動作從停車改成「慢爬向縫隙」。
+    clearance_fallback: bool = False
+    v_creep: float = 0.3        # m/s — 退化時的線速度上限（慢爬，安全優先）
+    # VO 主動繞行前進速度上限：RL 期望低(timid，rl_v≈0)時 VO 仍可前進到此速度執行繞行。
+    # 0.0=純守 v_des（RL 多慢 VO 多慢→RL 縮手就繞不動，只原地轉）；0.3=RL 近乎停 VO 也能慢繞。
+    # 安全：輸出仍 ≤ max(v_des, this)，RL 正常驅動(v_des≥this)時不超過 v_des（不重現 speedup 0.8）；
+    # 只在 RL 縮手(v_des<this)時補到 this。且只在 engaged(有近障跑候選)時生效；沿不撞的弧前進。
+    goaround_v_cap: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -99,15 +116,6 @@ def _clamp(x: float, lo: float, hi: float) -> float:
     if x > hi:
         return hi
     return x
-
-
-def _ang_norm(a: float) -> float:
-    """把角度 wrap 到 [-π, π]。"""
-    while a > math.pi:
-        a -= 2.0 * math.pi
-    while a < -math.pi:
-        a += 2.0 * math.pi
-    return a
 
 
 def _linspace(lo: float, hi: float, n: int) -> list[float]:
@@ -172,6 +180,13 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
     # 3) dynamic window（以實測速度為中心，window_time 內可達範圍 → 候選夠廣可繞行）
     v_lo = _clamp(robot.v - p.accel_v * p.window_time, p.v_min, p.v_max)
     v_hi = _clamp(robot.v + p.accel_v * p.window_time, p.v_min, p.v_max)
+    # ★安全層不變快：VO 線速度上限鉗到 max(v_des, goaround_v_cap)。
+    # 主鉗 v_des：RL 正常驅動時不超過 RL 期望（不重現 speedup：實測 des_v=0.5→VO 曾衝 0.8）。
+    # goaround_v_cap 地板：RL 縮手(v_des≈0)且近障時，仍允許前進到此速度沿不撞弧繞行
+    # （否則 v_des≈0→v_hi=0→VO 只能原地轉、繞不過去）。仍只在 engaged 候選搜尋中生效。
+    v_hi = min(v_hi, max(v_des, p.goaround_v_cap))
+    if v_hi < v_lo:          # RL 期望比可達下限還慢（如 RL 要停）→ 收斂到 v_des，仍允許倒退候選
+        v_lo = min(v_lo, v_hi)
     w_lo = _clamp(robot.w - p.accel_w * p.window_time, -p.w_max, p.w_max)
     w_hi = _clamp(robot.w + p.accel_w * p.window_time, -p.w_max, p.w_max)
 
@@ -187,30 +202,48 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
         w_cands.append(0.0)
 
     # 4-5) 掃所有候選，挑「可行且成本最低」者
-    #   成本 = w_v·Δv² + w_w·Δω²（貼近 RL）+ w_goal·heading_err²（朝 goal 繞行，選填）
+    #   成本 = w_v·Δv² + w_w·Δω²（貼近 RL）+ w_goal·(d_end−d_now)（朝 goal 推進，選填）
     use_goal = goal is not None and p.w_goal > 0.0
+    d_now = math.hypot(goal[0] - robot.x, goal[1] - robot.y) if use_goal else 0.0
     best: tuple[float, float] | None = None
     best_cost = math.inf
     best_ttc = math.inf
     n_feasible = 0
+    # clearance 退化用：記「碰撞時刻最晚」的不可行候選（=最往縫隙挪的方向）。
+    # 同 ttc 時偏好較慢（|v| 小）以策安全。
+    inf_best: tuple[float, float] | None = None
+    inf_best_ttc = -1.0
     for v in v_cands:
         for w in w_cands:
-            ttc, ex, ey, eyaw = _rollout(v, w, robot, near, p)
+            ttc, ex, ey, _eyaw = _rollout(v, w, robot, near, p)
             if ttc == math.inf:  # horizon 內不撞
                 n_feasible += 1
                 cost = p.w_v * (v - v_des) ** 2 + p.w_w * (w - w_des) ** 2
                 if use_goal:
-                    # 弧線終點朝向與「終點→goal」方位的夾角誤差（越小=越對準 goal）
-                    bearing = math.atan2(goal[1] - ey, goal[0] - ex)
-                    herr = _ang_norm(bearing - eyaw)
-                    cost += p.w_goal * herr * herr
+                    # 進展獎勵：弧線終點離 goal 的距離（越接近 goal=越省）。
+                    # d_end−d_now<0 表示有推進 → 降低成本，獎勵真的繞過去往 goal 走。
+                    d_end = math.hypot(goal[0] - ex, goal[1] - ey)
+                    cost += p.w_goal * (d_end - d_now)
                 if cost < best_cost:
                     best_cost = cost
                     best = (v, w)
                     best_ttc = math.inf
+            elif p.clearance_fallback:
+                # 不可行候選：留住碰撞最晚者（ttc 大 = 撐最久 = 最往空檔挪）
+                if ttc > inf_best_ttc + 1e-3 or (
+                        abs(ttc - inf_best_ttc) <= 1e-3
+                        and inf_best is not None and abs(v) < abs(inf_best[0])):
+                    inf_best_ttc = ttc
+                    inf_best = (v, w)
 
-    # 6) 全不可行 → fallback 停車（安全優先）
+    # 6) 全不可行 → fallback
     if best is None:
+        if p.clearance_fallback and inf_best is not None:
+            # 不急停：慢爬向「碰撞最晚」的方向（保留轉向、線速度封到 v_creep）。
+            # 逐拍 20Hz 重規劃 → 往縫隙擠出繞行。仍標 blocked（場面確實全堵）。
+            fv = _clamp(inf_best[0], p.v_min, p.v_creep)
+            return VOResult(fv, inf_best[1], engaged=True, blocked=True,
+                            n_obstacles=len(near), n_feasible=0, min_ttc=inf_best_ttc)
         return VOResult(0.0, 0.0, engaged=True, blocked=True,
                         n_obstacles=len(near), n_feasible=0, min_ttc=0.0)
 
