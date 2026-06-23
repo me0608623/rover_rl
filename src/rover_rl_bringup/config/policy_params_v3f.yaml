@@ -1,0 +1,126 @@
+rover_rl_policy:
+  ros__parameters:
+    # ════════════════════════════════════════════════════════════════
+    # ★ v3f (sa4_v3f_240000) 專用 config — deploy_rl_shell 選到 *v3f* 自動帶入。
+    # 與 v3e 的唯一差別: obs = 79D (act_hist 整段移除, CHARGE_USE_ACT_HIST=0 訓練)。
+    #   → policy_node 偵測 bundle.raw_obs_dim==79 會自動關閉 action stacking / act_hist,
+    #     故下方 act_stack_* / act_hist_* 參數對 v3f 不作用 (保留以共用 v3e 範本, 無害)。
+    # 校準與 v3e 相同: r_min=0.25, 動作 omega_max=1.2, obs omega 正規化=1.5。
+    # 79D obs 佈局: ego(4)+goal(2)+lidar(72)+time(1); 見 models/sa4_v3f_240000.obs_spec.md。
+    # ════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════
+    # v3e（sa2_v3e_240000 / sa1_v3e_60000）專用 config — 由 deploy_rl_shell
+    # 選單在選到 *v3e* checkpoint 時自動以 params_file:= 帶入。
+    #
+    # 架構與 v3c 完全相同（83D obs / RNN hidden=64 / fc=64 / middle=48 /
+    # predict=13），故沿用 v3c 部署管線，僅以下差異：
+    #   1. model_path → sa2_v3e_240000.ts（動態場景最終）/ sa1_v3e_60000.ts（靜態）
+    #      兩者皆 83D、同架構，靠選單 model_path:= 切換；此處預設動態。
+    #   2. act_max_angular_velocity 0.785 → 1.2（★ 修正 v3c 已知 bug：訓練實際
+    #      ω_max = 1.2 rad/s，見 finding_v3c_omega_max_decode_bug。底盤
+    #      profile_omega_max=1.2，故 1.2 既對上訓練值又在底盤上限內）。
+    #
+    # ⚠️ act_hist 語義差異（v3e vs v3c）：v3e 訓練用 CHARGE_ACT_HIST_MODE=
+    #    action_error（obs[79:83] = 意圖 − 實際致動殘差），v3c 用原始 action
+    #    history（上 2 步 decode 的 actual_accel/cmd_w）。car 端 policy_node 目前
+    #    以 v3c 語義填 act_hist；首次上路請架空驗證行為，若抽動/不朝 goal 再評估
+    #    是否需改 policy_node 的 act_hist 計算。詳見部署摘要。
+    #
+    # ✅ obs_max_angular_velocity = 1.5 是正確值（訓練 ObsTerm
+    #   base_angular_velocity_z max_angular_velocity=1.5），勿混三個 ω：
+    #   obs[2]正規化=1.5、動作上限=1.2、act_stack正規化=π/15。
+    # ════════════════════════════════════════════════════════════════
+
+    # --- Model ---
+    model_path: "/home/aa/rover_rl/models/sa4_v3f_240000.ts"   # v3f 79D (SA4 空間規劃最終, act_hist 整段移除)
+    device: "cpu"                     # 車上 torch 是 CPU 版；裝 CUDA torch 後可改 cuda:0
+
+    # --- Topics（CampusRover 實車配置） ---
+    topic_lidar_sweep: "/rover_rl/lidar_sweep_72"   # 訂閱 preprocessor 發的 72-bin sweep
+    topic_lidar_raw: "/velodyne_points"             # 只在 use_inline_preprocess=true 時用
+    use_inline_preprocess: false                     # false=要先啟 lidar_preprocessor 節點
+    topic_odom: "/odom"                              # 里程計來源（底盤 driver 發）
+    topic_goal_pose: "/goal_pose"                    # 單一目標（RViz Nav2 Goal）
+    topic_global_path: "/global_path"     # campusrover_routing / AIT* 任一都可
+    topic_cmd_vel: "/input/nav_cmd_vel"              # 推論輸出 cmd_vel 發布到此
+    topic_markers: "~/markers"                       # RViz 視覺化 marker（私有命名空間）
+    topic_obs_debug: "~/obs_debug"                   # 79D obs 除錯輸出（給 bev_play 取 goal body）
+    publish_obs_debug: true                          # 是否發 obs_debug
+    publish_markers: true                            # 是否發 markers
+
+    # --- QoS ---
+    lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS
+
+    # --- LiDAR 校準 ---
+    lidar_yaw_offset_deg: 0.0         # velodyne_link 相對 base_link 無 yaw → 0
+    lidar_z_filter_m: 0.5             # 訓練值；在 sensor frame |z|>0.5 過濾地板/天花板
+    lidar_r_min_m: 0.25               # ★ v3e 訓練值（=v3c，表面→人物中心 0.2 + 半徑 0.0515）
+    lidar_r_max_m: 20.0               # 最遠有效距離；>= 此值正規化為 1.0
+
+    # --- Obs normalizer（必須與訓練一致；勿改） ---
+    obs_max_acceleration: 1.0         # obs 加速度正規化分母
+    obs_max_linear_velocity: 1.0      # obs 線速度正規化分母
+    obs_max_angular_velocity: 1.5     # ✅ 正確（訓練 ObsTerm max_angular_velocity=1.5），勿改
+    robot_radius_m: 0.35              # 與訓練一致
+    episode_horizon_s: 60.0           # obs 時間項正規化用 episode 長度
+
+    # --- Action limits（鎖在 v3e 訓練分布內） ---
+    act_max_linear_velocity: 1.0      # v3e v_max = 1.0 m/s
+    act_max_linear_accel: 0.5         # v3e a_max = 0.5 m/s²
+    act_max_angular_velocity: 1.2     # ★ v3e ω_max = 1.2 rad/s（修正 v3c 0.785 bug；底盤上限 1.2）
+    act_max_angular_accel: 3.0        # ★ 角速度 α slew（每步 Δω≤3.0×dt=0.6；0=不 slew）
+
+    # --- 全域速度縮放 ---
+    # v3e 延遲感知重訓已取代時間膨脹；首次上電靠架空+estop+保守 goal 確保安全，
+    # 不靠降 speed_rate。穩定後可調回 1.0 精確對齊 slew/action_stack。
+    speed_rate: 0.5
+
+    # --- Action stacking（v3e=v3c）：raw_obs_dim==83 自動啟用 ---
+    # 正規化分母 = 訓練 action history 尺度（obs_spec [79:83]：a÷0.2、ω÷π/15）
+    act_stack_size: 2                 # 堆疊步數；83 = 79 + 2*2
+    act_stack_a_max: 0.2              # 線加速度正規化分母
+    act_stack_omega_max: 0.20943951   # 角速度正規化分母 π/15
+
+    # --- act_hist 語義（v3e = action_error；隨模型 obs_spec.json 自動偵測） ---
+    # obs[79:81]=上一步指令(a,ω)；obs[81:83] 依 mode：raw=a_{t-2},ω_{t-2}；
+    # action_error=致動追蹤誤差(指令−實測速度)。policy_node 預設讀 <model>.obs_spec.json。
+    act_hist_mode: "auto"             # auto=讀 sidecar（v3e→action_error）；raw/action_error 可覆寫
+    act_hist_err_source: "measured"   # ★ measured=(上拍指令−odom實測)/v_max；zero=填0（穩態近似，較保守）
+    act_err_v_max: 1.0                # err_v 正規化分母（訓練 max_linear_velocity）
+    act_err_w_max: 1.2                # err_w 正規化分母（訓練 max_angular_vel=1.2）
+
+    # --- 控制週期 ---
+    control_dt: 0.2                   # 5 Hz inference；訓練 dt 一致，勿改
+    cmd_rate_hz: 20.0                 # 20 Hz cmd_vel republish（解 watchdog 風險）
+    marker_rate_hz: 10.0
+    deterministic: true               # 首次部署用 argmax
+    timeout_lidar_s: 0.5              # VLP-16 10Hz 雙回掃，0.5s 足夠
+    timeout_odom_s: 0.3               # /odom 20Hz，0.3s 偵測掉線
+    lidar_motion_compensation: true   # 補償掃描期間機器人位移
+
+    # --- cmd_vel filter (low-pass + slew-rate) ---
+    cmd_alpha_linear: 0.3             # 線速度低通係數
+    cmd_alpha_angular: 0.5            # 角速度低通係數
+    cmd_max_accel_linear: 1.0         # m/s² slew limit
+    cmd_max_accel_angular: 3.0        # rad/s² slew limit
+
+    # --- cmd_delay 補償 (gap #5) ---
+    # v3e 已做延遲感知重訓（obs_delay_steps DR），理論上可不補；先沿用 v3c 設定，
+    # 若實測過度領先可 ros2 param set /rover_rl_policy cmd_delay_comp_enable false
+    cmd_delay_comp_s: 0.2
+    cmd_delay_comp_enable: true
+    cmd_delay_comp_src: "commanded"
+
+    # --- mode ---
+    initial_mode: "nav"               # 啟動模式（nav/idle/estop/manual/paused）
+    base_frame: "base_footprint"      # 車體 frame；查 map→此 frame TF 取車姿
+
+    # --- Goal / 定位 ---
+    goal_frame: "map"
+    goal_tolerance_m: 0.6           # 進此距離視為到達 goal
+    path_lookahead_m: 2.0           # carrot lookahead (pure-pursuit-like)
+    topic_ndt_pose: "/ndt_pose"     # 僅用於 NDT 活性判定（內容是 map→odom，非車姿）
+    require_ndt: false              # true=NDT 未穩定就拒絕動；false=fallback 純 odom
+
+    # --- Safety ---
+    safety_lidar_emergency_stop_m: 0.40   # 首次部署保守值，穩定後可降到 0.30
