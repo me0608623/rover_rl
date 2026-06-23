@@ -19,6 +19,8 @@ rover_rl_diag_logger:
                                                #      （避免發了 goal 但車沒動就佔一個空 run）
     start_motion_eps: 0.03                     # 判定「有速度輸出」門檻(|v| 或 |w|，m/s 或 rad/s)
     log_only_with_goal: true                   # 只在有 goal 時寫列（收斂期無 goal 不留雜訊）
+    stale_warn_s: 0.5                          # 開錄前各輸入 *_age 超過此值 → 紅字警告「記錄可能被
+                                               # 阻塞」（抓 topic 掉線 / wandb online 卡死 executor）
 
     # --- 一個 goal/path = 一段獨立紀錄（到終點自動停 + 自動 re-arm）---
     auto_stop_goal_tol: 0.6                     # 距 goal < 此值(m)
@@ -28,5 +30,9 @@ rover_rl_diag_logger:
                                                # 擋 routing path 2Hz 殘留造成的秒重開迴圈
 
     # --- wandb（每段一個 run，run 名=資料夾名）---
+    # ⚠ online 會卡死記錄：wandb.init/log 走網路同步，在單執行緒 executor 上一阻塞數秒
+    #   就餓死所有訂閱（odom/cmd/status 全 stale）→ CSV 只寫得出 1 列、節點隨後退出。
+    #   2026-06-22 實測：online 開錄 2ms 後即停、t_rel 直接跳 3.86s。實車網路不穩一律 offline，
+    #   資料留本機，回頭 `wandb sync ~/rover_rl/wandb/<run>` 再上傳。
     enable_wandb: true                         # 是否上傳 wandb（每段一個 run）
-    wandb_mode: "online"                       # online(即時)/offline(回頭 wandb sync)/disabled
+    wandb_mode: "offline"                      # offline(本機,非阻塞,推薦)/online(會卡死記錄!)/disabled
