@@ -52,6 +52,13 @@ class RoutingToPathNode(Node):
         self.declare_parameter("auto_clear_on_arrival", True)
         self.declare_parameter("arrival_clear_tol_m", 0.7)
         self.declare_parameter("arrival_clear_ticks", 5)   # status 5Hz × 5 = 1s
+        # 啟動清除：棧重啟時 RViz（獨立 process）仍掛著上一輪 routing 的紅色 /global_path。
+        # 新節點起來後前幾秒連發空 Path + 空站序主動清掉殘留（一收到新路徑就停）。
+        self.declare_parameter("clear_on_startup", True)
+        self.declare_parameter("clear_frame", "map")          # 空 Path 的 frame（與舊路徑同，通常 map）
+        self.declare_parameter("clear_startup_ticks", 6)      # 0.5s × 6 = 3s 內連發數次防漏接
+        # 長路徑偶發 flaky 回空（10+ 節點較易），單次點擊剛好中空就沒路線 → 自動重試數次。
+        self.declare_parameter("routing_retry", 3)
 
         building = self.get_parameter("building").get_parameter_value().string_value
         floor = self.get_parameter("floor").get_parameter_value().string_value
@@ -79,6 +86,14 @@ class RoutingToPathNode(Node):
 
         # 2Hz 定期重發最後一條路徑 + 站序，避免晚啟動的訂閱者（RViz / TUI）漏接
         self.create_timer(0.5, self._repub_path)
+
+        # 啟動清除殘留路線：見 clear_on_startup 參數說明
+        if bool(self.get_parameter("clear_on_startup").value):
+            self._clear_frame = self.get_parameter(
+                "clear_frame").get_parameter_value().string_value
+            self._startup_clear_ticks = int(self.get_parameter("clear_startup_ticks").value)
+            self._startup_clear_count = 0
+            self._startup_clear_timer = self.create_timer(0.5, self._startup_clear)
 
         # 監聽手動 2D Goal Pose：使用者手點單一目標 = 放棄目前 routing 路徑。
         # 收到就清掉緩存並停止 2Hz 重發，否則重發的舊 path 會持續蓋過手點目標
@@ -123,6 +138,22 @@ class RoutingToPathNode(Node):
         )
         self._building = building
         self._floor = floor
+
+    def _startup_clear(self):
+        """棧重啟後清掉 RViz 殘留的舊紅線：前幾秒連發空 Path + 空站序（防 discovery 漏接），
+        然後 cancel。一旦收到新路徑（_last_path 非空）立即停，避免蓋掉新規劃的路線。"""
+        if self._last_path is not None or self._startup_clear_count >= self._startup_clear_ticks:
+            self._startup_clear_timer.cancel()
+            return
+        empty = Path()
+        empty.header.frame_id = self._clear_frame
+        empty.header.stamp = self.get_clock().now().to_msg()
+        self.pub_path.publish(empty)
+        self.pub_stations.publish(String(data=json.dumps(
+            {"stations": [], "wp_idx": [], "n_wp": 0})))
+        self._startup_clear_count += 1
+        if self._startup_clear_count == 1:
+            self.get_logger().info("啟動清除：連發空 Path 清掉 RViz 殘留的舊 routing 路線")
 
     def _repub_path(self):
         if self._last_path is not None:
@@ -251,31 +282,31 @@ class RoutingToPathNode(Node):
             response.routing = []
             return response
 
-        # 用 Event 把 async future 轉成同步等待：service handler 必須回傳 response，
-        # 不能 return future；故在此阻塞等下游 routing 完成（靠 Reentrant group 不死鎖）。
-        event = threading.Event()
-        result_holder: list = []
+        # 長路徑偶發 flaky 回空（網路/引擎邊界）→ 自動重試數次，多數一兩次內成功。
+        # 引擎已修 segfault（common_connection 空陣列防護），空結果會乾淨回傳，重試安全。
+        retries = max(1, int(self.get_parameter("routing_retry").value))
+        result = None
+        for attempt in range(1, retries + 1):
+            result = self._call_routing_once(request)
+            if result is not None and result.routing:
+                if attempt > 1:
+                    self.get_logger().info(f"routing 第 {attempt} 次成功（前次回空已重試）")
+                break
+            if attempt < retries:
+                self.get_logger().warn(
+                    f"routing 回空，重試 {attempt}/{retries - 1}"
+                    f"（{request.origin} → {request.destination}）")
 
-        def _done(future):
-            try:
-                result_holder.append(future.result())
-            except Exception as e:
-                self.get_logger().error(f"routing callback 異常: {e}")
-            event.set()
-
-        future = self.routing_client.call_async(request)
-        future.add_done_callback(_done)
-
-        if not event.wait(timeout=8.0):
-            self.get_logger().warn("routing service 超時")
-            response.routing = []
-            return response
-
-        if result_holder and result_holder[0].routing:
+        if result is not None and result.routing:
             # generation_path 回傳 Path[]（可能多段）；policy 只需單一連續路徑，
             # 取第 0 條，存進 _last_path 供 2Hz republish 並立即發一次。
-            result = result_holder[0]
             path = result.routing[0]
+            # 重新規劃：先發一條空 Path 強制 RViz 清掉舊的紅色路線，再發新路徑，
+            # 確保畫面上永遠只有一條路線（避免新舊兩條同時殘留）。
+            empty = Path()
+            empty.header.frame_id = path.header.frame_id
+            empty.header.stamp = self.get_clock().now().to_msg()
+            self.pub_path.publish(empty)
             self._last_path = path
             self._arrival_count = 0      # 新路徑 → 重置到達計數，避免沿用舊段殘值
             self.pub_path.publish(path)
@@ -290,10 +321,31 @@ class RoutingToPathNode(Node):
             )
             response.routing = result.routing
         else:
-            self.get_logger().warn("routing 回傳空路徑")
+            self.get_logger().warn(f"routing 回傳空路徑（已試 {retries} 次）")
             response.routing = []
 
         return response
+
+    def _call_routing_once(self, request):
+        """打一次 generation_path 並同步等結果。回傳 result（含 .routing）或 None（逾時/異常）。
+        用 Event 把 async future 轉同步：service handler 必須回傳 response、不能 return future；
+        靠 Reentrant callback group 在 callback 內阻塞等下游不會死鎖。"""
+        event = threading.Event()
+        holder: list = []
+
+        def _done(future):
+            try:
+                holder.append(future.result())
+            except Exception as e:
+                self.get_logger().error(f"routing callback 異常: {e}")
+            event.set()
+
+        future = self.routing_client.call_async(request)
+        future.add_done_callback(_done)
+        if not event.wait(timeout=8.0):
+            self.get_logger().warn("routing service 超時")
+            return None
+        return holder[0] if holder else None
 
 
 def main(args=None):

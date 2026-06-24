@@ -174,7 +174,7 @@ def generate_launch_description():
             "file_path2": os.path.join(routing_pkg, "share/node_module/3F_modul.csv"),
             "file_path3": os.path.join(routing_pkg, "share/node_module/3F_modul.csv"),
             "file_node_info": os.path.join(routing_pkg, "share/node_module/3F_info.csv"),
-            "connect_method": "BezierCurve",
+            "connect_method": "common",
             "path_resolution": 0.05,
             "bezier_length": 1.5,
             "bezier_resolution": 0.01,
@@ -192,6 +192,7 @@ def generate_launch_description():
         parameters=[
             {"use_database": False},
             {"json_folder": os.path.join(routing_pkg, "share/json/")},
+            {"json_file": "itc_3f_3.json"},  # 直接讀此檔，忽略 building/floor 拼名
         ],
     )
     # 把規劃出的路徑畫成 RViz marker
