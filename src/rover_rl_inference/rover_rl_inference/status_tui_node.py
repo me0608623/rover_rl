@@ -374,7 +374,7 @@ class Dashboard:
         collided = False
         if status is not None and not stale:
             fm = status.get("front_m")
-            collided = fm is not None and (fm - self._front_overhang) <= 0.0
+            collided = fm is not None and (fm - self.node._front_overhang) <= 0.0
 
         win = stdscr.derwin(box_h, box_w, 0, 0)
         if collided and int(now * 2) % 2 == 0:
@@ -909,7 +909,7 @@ class Dashboard:
         # 車頭距障：front_m 是「感測器→障礙」，扣車頭前伸量 = 車頭最前緣到障礙的真實餘裕。
         # ⚠ VLP-16 近場盲區 ~0.4m（感測器物理極限）：front_m 不會小於 ~0.4，故餘裕 ≤0 時
         # 顯示「⚠ 已進盲區/可能接觸」提醒——此時雷達已看不到、不能只信數字。
-        oh = self._front_overhang
+        oh = self.node._front_overhang
         if f is None:
             front_txt, front_pair = "—", 5
         else:
