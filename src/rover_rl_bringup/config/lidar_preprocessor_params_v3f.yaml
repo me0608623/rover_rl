@@ -19,9 +19,13 @@ rover_rl_lidar_preprocessor:
 
     # --- 訓練端對齊參數（v3e=v3c；勿改） ---
     num_bins: 72                             # 角度 bin 數（atan2 環周 360°/72）
+    # ⚠ tcadapt 部署卡片寫「normalize /10」是文件筆誤；PC 端 charge_env_cfg_vlp16.py
+    #   ObsTerm wd_like_sweep_72 實為 r_max=20 / r_robot=0.35 / r_min=0.25（無 /10）。勿改成 10。
     r_max: 20.0                              # 最遠有效距離(m)，>= 此值正規化為 1.0
     r_robot: 0.35                            # 機器人半徑(m)，正規化基準
     r_min: 0.25                              # ★ v3e 訓練值（v2 為 0.9）
     z_filter: 0.5                            # sensor frame |z|>0.5 過濾地板/天花板
     yaw_offset_deg: 0.0                      # velodyne_link 相對 base_link 無 yaw → 0
-    motion_compensation: true                # 補償掃描期間機器人位移
+    motion_compensation: false               # ⚠ 關閉：均勻平移式補償會讓近物點雲重新分 bin，
+                                             # 移動時近距離讀數跳變（0.5m→1.1m）。訓練端 Isaac
+                                             # 為瞬時 ray cast 無畸變，關掉反而更貼近訓練分布

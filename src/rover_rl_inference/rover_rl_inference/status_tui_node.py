@@ -27,7 +27,7 @@ import unicodedata
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32MultiArray, String
+from std_msgs.msg import Empty, Float32MultiArray, String
 from visualization_msgs.msg import MarkerArray
 
 # 到達判定距離（m）：與 diag_logger 的 auto_stop_goal_tol 對齊，goal_dist ≤ 此值即算到達
@@ -67,11 +67,20 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_vo_status", "/vo_safety_node/status")
         # 右側 LiDAR 雷達（重畫 BEV 的極座標散點，不吃 bev_image 影像）
         self.declare_parameter("topic_sweep", "/rover_rl/lidar_sweep_72")
+        # 往返測試（enable_pingpong:=true 才有此 topic；收不到→不顯示提示）：
+        # 就緒時 TUI 跳提示，按空白鍵發 start 觸發開始往返
+        self.declare_parameter("topic_pingpong_status", "/rover_rl/pingpong/status")
+        self.declare_parameter("topic_pingpong_start", "/rover_rl/pingpong/start")
+        self.declare_parameter("topic_pingpong_auto", "/rover_rl/pingpong/auto_toggle")
+        self.declare_parameter("topic_pingpong_stop", "/rover_rl/pingpong/stop")
         self.declare_parameter("enable_radar", True)
         self.declare_parameter("radar_style", "braille")   # braille / dots，可熱切換
         self.declare_parameter("radar_range_m", 5.0)       # 雷達顯示半徑（>此距離貼邊）
         self.declare_parameter("r_max", 20.0)              # 與 preprocessor 正規化對齊
         self.declare_parameter("r_robot", 0.35)
+        # 車頭前伸量：LiDAR 感測器到車頭最前緣的距離(m)。front_m 是「感測器→障礙」，
+        # 扣掉此量才是「車頭→障礙」的真實餘裕。實測：撞牆瞬間 front_m≈0.5~0.6 → 預設 0.5
+        self.declare_parameter("front_overhang_m", 0.5)
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
         topic_dyn = self.get_parameter(
             "topic_dynamic_bboxes").get_parameter_value().string_value
@@ -80,9 +89,18 @@ class StatusTuiNode(Node):
             "topic_route_stations").get_parameter_value().string_value
         topic_vo = self.get_parameter("topic_vo_status").get_parameter_value().string_value
         topic_sweep = self.get_parameter("topic_sweep").get_parameter_value().string_value
+        topic_pp = self.get_parameter(
+            "topic_pingpong_status").get_parameter_value().string_value
+        topic_pp_start = self.get_parameter(
+            "topic_pingpong_start").get_parameter_value().string_value
+        topic_pp_auto = self.get_parameter(
+            "topic_pingpong_auto").get_parameter_value().string_value
+        topic_pp_stop = self.get_parameter(
+            "topic_pingpong_stop").get_parameter_value().string_value
         self._radar_range = float(self.get_parameter("radar_range_m").value)
         self._r_max = float(self.get_parameter("r_max").value)
         self._r_robot = float(self.get_parameter("r_robot").value)
+        self._front_overhang = float(self.get_parameter("front_overhang_m").value)
         self._lock = threading.Lock()
         self._status: dict | None = None
         self._last_t = 0.0
@@ -96,12 +114,21 @@ class StatusTuiNode(Node):
         self._vo_t = 0.0
         self._sweep: list | None = None        # 72-bin 正規化 sweep（畫雷達用）
         self._sweep_t = 0.0
+        self._pp: dict | None = None            # 往返測試狀態；None=未啟動/沒收到
+        self._pp_t = 0.0
         self.create_subscription(String, topic, self._cb_status, 10)
         self.create_subscription(MarkerArray, topic_dyn, self._cb_dyn, 10)
         self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
         self.create_subscription(String, topic_stations, self._cb_stations, 10)
         self.create_subscription(String, topic_vo, self._cb_vo, 10)
         self.create_subscription(Float32MultiArray, topic_sweep, self._cb_sweep, 10)
+        self.create_subscription(String, topic_pp, self._cb_pp, 10)
+        # 空白鍵 → 發 start 觸發往返測試開始
+        self.pub_pp_start = self.create_publisher(Empty, topic_pp_start, 5)
+        # 'a' 鍵 → 熱切換全自動模式
+        self.pub_pp_auto = self.create_publisher(Empty, topic_pp_auto, 5)
+        # 's' 鍵 → 主動中斷往返（running 中回待命、停車）
+        self.pub_pp_stop = self.create_publisher(Empty, topic_pp_stop, 5)
         self._topic = topic
 
     def _cb_status(self, msg: String) -> None:
@@ -153,13 +180,51 @@ class StatusTuiNode(Node):
             self._sweep = list(msg.data)
             self._sweep_t = time.monotonic()
 
+    def _cb_pp(self, msg: String) -> None:
+        try:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            return
+        with self._lock:
+            self._pp = data
+            self._pp_t = time.monotonic()
+
+    def pingpong_ready(self) -> bool:
+        """往返節點是否處於 ready（停在點上等空白鍵）且狀態新鮮（<2s）。"""
+        with self._lock:
+            if self._pp is None or (time.monotonic() - self._pp_t) > 2.0:
+                return False
+            return self._pp.get("state") == "ready"
+
+    def request_pingpong_start(self) -> None:
+        self.pub_pp_start.publish(Empty())
+
+    def pingpong_active(self) -> bool:
+        """往返節點是否在跑（狀態新鮮 <2s）——決定 'a' 鍵是否作用。"""
+        with self._lock:
+            return self._pp is not None and (time.monotonic() - self._pp_t) <= 2.0
+
+    def toggle_pingpong_auto(self) -> None:
+        self.pub_pp_auto.publish(Empty())
+
+    def pingpong_running(self) -> bool:
+        """往返節點是否在跑往返（running，狀態新鮮 <2s）——決定 's' 鍵是否作用。"""
+        with self._lock:
+            if self._pp is None or (time.monotonic() - self._pp_t) > 2.0:
+                return False
+            return self._pp.get("state") == "running"
+
+    def request_pingpong_stop(self) -> None:
+        self.pub_pp_stop.publish(Empty())
+
     def snapshot(self) -> tuple:
         with self._lock:
             return (self._status, self._last_t, self._lvdot_n, self._lvdot_t,
                     self._diag_event, self._diag_event_t,
                     self._stations, self._stations_t,
                     self._sweep, self._sweep_t,
-                    self._vo, self._vo_t)
+                    self._vo, self._vo_t,
+                    self._pp, self._pp_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -204,6 +269,15 @@ class Dashboard:
                 ch = stdscr.getch()
                 if ch in (ord("q"), ord("Q"), 27):  # q / ESC
                     break
+                # 空白鍵：往返測試就緒時 → 發 start 觸發開始（其餘狀態忽略）
+                if ch == ord(" ") and self.node.pingpong_ready():
+                    self.node.request_pingpong_start()
+                # 'a' 鍵：往返測試在跑時 → 熱切換全自動模式（停穩自動出發，免按空白）
+                if ch in (ord("a"), ord("A")) and self.node.pingpong_active():
+                    self.node.toggle_pingpong_auto()
+                # 's' 鍵：往返測試 running 時 → 主動中斷（停車、回待命）
+                if ch in (ord("s"), ord("S")) and self.node.pingpong_running():
+                    self.node.request_pingpong_stop()
                 self._render(stdscr)
             except curses.error:
                 pass
@@ -240,7 +314,8 @@ class Dashboard:
 
     def _render(self, stdscr) -> None:
         (status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t,
-         stations, stations_t, sweep, sweep_t, vo, vo_t) = self.node.snapshot()
+         stations, stations_t, sweep, sweep_t, vo, vo_t,
+         pp, pp_t) = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
@@ -294,9 +369,21 @@ class Dashboard:
             stdscr.refresh()
             return
 
+        # 車頭碰撞：front_m 扣車頭前伸量 ≤0 = 障礙已在車頭最前緣/接觸 → 邊框微微閃紅示警。
+        # int(now*2)%2 以 2Hz 交替紅/正常，配合 ~150ms 刷新產生閃爍。
+        collided = False
+        if status is not None and not stale:
+            fm = status.get("front_m")
+            collided = fm is not None and (fm - self._front_overhang) <= 0.0
+
         win = stdscr.derwin(box_h, box_w, 0, 0)
-        win.box()
-        title = " rover_rl 即時狀態 "
+        if collided and int(now * 2) % 2 == 0:
+            win.attron(self._c(3))
+            win.box()
+            win.attroff(self._c(3))
+        else:
+            win.box()
+        title = "⚠ 車頭碰撞 ⚠" if collided else " rover_rl 即時狀態 "
         win.addstr(0, max(2, (box_w - self._disp_w(title)) // 2), title,
                    self._c(4) | curses.A_BOLD)
 
@@ -308,6 +395,9 @@ class Dashboard:
             # 雷達只吃 sweep，與 policy 狀態解耦：狀態逾時仍可看 LiDAR
             self._maybe_draw_radar(stdscr, h, w, box_w, box_h,
                                    sweep, sweep_t, None, now)
+            # 往返測試提示與 policy 狀態解耦，逾時時仍顯示
+            if pp is not None and (now - pp_t) < 2.0:
+                self._draw_pingpong(stdscr, h, w, pp)
             return
 
         val_col = 11  # 標籤欄 4 全形字 ≈ 8 格 + 邊距
@@ -340,6 +430,62 @@ class Dashboard:
             banner_age = now - diag_event_t
             if banner_age < 6.0:
                 self._draw_goal_banner(stdscr, h, w, diag_event, 6.0 - banner_age)
+
+        # 往返測試提示（就緒時跳大字提示按空白鍵；待命/來回中顯示底部一列）
+        if pp is not None and (now - pp_t) < 2.0:
+            self._draw_pingpong(stdscr, h, w, pp)
+
+    def _draw_pingpong(self, stdscr, h: int, w: int, pp: dict) -> None:
+        """往返測試提示：ready→大字提示按空白鍵；waiting/running→底部單列狀態。"""
+        state = pp.get("state")
+        a, b = pp.get("a"), pp.get("b")
+        auto = bool(pp.get("auto"))
+        auto_tag = "全自動:開" if auto else "全自動:關"
+        if state == "ready":
+            rp = pp.get("ready_point")
+            other = b if rp == a else a
+            banner_h = 5
+            banner_w = min(max(50, w - 2), 72)
+            by = min(h - banner_h - 1, 19)
+            bx = max(0, (w - banner_w) // 2)
+            if by < 0 or banner_w < 20:
+                return
+            try:
+                bwin = stdscr.derwin(banner_h, banner_w, by, bx)
+                bwin.erase()
+                bwin.box()
+                title = f" 往返測試就緒：車停在 {rp}　[{auto_tag}] "
+                bwin.addstr(1, max(2, (banner_w - self._disp_w(title)) // 2), title,
+                            self._c(1) | curses.A_BOLD)
+                if auto:
+                    hint = f"全自動模式：即將自動出發往 {other}（往返 {a} ↔ {b}）"
+                else:
+                    hint = f"按【空白鍵】開始往 {other}（往返 {a} ↔ {b}）"
+                bwin.addstr(2, max(2, (banner_w - self._disp_w(hint)) // 2),
+                            hint, self._c(2) | curses.A_BOLD)
+                foot = " 空白=開始 · a=全自動切換 · q=離開 "
+                bwin.addstr(banner_h - 1, 2, foot, self._c(5))
+                bwin.refresh()
+            except curses.error:
+                pass
+        else:
+            # waiting / running → 螢幕最底一列
+            if state == "running":
+                txt = (f"↻ 往返測試進行中 {pp.get('from')}→{pp.get('target')}"
+                       f" [{auto_tag}]（a=全自動切換 · s=中斷 · 切 manual/estop 亦中斷）")
+                pair = 4
+            elif not pp.get("nodes_loaded"):
+                txt = "往返測試：等路由節點表載入（需 routing/NDT 在跑）…"
+                pair = 2
+            else:
+                txt = (f"往返測試待命 [{auto_tag}]：把車開到 {a}/{b} 停穩 → "
+                       f"就緒後{'自動出發' if auto else '按空白鍵開始'}（a=全自動切換）")
+                pair = 2
+            try:
+                y = h - 1
+                stdscr.addstr(y, 0, txt[:max(0, w - 1)], self._c(pair) | curses.A_BOLD)
+            except curses.error:
+                pass
 
     @staticmethod
     def _dist(m) -> str:
@@ -675,7 +821,7 @@ class Dashboard:
         # 三層速度：想要(RL) → 送出(濾波後) → 實測(odom)
         # 非 nav 模式不跑推論、cmd 強制 0，三層都會是 0 → 顯示灰字狀態文字避免誤會
         IDLE_SPEED_TXT = {
-            "idle": "待命中（未啟動導航）", "paused": "暫停中（保留 RNN 狀態）",
+            "idle": "待命中（未啟動導航）", "paused": "暫停中（保留推論記憶）",
             "estop": "緊急停車中", "manual": "外部接管中（搖桿）",
         }
         w_over = bool(s.get("w_over"))
@@ -760,18 +906,22 @@ class Dashboard:
 
         model_txt = s.get("model") or "—"
 
-        # RNN hidden state（episode 記憶）
-        norm = s.get("rnn_norm")
-        resets = s.get("rnn_resets")
-        steps = s.get("rnn_steps")
-        if norm is None:
-            rnn_txt, rnn_pair = "—", 5
-        elif norm < 0.01:
-            rnn_txt, rnn_pair = f"待命/已重置  (累計重置 {_fmt(resets, 'd')} 次)", 5
+        # 車頭距障：front_m 是「感測器→障礙」，扣車頭前伸量 = 車頭最前緣到障礙的真實餘裕。
+        # ⚠ VLP-16 近場盲區 ~0.4m（感測器物理極限）：front_m 不會小於 ~0.4，故餘裕 ≤0 時
+        # 顯示「⚠ 已進盲區/可能接觸」提醒——此時雷達已看不到、不能只信數字。
+        oh = self._front_overhang
+        if f is None:
+            front_txt, front_pair = "—", 5
         else:
-            rnn_txt = (f"‖h‖={norm:.2f}  本段步數 {_fmt(steps, 'd')}  "
-                       f"重置 {_fmt(resets, 'd')} 次")
-            rnn_pair = 1
+            clr = f - oh
+            if clr <= 0.0:
+                front_txt, front_pair = f"⚠ ≤0（已進盲區/可能接觸） 前緣 前{self._dist(f)}−{oh:.2f}", 3
+            elif clr < 0.3:
+                front_txt, front_pair = f"{clr:.2f}m ⚠近  (前{self._dist(f)}−車頭{oh:.2f})", 3
+            elif clr < 0.6:
+                front_txt, front_pair = f"{clr:.2f}m  (前{self._dist(f)}−車頭{oh:.2f})", 2
+            else:
+                front_txt, front_pair = f"{clr:.2f}m  (前{self._dist(f)}−車頭{oh:.2f})", 1
 
         # LV-DOT 動態障礙偵測（獨立節點，policy 不吃，純態勢感知）
         if lvdot_n is None:
@@ -788,8 +938,8 @@ class Dashboard:
             ("速度v", v_txt, v_pair, False),
             ("速度ω", w_txt, w_pair, w_over),
             ("延遲", lag_txt, lag_pair, lag_pair == 3),
-            ("RNN", rnn_txt, rnn_pair, False),
             ("障礙", obst_txt, obst_pair, obst_pair == 3),
+            ("車頭距障", front_txt, front_pair, front_pair == 3),
             ("動態", lvdot_txt, lvdot_pair, False),
         ]
         # VO 安全層（enable_vo 才有 status；收不到/逾時就不畫，自動隱藏）

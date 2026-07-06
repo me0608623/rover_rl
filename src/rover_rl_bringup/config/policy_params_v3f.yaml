@@ -1,12 +1,18 @@
 rover_rl_policy:
   ros__parameters:
     # ════════════════════════════════════════════════════════════════
-    # ★ v3f (sa4_v3f_240000) 專用 config — deploy_rl_shell 選到 *v3f* 自動帶入。
+    # ★ v3f 家族共用 config — deploy_rl_shell 選到 *v3f* 自動帶入。
+    #   預設模型 = sa5_v3f_tcadapt_60000（★單政策部署定版；T走廊 TC1 特化，det SR 92.7%）。
+    #   也涵蓋 sa4_v3f_240000（SA4 空間規劃中繼）—— 選單以 model_path:= 覆寫即可切換，
+    #   兩者同架構同校準（下方參數逐字適用）。
     # 與 v3e 的唯一差別: obs = 79D (act_hist 整段移除, CHARGE_USE_ACT_HIST=0 訓練)。
     #   → policy_node 偵測 bundle.raw_obs_dim==79 會自動關閉 action stacking / act_hist,
     #     故下方 act_stack_* / act_hist_* 參數對 v3f 不作用 (保留以共用 v3e 範本, 無害)。
     # 校準與 v3e 相同: r_min=0.25, 動作 omega_max=1.2, obs omega 正規化=1.5。
-    # 79D obs 佈局: ego(4)+goal(2)+lidar(72)+time(1); 見 models/sa4_v3f_240000.obs_spec.md。
+    #   ⚠ tcadapt 部署卡片寫「normalize /10」是【文件筆誤】：已於 PC 端 charge_env_cfg_vlp16.py
+    #     實查 ObsTerm wd_like_sweep_72 → r_max=20.0 / r_robot=0.35 / r_min=0.25（無 /10、無 scale）。
+    #     故 lidar 正規化沿用家族值 r_max=20（見 lidar_preprocessor_params_v3f.yaml），勿改成 10。
+    # 79D obs 佈局: ego(4)+goal(2)+lidar(72)+time(1); 見 models/sa5_v3f_tcadapt_60000.obs_spec.md。
     # ════════════════════════════════════════════════════════════════
     # ════════════════════════════════════════════════════════════════
     # v3e（sa2_v3e_240000 / sa1_v3e_60000）專用 config — 由 deploy_rl_shell
@@ -32,7 +38,7 @@ rover_rl_policy:
     # ════════════════════════════════════════════════════════════════
 
     # --- Model ---
-    model_path: "/home/aa/rover_rl/models/sa4_v3f_240000.ts"   # v3f 79D (SA4 空間規劃最終, act_hist 整段移除)
+    model_path: "/home/aa/rover_rl/models/sa5_v3f_tcadapt_60000.ts"   # ★v3f 79D 定版 (TC1 走廊特化 60k, act_hist 整段移除)
     device: "cpu"                     # 車上 torch 是 CPU 版；裝 CUDA torch 後可改 cuda:0
 
     # --- Topics（CampusRover 實車配置） ---
@@ -96,7 +102,7 @@ rover_rl_policy:
     deterministic: true               # 首次部署用 argmax
     timeout_lidar_s: 0.5              # VLP-16 10Hz 雙回掃，0.5s 足夠
     timeout_odom_s: 0.3               # /odom 20Hz，0.3s 偵測掉線
-    lidar_motion_compensation: true   # 補償掃描期間機器人位移
+    lidar_motion_compensation: false  # ⚠ 關閉（見 lidar_preprocessor_params_v3f.yaml）：inline fallback 用
 
     # --- cmd_vel filter (low-pass + slew-rate) ---
     cmd_alpha_linear: 0.3             # 線速度低通係數
