@@ -1,0 +1,128 @@
+# ============================================================================
+# VO 安全層【滿血版】參數（vo_params_full.yaml）
+# ─ 與預設 vo_params.yaml 完全獨立：換這份 yaml 就換成滿血行為，原檔一個字不動。
+#   啟動：deploy_rl_shell / deploy_rl 選 VO=Y 後，追問「是否用滿血版」選 Y 即帶入本檔
+#         （launch 端 vo_params_file:=…/vo_params_full.yaml；同一個 vo_safety_node）。
+# ============================================================================
+#
+# ▍滿血版是什麼（設計意圖）
+#   「LiDAR 中心半徑 4m 內的動態障礙（人）由 VO 全權負責避開 + 停讓；側邊來的人提早繞行；
+#     導航（往 goal 的方向/路徑）主要交給 RL。」
+#   → 相對預設版（engage_range=1m、偏保守）：滿血版把 VO 的「注意範圍」拉到 4m、預測更久，
+#     讓側向切入的人在還很遠時就靠可行側弧繞開；正前方全堵時則「停讓」（不硬鑽）。
+#
+# ▍與預設 vo_params.yaml 的差異（只列改動；其餘語意見預設檔詳解）
+#   engage_range   1.0 → 4.0    ★核心：4m 內才由 VO 接手避障（全向圓、車中心↔障礙中心）
+#   horizon        1.0 → 2.0    預測更久 → 側邊接近的人提早被判會擋路 → 提早繞
+#   margin         0.20 → 0.25  通過間距略加大 → 繞得更開、更早起繞（勿再大，過大易凍結）
+#   goaround_v_cap 0.45 → 0.50  RL 縮手(rl_v≈0)時 VO 仍能前進繞行的速度地板
+#   n_v / n_w      7/15 → 9/19  候選更細 → 繞行弧更平滑（Orin CPU 有餘）
+#   escape_reverse_v -0.4 → -0.2 對齊 v_min（見下「輸出鉗位真相」），倒退逃脫仍夠開空間
+#   其餘（clearance_fallback、輸出硬上限、看門狗、卡死逃脫、commit、w_v/w_w/w_goal）＝沿用預設
+#
+# ▍「早繞」與「停讓」怎麼分流（重要，別誤設 clearance_fallback）
+#   - 側邊來的人 → 有不撞的側弧可行 → w_goal 進展獎勵讓它繞過去（早繞）。
+#   - 正前方對衝/全堵 → 沒有任何不撞候選 → clearance_fallback=false → 直接停 (0,0)＝停讓。
+#   ⚠ 不要為了「更積極」把 clearance_fallback 設 true：那會在「所有候選都預測會撞」時仍以
+#     v_creep 慢爬向「碰撞最晚」方向（往人擠），與你要的「停讓」相反。滿血版刻意保持 false。
+#
+# ▍「導航主要交 RL」是弱保證、非硬邊界（誠實說明）
+#   VO 不是「先看 RL 期望安不安全、安全就原樣放行」；而是在所有可行候選裡最小化成本
+#   cost = w_v·Δv² + w_w·Δω² + w_goal·(終點離 goal 變近多少)。故當 desired 仍可行時，
+#   w_goal>0 仍可能選一條「更靠 goal」的繞行弧（小幅偏離 RL）。engage_range=4 會讓這種
+#   局部修正更常發生。但 VO 沒有自己的路徑/goal（goal 取自 policy status＝RL 已在追的方向），
+#   所以是「沿 RL 已在追的方向做局部避障偏好」，非另立導航搶 RL。要更硬的「只避障不導向」可把
+#   w_goal 設 0，但代價是靜止/側向障礙容易「只停不繞」（w_goal 正是為解此才加，勿輕率歸零）。
+#
+# ▍輸出鉗位真相（避免再誤標「硬上限兜住一切」）
+#   正常路徑的 v/w 由 vo_layer 的候選窗鉗到 [v_min,v_max]/[-w_max,w_max]，安全。但
+#   卡死逃脫的 escape_reverse_v 是 node 狀態機直接送 _publish_slew（只限加速度、不再鉗
+#   v_min/v_max/w_max）→ 若 escape_reverse_v 比 v_min 更負，實際會輸出到 escape_reverse_v。
+#   故此處刻意讓 escape_reverse_v(-0.2) == v_min(-0.2)，使倒退不超過標稱下限。改任一個要同步。
+#
+# ▍鐵則
+#   1. 改值前先 cp 一份備份（檔名加時間戳）。
+#   2. 首次開滿血版：架空車輪 + estop 待命，拿真人走「正對 / 偏側切入 / 站著」三情境實測。
+#   3. w_goal 必須 < w_v。輸出硬上限那組對齊底盤真實能力，非必要不要動。
+#   4. 需 lv-dot 在跑才有障礙來源；沒跑則退化為放行 + ω 限幅（安全，但滿血無意義）。
+# ============================================================================
+
+vo_safety_node:
+  ros__parameters:
+
+    # ── ★靜止人源（滿血版專屬）：站著不動的人也避 ──
+    # LV-DOT 對靜止的人常因「YOLO 2D↔3D 框關聯斷」→ 不判 dynamic → 進不了 tracked_obstacles →
+    # VO 看不到（實測站著的人 dynamic框=0、VO n=0）。此源在 vo_safety_node 自建：拿 YOLO person
+    # 2D（相機方位）× visual_bboxes 3D（車體方位）做方位角關聯 → 補「人的靜態位置障礙」(v=0) 給 VO。
+    #   只避人不避牆（靠 YOLO person 過濾）；只滿血版開（雙保守凍結風險 opt-in）。需 lv-dot 在跑。
+    #   實測關聯：人方位誤差 0~11°、牆/遠框 15~52° → 容差 12° 乾淨分離；每個人取同方位最近框（防遠牆誤標）。
+    static_human_enable: true
+    static_human_assoc_tol_deg: 12.0   # 方位角關聯容差（實測值，勿大於 15 否則牆會漏進來）
+    static_human_timeout_s: 0.5        # yolo/visual 任一逾時 → 不補人源（安全退化）
+    static_human_radius_max: 0.45      # 人等效半徑上限（同 obstacle_radius_max）
+    static_human_dedup_m: 0.6          # 與既有動態 track 這麼近 → 同一人不重複加
+
+    # ── ★滿血核心：4m 內由 VO 負責 ──
+    engage_range: 4.0          # 預設 1.0；4m 內的動態障礙才啟動 VO 接手避障/停讓
+
+    # ── 提早繞行（側向切入更早反應）──
+    horizon: 2.0               # 預設 1.0；rollout 預測更久 → 側邊接近提早判擋路 → 提早繞
+    margin: 0.25               # 預設 0.20；通過間距略加大（人邊緣↔車中心 = 0.40+0.25 = 0.65m）
+    goaround_v_cap: 0.5        # 預設 0.45；RL 縮手時 VO 前進繞行速度地板
+
+    # ── 全堵死時：停讓（不慢爬鑽縫）──
+    clearance_fallback: false  # ★保持 false＝全候選皆撞時直接停 (0,0)＝停讓（勿設 true，見表頭說明）
+    v_creep: 0.4               # clearance_fallback=false 時此值不生效（保留以便日後切換）
+
+    # ── 取樣解析度（繞行弧更細更平滑）──
+    n_v: 9                     # 預設 7
+    n_w: 19                    # 預設 15
+
+    # ── 以下沿用預設 vo_params.yaml（列出以便單檔即完整、現場好核對）──
+    r_robot: 0.40              # 實車轉彎 footprint 外接圓（與 policy robot_radius 獨立）
+    obstacle_radius_max: 0.45  # 障礙等效半徑封頂（防假巨框擋死全路）
+    window_time: 1.0           # 候選視窗可達時間
+    sim_dt: 0.1                # rollout 步長
+
+    # 成本權重（只在多條可行候選裡挑一條時生效；不決定能不能走）
+    w_v: 1.0
+    w_w: 0.4
+    w_goal: 0.6                # 朝 goal 推進獎勵（必須 < w_v）；解「只停不繞」，見表頭弱保證說明
+    w_commit: 2.0              # 繞行側鎖定（解左右橫跳）
+    commit_hold_s: 3.0
+
+    # 卡死逃脫（人逼太近→堵死→後方有空間則慢退開空間再繞）
+    stuck_escape_enable: true
+    stuck_timeout_s: 2.0
+    rear_clear_min_m: 0.7
+    escape_reverse_v: -0.2     # ★對齊 v_min（見表頭「輸出鉗位真相」）；預設檔用 -0.4 會超出標稱下限
+    escape_max_dist_m: 1.0
+    escape_turn_w: 0.35
+    escape_turn_min_side_m: 0.8
+    escape_aim_w_thresh: 0.3
+    escape_aim_timeout_s: 5.0
+    escape_aim_cone_deg: 50.0
+
+    # 障礙速度信心門檻（年輕 track 當靜態位置避，不外推跳動速度）
+    min_vel_confidence: 0.3
+
+    # ── 看門狗（fail-safe，安全命脈）+ 頻率 ──
+    timeout_desired_s: 0.5
+    timeout_odom_s: 0.3
+    timeout_obstacles_s: 1.0
+    timeout_goal_s: 1.5
+    ctrl_rate_hz: 20.0
+
+    # ── 輸出硬上限（對齊底盤真實能力，★非必要不要動）──
+    v_max: 1.0
+    v_min: -0.2                # 倒退下限（正常路徑候選窗鉗此值；escape 另見表頭「輸出鉗位真相」）
+    w_max: 1.2
+    accel_v: 1.2
+    accel_w: 3.0
+
+    # ── Topics（接線，與預設同）──
+    topic_cmd_in: "/rover_rl/cmd_vel_desired"
+    topic_cmd_out: "/input/nav_cmd_vel"
+    topic_odom: "/odom"
+    topic_obstacles: "/vo_interface/tracked_obstacles"
+    topic_goal_status: "/rover_rl_policy/status"

@@ -13,6 +13,8 @@
   <depend>nav_msgs</depend>
   <depend>std_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>vision_msgs</depend>      <!-- VO 靜止人源吃 yolo_detector 的 Detection2DArray -->
+
   <depend>std_srvs</depend>
   <depend>tf2_ros</depend>
   <depend>onboard_detector</depend>  <!-- status_tui 用 onboard_detector 介面 -->
