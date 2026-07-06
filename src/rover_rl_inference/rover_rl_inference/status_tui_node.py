@@ -81,6 +81,8 @@ class StatusTuiNode(Node):
         # 車頭前伸量：LiDAR 感測器到車頭最前緣的距離(m)。front_m 是「感測器→障礙」，
         # 扣掉此量才是「車頭→障礙」的真實餘裕。實測：撞牆瞬間 front_m≈0.5~0.6 → 預設 0.5
         self.declare_parameter("front_overhang_m", 0.5)
+        # 碰撞/過近警示：前後左右任一方向感測器距離 < 此值 → 邊框粗閃紅
+        self.declare_parameter("collision_warn_m", 0.5)
         topic = self.get_parameter("topic_status").get_parameter_value().string_value
         topic_dyn = self.get_parameter(
             "topic_dynamic_bboxes").get_parameter_value().string_value
@@ -101,6 +103,7 @@ class StatusTuiNode(Node):
         self._r_max = float(self.get_parameter("r_max").value)
         self._r_robot = float(self.get_parameter("r_robot").value)
         self._front_overhang = float(self.get_parameter("front_overhang_m").value)
+        self._collision_warn = float(self.get_parameter("collision_warn_m").value)
         self._lock = threading.Lock()
         self._status: dict | None = None
         self._last_t = 0.0
@@ -369,21 +372,24 @@ class Dashboard:
             stdscr.refresh()
             return
 
-        # 車頭碰撞：front_m 扣車頭前伸量 ≤0 = 障礙已在車頭最前緣/接觸 → 邊框微微閃紅示警。
+        # 障礙過近：前後左右任一方向感測器距離 < collision_warn_m → 邊框粗閃紅示警。
         # int(now*2)%2 以 2Hz 交替紅/正常，配合 ~150ms 刷新產生閃爍。
         collided = False
         if status is not None and not stale:
-            fm = status.get("front_m")
-            collided = fm is not None and (fm - self.node._front_overhang) <= 0.0
+            warn = self.node._collision_warn
+            collided = any(
+                (d is not None and d < warn)
+                for d in (status.get("front_m"), status.get("back_m"),
+                          status.get("left_m"), status.get("right_m")))
 
         win = stdscr.derwin(box_h, box_w, 0, 0)
         if collided and int(now * 2) % 2 == 0:
-            win.attron(self._c(3))
+            win.attron(self._c(3) | curses.A_BOLD)   # 粗紅框
             win.box()
-            win.attroff(self._c(3))
+            win.attroff(self._c(3) | curses.A_BOLD)
         else:
             win.box()
-        title = "⚠ 車頭碰撞 ⚠" if collided else " rover_rl 即時狀態 "
+        title = "⚠ 障礙過近 ⚠" if collided else " rover_rl 即時狀態 "
         win.addstr(0, max(2, (box_w - self._disp_w(title)) // 2), title,
                    self._c(4) | curses.A_BOLD)
 
