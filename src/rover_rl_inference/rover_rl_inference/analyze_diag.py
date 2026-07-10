@@ -371,6 +371,64 @@ def _print_vo_approach(t, dist, n_obs, des_v, out_v, blocked, min_ttc) -> None:
     print("-" * 60)
 
 
+def _print_vo_engage_calib(dyn_min, vo_active, vo_interv, vo_blocked, engage_vals) -> None:
+    """VO 介入距離校準：把每拍按「最近動態障礙中心距離」分桶，統計各距離下
+    誰在動手（RL / VO 繞行 / VO 煞停）→ 直接看出 VO 實際在幾公尺開始接管，好調 engage_range。
+
+    dyn_min      = dyn_obs_min_m   最近動態障礙的車中心↔障礙中心距離（與 engage_range 同基準）
+    engage_vals  = vo_engage_range 當下 VO 設定值（整段常數）
+    """
+    print("【VO 介入距離校準】最近動態障礙距離(中心↔中心) × 誰在動手")
+    ev = [x for x in engage_vals if x is not None]
+    er = ev[0] if ev else None
+
+    def _driver(i):
+        act = vo_active[i]
+        if act is None or act < 0.5:
+            return "rl"                       # VO 沒在線 → RL 直出
+        if vo_blocked[i] and vo_blocked[i] > 0.5:
+            return "stop"
+        if vo_interv[i] and vo_interv[i] > 0.5:
+            return "vo"
+        return "rl"                           # VO 在線但只放行 = RL 主導
+
+    pts = [(d, _driver(i)) for i, d in enumerate(dyn_min) if d is not None]
+    if not pts:
+        print("  本段無動態障礙距離資料（vo_interface 未起 / 場上無人）→ 無法校準")
+        print("    需 lv-dot 在跑（發 /vo_interface/tracked_obstacles）才有動態障礙距離")
+        print("-" * 60)
+        return
+    if er is not None:
+        print(f"  目前設定 engage_range = {er:.2f} m（vo_params.yaml；VO 只在此距離內跑）")
+
+    bins = [(0, 0.5), (0.5, 1.0), (1.0, 1.5), (1.5, 2.0),
+            (2.0, 3.0), (3.0, 5.0), (5.0, 1e9)]
+    labels = ["<0.5", "0.5–1", "1–1.5", "1.5–2", "2–3", "3–5", ">5"]
+    print(f"    {'距離(m)':>7} {'列數':>6} {'VO繞行':>7} {'VO煞停':>7} {'RL主導':>7}")
+    for (lo, hi), lab in zip(bins, labels):
+        sub = [drv for d, drv in pts if lo <= d < hi]
+        if not sub:
+            continue
+        n = len(sub)
+        vo = sum(1 for x in sub if x == "vo") / n
+        stp = sum(1 for x in sub if x == "stop") / n
+        rl = sum(1 for x in sub if x == "rl") / n
+        print(f"    {lab:>7} {n:>6} {vo:>6.0%} {stp:>6.0%} {rl:>6.0%}")
+
+    vo_ds = [d for d, drv in pts if drv in ("vo", "stop")]
+    if vo_ds:
+        print(f"  → 實測 VO 動手(繞行/煞停)最遠距離 = {max(vo_ds):.2f} m")
+        if er is not None:
+            print(f"    （engage_range={er:.2f}m 是理論上限；實測最遠 {max(vo_ds):.2f}m"
+                  " 是障礙真的進到那個距離才動）")
+        print("    調法: 想讓 VO 更晚、更貼近車頭才動 → 調小 engage_range（或連 margin 一起）；")
+        print("          想更早反應 → 調大 engage_range。挑上表『VO 動手率開始明顯上升』的距離當 engage_range。")
+    else:
+        print("  → 本段 VO 全程沒動手（各距離都 RL 主導）")
+        print("    可能：人從沒進 engage_range / 這段沒走 VO / 人不在前進軌跡上（VO 靠 rollout 只擋擋路的）")
+    print("-" * 60)
+
+
 def analyze(path: str) -> None:
     rows = _load(path)
     if not rows:
@@ -408,6 +466,9 @@ def analyze(path: str) -> None:
     vo_des_v = _col(rows, "vo_des_v")
     vo_out_v = _col(rows, "vo_out_v")
     vo_min_ttc = _col(rows, "vo_min_ttc")
+    # VO 介入距離校準：最近動態障礙中心距離（與 engage_range 同基準）+ 當下設定值
+    dyn_obs_min = _col(rows, "dyn_obs_min_m")
+    vo_engage_range = _col(rows, "vo_engage_range")
     # goal 方向角抖動歸因：NDT(map→odom) yaw 與合成車姿 yaw 的每拍跳動
     ndt_yaw = _col(rows, "ndt_yaw_deg")
     map_yaw = _col(rows, "map_yaw_deg")
@@ -491,6 +552,7 @@ def analyze(path: str) -> None:
     _print_speed_tracking(rl_w, sent_w, act_w, rl_v, sent_v, act_v)
     print("-" * 60)
     _print_vo_approach(t, dist, vo_n_obs, vo_des_v, vo_out_v, vo_blocked, vo_min_ttc)
+    _print_vo_engage_calib(dyn_obs_min, vo_active, vo_interv, vo_blocked, vo_engage_range)
     _print_latency(t, sent_w, act_w, sent_v, act_v, lag_ms, lag_corr)
     print("=" * 60)
 

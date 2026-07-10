@@ -59,6 +59,9 @@ class RoutingToPathNode(Node):
         self.declare_parameter("clear_startup_ticks", 6)      # 0.5s × 6 = 3s 內連發數次防漏接
         # 長路徑偶發 flaky 回空（10+ 節點較易），單次點擊剛好中空就沒路線 → 自動重試數次。
         self.declare_parameter("routing_retry", 3)
+        # RViz 顯示 z 軸覆寫：routing engine 給的 poses.z 可能非 0，rover_rl 端統一壓到
+        # 此高度（預設 0.0 貼地），讓 RViz 紅線貼合 NDT 地圖平面。只動顯示、不動 routing。
+        self.declare_parameter("path_z", 0.0)
 
         building = self.get_parameter("building").get_parameter_value().string_value
         floor = self.get_parameter("floor").get_parameter_value().string_value
@@ -301,6 +304,11 @@ class RoutingToPathNode(Node):
             # generation_path 回傳 Path[]（可能多段）；policy 只需單一連續路徑，
             # 取第 0 條，存進 _last_path 供 2Hz republish 並立即發一次。
             path = result.routing[0]
+            # 覆寫 z 軸到 path_z（預設 0.0 貼地）：routing engine 給的 poses.z 可能非 0，
+            # 統一壓平讓 RViz 紅線貼地圖。_last_path 也用覆寫後的，2Hz republish 一致。
+            path_z = float(self.get_parameter("path_z").value)
+            for ps in path.poses:
+                ps.pose.position.z = path_z
             # 重新規劃：先發一條空 Path 強制 RViz 清掉舊的紅色路線，再發新路徑，
             # 確保畫面上永遠只有一條路線（避免新舊兩條同時殘留）。
             empty = Path()

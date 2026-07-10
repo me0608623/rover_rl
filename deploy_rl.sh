@@ -14,6 +14,7 @@
 source ~/rover_rl/deploy_select.sh
 EXTRA_ARGS=()
 VO_ARG="enable_vo:=true"
+ORCA_ARG="enable_orca:=false"
 
 # TTY 守門：只有真實終端機才跑互動選單（read 在 pipe / 非互動會卡住）。
 if [ -t 0 ] && [ -t 1 ]; then
@@ -33,5 +34,5 @@ export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 # 預設 enable_ndt/lvdot:=false；VO_ARG/EXTRA_ARGS 在前，user "$@" 接在後可覆寫
 # （ros2 launch 重複參數取最後值）。exec 取代本 shell → 前景滾動 log，Ctrl+C 直接停 launch。
 exec ros2 launch rover_rl_bringup deploy_full.launch.py \
-    enable_ndt:=false enable_lvdot:=false "$VO_ARG" rviz:=false \
+    enable_ndt:=false enable_lvdot:=false "$VO_ARG" "$ORCA_ARG" rviz:=false \
     "${EXTRA_ARGS[@]}" "$@"

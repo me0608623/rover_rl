@@ -73,11 +73,14 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_pingpong_start", "/rover_rl/pingpong/start")
         self.declare_parameter("topic_pingpong_auto", "/rover_rl/pingpong/auto_toggle")
         self.declare_parameter("topic_pingpong_stop", "/rover_rl/pingpong/stop")
+        self.declare_parameter("topic_vo_strict_front", "/vo_safety/strict_front_toggle")
         self.declare_parameter("enable_radar", True)
         self.declare_parameter("radar_style", "braille")   # braille / dots，可熱切換
         self.declare_parameter("radar_range_m", 5.0)       # 雷達顯示半徑（>此距離貼邊）
         self.declare_parameter("r_max", 20.0)              # 與 preprocessor 正規化對齊
         self.declare_parameter("r_robot", 0.35)
+        # 前方 ±30° bins 顯示用：bin < 此距離視為「打在人身上」(█)，對齊 policy front_block_close_m
+        self.declare_parameter("front_block_close_m", 1.2)
         # 車頭前伸量：LiDAR 感測器到車頭最前緣的距離(m)。front_m 是「感測器→障礙」，
         # 扣掉此量才是「車頭→障礙」的真實餘裕。實測：撞牆瞬間 front_m≈0.5~0.6 → 預設 0.5
         self.declare_parameter("front_overhang_m", 0.5)
@@ -102,6 +105,7 @@ class StatusTuiNode(Node):
         self._radar_range = float(self.get_parameter("radar_range_m").value)
         self._r_max = float(self.get_parameter("r_max").value)
         self._r_robot = float(self.get_parameter("r_robot").value)
+        self._front_block_close = float(self.get_parameter("front_block_close_m").value)
         self._front_overhang = float(self.get_parameter("front_overhang_m").value)
         self._collision_warn = float(self.get_parameter("collision_warn_m").value)
         self._lock = threading.Lock()
@@ -132,6 +136,9 @@ class StatusTuiNode(Node):
         self.pub_pp_auto = self.create_publisher(Empty, topic_pp_auto, 5)
         # 's' 鍵 → 主動中斷往返（running 中回待命、停車）
         self.pub_pp_stop = self.create_publisher(Empty, topic_pp_stop, 5)
+        # 'f' 鍵 → 熱切換 VO 嚴格前方模式（只處理前方±15° 卡≥2s 或直衝車端的障礙）
+        topic_vo_sf = self.get_parameter("topic_vo_strict_front").get_parameter_value().string_value
+        self.pub_vo_strict = self.create_publisher(Empty, topic_vo_sf, 5)
         self._topic = topic
 
     def _cb_status(self, msg: String) -> None:
@@ -210,6 +217,10 @@ class StatusTuiNode(Node):
     def toggle_pingpong_auto(self) -> None:
         self.pub_pp_auto.publish(Empty())
 
+    def toggle_vo_strict_front(self) -> None:
+        """'f' 鍵 → 切換 VO 嚴格前方模式（只處理前方±15° 卡≥2s 或直衝車端）。"""
+        self.pub_vo_strict.publish(Empty())
+
     def pingpong_running(self) -> bool:
         """往返節點是否在跑往返（running，狀態新鮮 <2s）——決定 's' 鍵是否作用。"""
         with self._lock:
@@ -255,17 +266,18 @@ class Dashboard:
         curses.init_pair(3, curses.COLOR_RED, -1)
         curses.init_pair(4, curses.COLOR_CYAN, -1)
         curses.init_pair(5, curses.COLOR_WHITE, -1)
+        curses.init_pair(6, curses.COLOR_BLACK, -1)
 
     def _c(self, pair: int) -> int:
         return curses.color_pair(pair) if curses.has_colors() else 0
 
     def run(self, stdscr) -> None:
         # 由 curses.wrapper 呼叫，stdscr 是已初始化的真實終端機畫面。
-        # nodelay+timeout：getch 非阻塞、最多等 150ms，讓迴圈能定時重繪
-        # 而不會卡在等鍵盤輸入（否則畫面不會自動刷新）。
+        # nodelay+timeout：getch 非阻塞、最多等 100ms，讓迴圈能定時重繪
+        # 而不會卡在等鍵盤輸入（否則畫面不會自動刷新）。100ms 讓碰撞紅框快閃更乾淨。
         curses.curs_set(0)
         stdscr.nodelay(True)
-        stdscr.timeout(150)
+        stdscr.timeout(100)
         self._init_colors()
         while rclpy.ok():
             try:
@@ -281,6 +293,9 @@ class Dashboard:
                 # 's' 鍵：往返測試 running 時 → 主動中斷（停車、回待命）
                 if ch in (ord("s"), ord("S")) and self.node.pingpong_running():
                     self.node.request_pingpong_stop()
+                # 'f' 鍵：切換 VO 嚴格前方模式（只處理前方±15° 卡≥2s 或直衝車端的障礙）
+                if ch in (ord("f"), ord("F")):
+                    self.node.toggle_vo_strict_front()
                 self._render(stdscr)
             except curses.error:
                 pass
@@ -292,6 +307,43 @@ class Dashboard:
         for ch in text:
             w += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
         return w
+
+    def _trim_w(self, text: str, max_w: int) -> str:
+        """依顯示寬度截斷，避免寬字元穿出右框。"""
+        out = []
+        used = 0
+        for ch in text:
+            cw = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+            if used + cw > max_w:
+                break
+            out.append(ch)
+            used += cw
+        return "".join(out)
+
+    def _draw_value(self, win, y: int, x: int, value, avail: int,
+                    default_pair: int, default_bold: bool) -> None:
+        """畫一般字串或 [(text, pair, bold), ...] 分段值；分段用於前方 bins 中心紅標。"""
+        if not isinstance(value, list):
+            v = str(value)
+            while self._disp_w(v) > avail and v:
+                v = v[:-1]
+            attr = self._c(default_pair) | (curses.A_BOLD if default_bold else 0)
+            win.addstr(y, x, v, attr)
+            return
+
+        cur_x = x
+        remaining = avail
+        for text, pair, bold in value:
+            if remaining <= 0:
+                break
+            piece = self._trim_w(str(text), remaining)
+            if not piece:
+                break
+            attr = self._c(pair) | (curses.A_BOLD if bold else 0)
+            win.addstr(y, cur_x, piece, attr)
+            pw = self._disp_w(piece)
+            cur_x += pw
+            remaining -= pw
 
     @staticmethod
     def _current_station(stations: dict | None, path_i) -> tuple[list, int] | None:
@@ -329,7 +381,7 @@ class Dashboard:
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        box_w = min(max(52, w - 2), 70)
+        box_w = min(max(52, w - 2), 82)
 
         # 先依狀態決定列數與是否畫地鐵式進度條（路徑導航才畫）→ 才能算框高
         station_info = None
@@ -373,7 +425,7 @@ class Dashboard:
             return
 
         # 障礙過近：前後左右任一方向感測器距離 < collision_warn_m → 邊框粗閃紅示警。
-        # int(now*2)%2 以 2Hz 交替紅/正常，配合 ~150ms 刷新產生閃爍。
+        # int(now*4)%2 以 0.25s 交替紅/正常（≈2Hz 閃爍），配合 ~100ms 刷新產生快閃。
         collided = False
         if status is not None and not stale:
             warn = self.node._collision_warn
@@ -383,7 +435,7 @@ class Dashboard:
                           status.get("left_m"), status.get("right_m")))
 
         win = stdscr.derwin(box_h, box_w, 0, 0)
-        if collided and int(now * 2) % 2 == 0:
+        if collided and int(now * 4) % 2 == 0:
             win.attron(self._c(3) | curses.A_BOLD)   # 粗紅框
             win.box()
             win.attroff(self._c(3) | curses.A_BOLD)
@@ -410,20 +462,16 @@ class Dashboard:
         for i, (label, value, pair, bold) in enumerate(rows):
             y = 1 + i
             win.addstr(y, 2, label, self._c(5))
-            attr = self._c(pair) | (curses.A_BOLD if bold else 0)
             # 依顯示寬度截斷，避免超出右框線
             avail = box_w - val_col - 2
-            v = value
-            while self._disp_w(v) > avail and v:
-                v = v[:-1]
-            win.addstr(y, val_col, v, attr)
+            self._draw_value(win, y, val_col, value, avail, pair, bold)
 
         if show_route:
             self._draw_route_stations(win, line_y, box_w, *station_info)
         elif show_subway:
             self._draw_subway(win, line_y, box_w, status)
 
-        foot = f" 更新 {age:.1f}s 前 · 按 q 離開 "
+        foot = f" 更新 {age:.1f}s 前 · f=VO嚴格前方 · q=離開 "
         win.addstr(box_h - 1, 2, foot, self._c(5))
         win.refresh()
 
@@ -808,10 +856,58 @@ class Dashboard:
             f"ω≤{_fmt(vo.get('w_max'), '.1f')} 預測{_fmt(vo.get('horizon'), '.1f')}s "
             f"觸發{_fmt(vo.get('engage_range'), '.0f')}m 餘裕{_fmt(vo.get('margin'), '.2f')}m "
             f"追蹤{vo.get('n_tracked', 0)}")
-        return [
+        rows = [
             ("VO", vo_txt, vo_pair, vo_bold),
             ("VO參數", params_txt, 5, False),
         ]
+        # 嚴格前方模式 ON → 多一列醒目提示（'f' 鍵切的）
+        if vo.get("strict_front"):
+            rows.append(("VO嚴格", "ON：只擋前方±15° 卡≥2s 或直衝車端（'f' 切回）", 2, True))
+        return rows
+
+    def _front_bins_txt(self, s: dict, vo: dict | None = None) -> tuple[str, int]:
+        """前方 ±30° 共 13 個 bin 的距離變化。
+
+        字串左=車左(bin42)、右=車右(bin30)。每格用黑框隔開；正中心 lidar[36]
+        用紅色標出，方便確認車頭正前方是哪一格。
+        """
+        sweep = self.node._sweep
+        ratio = s.get("front_block_ratio")
+        strict = bool(vo and vo.get("strict_front"))
+        pre = "⚡嚴格 " if strict else ""
+        if not sweep or len(sweep) < 72:
+            return (f"{pre}填{int(ratio*100)}%(無sweep)" if ratio is not None else f"{pre}(無sweep)", 5)
+        r_max, r_robot = self.node._r_max, self.node._r_robot
+        close = self.node._front_block_close
+        bins = list(range(30, 43))
+        meters = [(i, sweep[i] * (r_max - r_robot) + r_robot) for i in bins]
+        meters = meters[::-1]   # bin42(車左)在字串左、bin30(車右)在右
+
+        def _blk(m: float) -> str:
+            if m < 0.5:  return "█"   # 貼身
+            if m < 0.8:  return "▓"   # 很近
+            if m < close: return "▒"  # 近(close 閾值內=打在人身上)
+            if m < 2.0:  return "░"   # 中距
+            return "·"                # 遠/無回波
+
+        cells = []
+        if pre:
+            cells.append((pre, 2 if strict else 5, strict))
+        for bin_idx, m in meters:
+            # 黑框用可見的黑色實心邊界字元；中心 lidar[36] 的內容改紅色。
+            cells.append(("▌", 6, False))
+            if bin_idx == 36:
+                cells.append((_blk(m), 3, True))
+            else:
+                cells.append((_blk(m), 5, False))
+            cells.append(("▐", 6, False))
+
+        near = min(m for _, m in meters)
+        rtxt = f" 填{int(ratio*100)}%" if ratio is not None else ""
+        cells.append((f"{rtxt} 近{near:.1f}m", 5, False))
+        nblk = sum(1 for _, m in meters if m < close)
+        pair = 3 if nblk >= 11 else (2 if nblk >= 7 else 1)   # ≥11紅(近全堵)、≥7黃、其餘綠
+        return cells, pair
 
     def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf"),
                     station_info=None, goal_reached=False,
@@ -946,11 +1042,10 @@ class Dashboard:
             ("延遲", lag_txt, lag_pair, lag_pair == 3),
             ("障礙", obst_txt, obst_pair, obst_pair == 3),
             ("車頭距障", front_txt, front_pair, front_pair == 3),
+            ("前方bins", *self._front_bins_txt(s, vo), False),
             ("動態", lvdot_txt, lvdot_pair, False),
         ]
-        # VO 安全層（enable_vo 才有 status；收不到/逾時就不畫，自動隱藏）
-        if vo is not None and vo_age < 1.5:
-            rows.extend(self._vo_rows(vo))
+        # VO 安全層：不顯示（改顯示前方 bins 變化）。嚴格前方模式只在前方bins列加小標記。
         rows += [
             ("LiDAR", lidar_txt, 3 if not lidar_ok else 1, False),
             ("里程計", odom_txt, 1 if odom_ok else 3, False),

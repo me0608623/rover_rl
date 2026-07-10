@@ -661,6 +661,40 @@ ros2 run rover_rl_inference routing_click_bridge
   ros2 run rover_rl_inference analyze_diag "$(ls -td ~/rover_rl/logs/diag/*/ | head -1)"/*.csv
   ```
 
+### pingpong_test（兩固定點往返避障測試，2026-06-24 加入）
+- **Executable**: `pingpong_test`
+- **職責**: 把車手動開到 A/B 兩拓撲節點（預設 c24/c27）任一點停穩 → **每段都按空白鍵才出發**：
+  按下後規劃到對向點，到達**自動停車回就緒**、再按空白鍵走回來，A↔B 一段一段確認來回，
+  供兩段間重擺障礙物反覆測避障。與 RL 推論/VO 避障完全解耦（只訂閱 policy status、呼叫
+  routing、必要時切 mode=nav/idle）。
+- **三態狀態機**：
+  - `waiting`：等車開到 A/B 停穩（距 < `arrive_tol_m`=0.8m、低速 < `start_max_speed`=0.15m/s、
+    連續 `start_dwell_ticks`=4 拍≈2s）。mode **只擋 estop**（estop=明確要停，不就緒）；
+    **nav/manual/idle 皆可就緒**——預設 nav 把車停到點上即就緒，不必先切 idle。安全靠「停穩在點上
+    + 空白鍵閘門」兩道把關（RL 若在開速度/距離一定不過關）。
+  - `ready`：就緒，發狀態給 TUI 跳大字提示。**只有按空白鍵**（TUI 攔截 → `/rover_rl/pingpong/start`
+    Empty）才真正開始；車一離開點/加速/切 estop 即退回 waiting。
+  - `running`：切 mode=nav（`auto_set_nav`，預設開）+ 呼叫 routing 到對向點；**到達對向點
+    自動停車（切 idle）回 `ready`、等空白鍵走下一段**（非自動折返）。mode 一旦離開 nav
+    （抓搖桿→manual / estop）→ **立即中斷回 waiting**，須手動開回任一點停穩、再按空白鍵重啟。
+    watchdog：3s 無有效路徑自動重規劃（防 routing 偶發回空）。
+- **介接**：座標來自 `/get_route_info` 拓撲節點表（同 routing_click_bridge 作法）；pose 用 policy
+  status 的 map-frame 車姿；routing 走 `/routing_to_path/routing_call`；mode 發 `/rover_rl_policy/mode`。
+  自身狀態 5Hz 發 `/rover_rl/pingpong/status`（JSON `{state, ready_point, from, target, a, b, nodes_loaded}`）
+  供 status_tui 顯示提示與底部狀態列。
+- **⚠ 需 NDT + routing 在跑**：靠拓撲節點 map-frame 定位判到點，沒 NDT（pose_src≠tf）會警告且判定失準。
+  `deploy_rl_shell` 預設不啟 NDT → 先另開 `ndt` alias，或改用 `deploy_all`。
+- **啟動**：`deploy_rl_shell` 互動詢問「是否啟用往返測試」並可填 A/B 點名；或 launch 直接帶參數：
+  ```bash
+  ros2 launch rover_rl_bringup deploy_full.launch.py \
+    enable_pingpong:=true pingpong_a:=c24 pingpong_b:=c27
+  ```
+  launch 參數：`enable_pingpong`(預設 false) / `pingpong_a`(c24) / `pingpong_b`(c27) /
+  `pingpong_auto_nav`(true)。
+- **操作流程**：① 手動把車開到 c24 或 c27 停穩 → ② TUI 跳「就緒，按空白鍵」→ ③ 按空白 → 車往對向點 →
+  ④ 到達自動停車、TUI 再跳「就緒，按空白鍵」→ ⑤ 按空白走回來（如此每段確認來回）→
+  要停就抓搖桿/estop（中斷）→ 手動開回任一點停穩、再按空白鍵重啟。
+
 ## 故障排除清單
 
 | 症狀 | 檢查 | 修復 |
@@ -672,6 +706,9 @@ ros2 run rover_rl_inference routing_click_bridge
 | Goal 永遠收不到 | `goal_frame` 設錯 | 改 `goal_frame: odom`（沒 map）或 `map`（有 NDT/AMCL） |
 | goal 方位/距離全歪（點正前方卻算成遠處側後方） | `/ndt_pose` 是 map→odom 非車姿，被當車姿用 | 已修：車姿改走 TF `map→base_footprint`（見上方 NDT 段）。確認 `pose_src=tf`、`pose_x/y` 與 `tf2_echo map base_footprint` 一致 |
 | routing_click_bridge 找不到節點 | 地圖節點未啟 | 先確認 `/get_route_info` service 存在 |
+| 往返測試一直「待命」不就緒 | mode=estop、車離點太遠(>0.8m)、沒停穩(速度>0.15)、或 pose_src≠tf | 把車開到 A/B 停穩（nav/manual/idle 皆可，只要別 estop）；`ros2 topic echo /rover_rl/pingpong/status` 看 state/nodes_loaded、policy status 看 pose_x/y 與點距；無 NDT 先開 `ndt` |
+| 往返測試按空白鍵沒反應 | 非 ready 狀態才會忽略空白鍵；或不在 TUI 焦點 | 先確認 TUI 跳「就緒」綠字才按；空白鍵只由 status_tui 攔截（deploy_rl_shell 才有 TUI） |
+| 往返測試 nodes_loaded=false | routing/get_route_info 沒起來 | 確認 routing_to_path + mapinfo_db_handler 在跑、`/get_route_info` service 存在 |
 | 跑起來但車原地震 | normalizer 期望維度與 model 不符（79/83/139 互錯，如 v3c 用了 SA6 yaml） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照；v3c 應為 raw_obs=83 |
 | cmd 振幅異常大 | normalizer mean/var 沒 bake 進 model | 重新 export_policy.py（必須帶有 obs_normalizer 的 checkpoint） |
 | RViz Nav2 goal 不被收 | topic remap | 確認 `/goal_pose` 是 Nav2 standard，不是 `/move_base_simple/goal` |

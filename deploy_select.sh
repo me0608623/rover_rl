@@ -18,6 +18,7 @@ deploy_rl_select() {
     # 全域（不加 local）：caller 要讀
     EXTRA_ARGS=()
     VO_ARG="enable_vo:=true"
+    ORCA_ARG="enable_orca:=false"   # 選 ORCA 時改 true（由 launch 啟 orca_safety_node 控制車）
 
     # ── Checkpoint 互動選單（launch 前先選模型） ──────────────────────────
     # 列出 ~/rover_rl/models/*.ts；Enter = 沿用 policy_params.yaml 預設。
@@ -34,9 +35,11 @@ deploy_rl_select() {
                 base=$(basename "$f"); tag=""
                 [ "$f" = "$DEFAULT_TS" ] && tag=" ←預設"
                 case "$base" in
+                    *tcadapt*) tag="$tag  [v3f 定版：79D TC1 走廊特化，帶 r_min=0.25 / ω_max=1.2 config]";;
                     *v3c*) tag="$tag  [v3c：自動帶 r_min=0.25 / ω_max=1.2 config]";;
                     *v3e*) tag="$tag  [v3e：自動帶 r_min=0.25 / ω_max=1.2 config]";;
                     *v3f*) tag="$tag  [v3f：79D／無 act_hist，自動帶 r_min=0.25 / ω_max=1.2 config]";;
+                    *v3h*) tag="$tag  [v3h：SA6 clean baseline 對照臂 79D／無 act_hist，帶 r_min=0.25 / ω_max=1.2 config]";;
                 esac
                 printf "│ %d) %s%s\n" "$i" "$base" "$tag"
                 i=$((i+1))
@@ -65,6 +68,7 @@ deploy_rl_select() {
                         *v3c*) VARIANT="v3c";;
                         *v3e*) VARIANT="v3e";;
                         *v3f*) VARIANT="v3f";;
+                        *v3h*) VARIANT="v3h";;
                     esac
                     if [ -n "$VARIANT" ]; then
                         PP="$CFG_DIR/policy_params_$VARIANT.yaml"
@@ -85,21 +89,58 @@ deploy_rl_select() {
         fi
     fi
 
-    # ── VO 安全層互動詢問（launch 前先選）────────────────────────────────
-    # VO = 夾在 RL policy 與底盤之間的動態障礙預測式避障/煞停層。
-    # 啟用後 policy 輸出改道 /rover_rl/cmd_vel_desired → vo_safety → /input/nav_cmd_vel。
+    # ── 安全層互動詢問（launch 前先選：VO 或 ORCA，皆控制車）──────
+    # 1) VO = DWA 取樣+rollout 預測式避障/煞停層（控制車）。
+    #    啟用後 policy 改道 /rover_rl/cmd_vel_desired → vo_safety → /input/nav_cmd_vel。
+    # 2) ORCA = RVO2 half-plane 避讓層（non-cooperative，控制車）。
+    #    policy 改道 /rover_rl/cmd_vel_desired → orca_safety → /input/nav_cmd_vel。
+    # VO 與 ORCA 互斥：選 ORCA 時 enable_vo:=false enable_orca:=true。
     if ! printf '%s\n' "$@" | grep -qE '^enable_vo:='; then
-        echo "┌─ VO 安全層（動態障礙預測式避障 / 煞停）─────────────────────"
-        echo "│ 夾在 RL policy 與底盤之間，吃 vo_interface 動態障礙做短期碰撞預測。"
-        echo "│ 需 lv-dot 在跑才有障礙來源（沒跑則退化為放行 + ω 限幅，安全）。"
-        echo "│ 啟用後 TUI 會多顯示「VO / VO參數」兩列（介入狀態 + 參數）。"
+        echo "┌─ 安全層選擇（VO 或 ORCA，皆控制車）──────────────────────"
+        echo "│ 1) VO 安全層 — DWA 取樣+rollout 預測式避障/煞停（控制車）"
+        echo "│ 2) ORCA 安全層 — RVO2 half-plane 避讓（non-cooperative，控制車）"
+        echo "│ 3) 都不啟用 — policy 直接送 mux"
+        echo "│ （兩者都需 lv-dot 在跑才有障礙來源；都只處理動態，靜態靠 RL sweep+front_brake）"
         echo "└──────────────────────────────────────────────────────────────"
-        local VO_SEL
-        read -rp "是否啟用 VO 安全層？[Y/n]（Enter=啟用） " VO_SEL
-        case "$VO_SEL" in
-            [Nn]*) VO_ARG="enable_vo:=false"; echo "[$TAG] VO：不啟用（policy 直接送 mux）" ;;
-            *)     VO_ARG="enable_vo:=true";  echo "[$TAG] VO：啟用（RL→VO→mux，TUI 顯示 VO 列）" ;;
+        local SAFETY_SEL
+        read -rp "選擇安全層[1=VO / 2=ORCA / 3=都不]（Enter=1 VO） " SAFETY_SEL
+        case "$SAFETY_SEL" in
+            2) VO_ARG="enable_vo:=false"; ORCA_ARG="enable_orca:=true"
+               echo "[$TAG] ORCA 控制車：啟用 orca_safety_node（RL→ORCA→mux）" ;;
+            3) VO_ARG="enable_vo:=false"; ORCA_ARG="enable_orca:=false"
+               echo "[$TAG] 安全層：都不啟用（policy 直接送 mux）" ;;
+            1|'') VO_ARG="enable_vo:=true";  ORCA_ARG="enable_orca:=false"
+               echo "[$TAG] VO：啟用（RL→VO→mux，TUI 顯示 VO 列）" ;;
+            *)    VO_ARG="enable_vo:=true";  ORCA_ARG="enable_orca:=false"
+               echo "[$TAG] 無效輸入，預設啟用 VO" ;;
         esac
+    fi
+
+    # ── 滿血版追問（僅在「VO 確實啟用」、且命令列未自帶 VO 相關參數時）──────
+    # 滿血版 = 獨立的 vo_params_full.yaml（engage_range=4m 內由 VO 全權避障/停讓、側向切入
+    # 提早繞行；導航主要交 RL）。與預設 vo_params.yaml 完全獨立，換 yaml 就換行為。
+    # ⚠ guard 三條缺一不可：
+    #   1. VO_ARG 互動選成 enable_vo:=true（選 N 關 VO 就不該問滿血版）
+    #   2. 命令列沒帶 enable_vo:=（帶了代表使用者在腳本化控制 VO，VO 詢問已跳過，此處也應跳過，
+    #      否則使用者明明 enable_vo:=false 卻仍被追問滿血版 → 邏輯/UX 錯，Codex 抓到）
+    #   3. 命令列沒帶 vo_params_file:=（尊重覆寫）
+    if [ "$VO_ARG" = "enable_vo:=true" ] \
+       && ! printf '%s\n' "$@" | grep -qE '^enable_vo:=' \
+       && ! printf '%s\n' "$@" | grep -qE '^vo_params_file:='; then
+        local FULL_YAML="$CFG_DIR/vo_params_full.yaml"
+        if [ -f "$FULL_YAML" ]; then
+            echo "┌─ VO 滿血版（4m 全權避障 + 側向提早繞行）──────────────────────"
+            echo "│ engage_range 1m→4m、預測更久、遇堵改積極鑽縫繞行（非硬停）。"
+            echo "│ 導航仍交 RL；靜態牆仍由 RL sweep。與預設 VO 設定完全獨立、原檔不動。"
+            echo "└──────────────────────────────────────────────────────────────"
+            local FULL_SEL
+            read -rp "是否使用 VO 滿血版？[y/N]（Enter=用預設保守版） " FULL_SEL
+            case "$FULL_SEL" in
+                [Yy]*) EXTRA_ARGS+=("vo_params_file:=$FULL_YAML")
+                       echo "[$TAG] VO：滿血版（vo_params_full.yaml，engage_range=4m）" ;;
+                *)     echo "[$TAG] VO：預設保守版（vo_params.yaml，engage_range=1m）" ;;
+            esac
+        fi
     fi
     return 0
 }

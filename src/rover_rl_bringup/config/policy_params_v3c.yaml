@@ -29,9 +29,14 @@ rover_rl_policy:
     topic_global_path: "/global_path"     # campusrover_routing / AIT* 任一都可
     topic_cmd_vel: "/input/nav_cmd_vel"              # 推論輸出 cmd_vel 發布到此
     topic_markers: "~/markers"                       # RViz 視覺化 marker（私有命名空間）
+    topic_trail: "/rover_rl/trail"                    # RViz 車輛行進歷史軌跡（nav_msgs/Path）
     topic_obs_debug: "~/obs_debug"                   # 79D obs 除錯輸出（給 bev_play 取 goal body）
     publish_obs_debug: true                          # 是否發 obs_debug
     publish_markers: true                            # 是否發 markers
+    publish_trail: true                              # 是否發車輛行進歷史軌跡
+    trail_rate_hz: 5.0                                # 軌跡發布頻率
+    trail_min_distance_m: 0.05                        # 每移動至少 5cm 才追加一點
+    trail_max_points: 2000                            # 最多保留點數，避免長時間佔記憶體
 
     # --- QoS ---
     lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS
@@ -94,6 +99,12 @@ rover_rl_policy:
     # --- Goal / 定位 ---
     goal_frame: "map"
     goal_tolerance_m: 0.6           # 進此距離視為到達 goal
+    # 終點朝向對齊（RL 沒訓練終點朝向；到達單一 goal 後用 RViz 2D Goal 箭頭原地轉對齊）
+    goal_align_yaw_enable: true     # false=到達就停（舊行為，不對齊朝向）
+    goal_align_yaw_tol_deg: 8.0     # yaw 誤差 < 此 → 對齊完成、停
+    goal_align_kp: 1.2              # w = kp·yaw_err（比例控制）
+    goal_align_w_max: 0.6          # 原地轉上限(rad/s，柔和)
+    goal_align_w_min: 0.15         # 死區地板：底盤低於此轉不動 → 補到此值
     path_lookahead_m: 2.0           # carrot lookahead (pure-pursuit-like)
     topic_ndt_pose: "/ndt_pose"     # 僅用於 NDT 活性判定（內容是 map→odom，非車姿）
     require_ndt: false              # true=NDT 未穩定就拒絕動；false=fallback 純 odom

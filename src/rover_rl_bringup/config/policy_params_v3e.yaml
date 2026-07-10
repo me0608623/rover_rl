@@ -36,9 +36,14 @@ rover_rl_policy:
     topic_global_path: "/global_path"     # campusrover_routing / AIT* 任一都可
     topic_cmd_vel: "/input/nav_cmd_vel"              # 推論輸出 cmd_vel 發布到此
     topic_markers: "~/markers"                       # RViz 視覺化 marker（私有命名空間）
+    topic_trail: "/rover_rl/trail"                    # RViz 車輛行進歷史軌跡（nav_msgs/Path）
     topic_obs_debug: "~/obs_debug"                   # 79D obs 除錯輸出（給 bev_play 取 goal body）
     publish_obs_debug: true                          # 是否發 obs_debug
     publish_markers: true                            # 是否發 markers
+    publish_trail: true                              # 是否發車輛行進歷史軌跡
+    trail_rate_hz: 5.0                                # 軌跡發布頻率
+    trail_min_distance_m: 0.05                        # 每移動至少 5cm 才追加一點
+    trail_max_points: 2000                            # 最多保留點數，避免長時間佔記憶體
 
     # --- QoS ---
     lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS

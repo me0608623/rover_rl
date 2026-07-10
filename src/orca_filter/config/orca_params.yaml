@@ -1,0 +1,82 @@
+# ORCA bystander 參數。所有 ORCA 核心參數預設 = PC-A 模擬器 1:1(non-cooperative)。
+orca_bystander:
+  ros__parameters:
+    # ── topics / 頻率 ──
+    topic_obstacles: /vo_interface/tracked_obstacles
+    topic_odom: /odom
+    frame_id: odom
+    decision_hz: 5.0          # ORCA 決策頻率(= sim dt=0.2s)
+
+    # ── v_pref 策略(bystander 無 policy 輸出,模擬意圖速度)──
+    #   forward : 固定前進 v_pref_speed(測「直走時 ORCA 怎麼閃」)
+    #   current : 當前 odom 速度(測「ORCA 對當前狀態的修正」)
+    v_pref_mode: forward
+    v_pref_speed: 0.8
+    min_vel_confidence: 0.0   # 低於此 confidence 的 track 忽略(0=全收)
+
+    # ── ORCA 核心參數(= PC-A rvo2_safety_filter.py 1:1)──
+    robot_radius: 0.35
+    safety_margin: 0.10       # rvo_radius = robot_radius + safety_margin = 0.45
+    max_speed: 1.0
+    culling_radius: 5.0       # 只考慮此半徑內的障礙物(GPU/numpy pre-filter)
+    neighbor_dist: 10.0
+    max_neighbors: 20
+    time_horizon_dynamic: 2.5 # 動態時域(s),提早反應
+    time_horizon_static: 0.3  # 靜態時域(s),必須<0.5 否則卡走廊
+    static_vel_threshold: 0.15
+    angle_threshold_deg: 60.0
+    omega_max: 0.7853981633974483  # 0.25*pi
+    # ── non-cooperative 設計(行人不會避讓)──
+    obs_inflation: 1.8        # 障礙半徑 ×1.8,提早反應
+    ego_responsibility: 1.0   # 機器人扛 100% 避讓,障礙 max_speed≈0
+
+
+# ════════════════════════════════════════════════════════════════════════
+# orca_safety_node 參數(控制車版,取代 vo_safety_node)
+# ── 首次測保守參數(對應 plan 風險對策,驗證後可放開)──
+#   accel_v 0.6 / accel_w 1.5(原 VO 1.2/3.0 降半,確認 slew 平滑再放開)
+#   min_vel_confidence 0.0(全收速度,信任 KF;防剛冒出快速闖入者漏避)
+#   front_brake_slow_m 1.0(原 0.6,早介入壓制 ORCA 側向逃生不確定性)
+# ════════════════════════════════════════════════════════════════════════
+orca_safety_node:
+  ros__parameters:
+    # ── topics ──
+    topic_cmd_in: /rover_rl/cmd_vel_desired
+    topic_cmd_out: /input/nav_cmd_vel
+    topic_odom: /odom
+    topic_obstacles: /vo_interface/tracked_obstacles
+    topic_policy_status: /rover_rl_policy/status
+    # ── 頻率 ──
+    ctrl_rate_hz: 20.0
+    # ── 看門狗逾時 ──
+    timeout_desired_s: 0.5
+    timeout_odom_s: 0.3
+    timeout_obstacles_s: 1.0
+    timeout_status_s: 1.5
+    # ── ORCA 核心(non-cooperative,= bystander 1:1)──
+    robot_radius: 0.35
+    safety_margin: 0.10
+    max_speed: 1.0
+    culling_radius: 5.0
+    neighbor_dist: 10.0
+    max_neighbors: 20
+    time_horizon_dynamic: 1.2  # 原 2.5:只對近的/快撞的反應,遠障礙交給 RL(治「遠就輸出大 ω」)
+    time_horizon_static: 0.3
+    static_vel_threshold: 0.15
+    angle_threshold_deg: 60.0
+    omega_max: 0.66            # ≤RL(v3f RL ω 上限≈0.66);原 0.25π=0.785 讓 ORCA 介入時轉得比 RL 還兇+頂滿甩頭,降到 0.66 對齊 RL
+    obs_inflation: 1.3         # 原 1.8:障礙別放太大,可行域留前方微繞空間(避免 RVO2 跳到滿速側逃)
+    ego_responsibility: 1.0
+    min_vel_confidence: 0.0
+    obstacle_radius_max: 2.0
+    # ── slew 限速(首次測保守降)──
+    accel_v: 0.6
+    accel_w: 1.5
+    v_max: 1.0
+    v_min: -1.0
+    w_max: 1.2
+    # ── front_brake 簡化版 ──
+    front_brake_enable: true
+    front_brake_slow_m: 1.0
+    front_brake_stop_m: 0.5
+    front_brake_emergency_m: 0.55

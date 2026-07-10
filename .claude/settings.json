@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/aa/rover_rl/.claude/check_ros_mcp.sh",
+            "timeout": 10,
+            "statusMessage": "檢查 ROS MCP 連線..."
+          }
+        ]
+      }
+    ]
+  }
+}

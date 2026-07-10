@@ -92,6 +92,8 @@ CSV_FIELDS = [
     "policy_goal_dist",
     "policy_v_norm", "policy_w_norm", "obs_age",
     "sweep_min_m", "sweep_age",                              # 72-bin sweep 還原成公尺後的最近障礙
+    # ★07-06: 方向距離(來自 policy status; front=bins28:45 等) + 72束原始obs(分號串接,校準/前錐分析用)
+    "front_m", "back_m", "left_m", "right_m", "obs_lidar72",
     # lidar_collision：sweep 最近障礙 < lidar_collision_m(param,預設0.5) → 1，與 TUI 碰撞閃紅同步。
     # ⚠ 這是「raw LiDAR 任一方向過近」旗標（含牆），與下方論文用 collision(VO 動態障礙中心距)不同，
     #   刻意分開避免走廊牆面污染 CR 指標。要看實際接觸仍以 collision / 人工 collision_mark 為準。
@@ -866,6 +868,9 @@ class DiagLoggerNode(Node):
             row["policy_v_norm"] = f"{obs[1]:.3f}"
             row["policy_w_norm"] = f"{obs[2]:.3f}"
             row["obs_age"] = f"{now - obt:.2f}"
+            # ★07-06: 72 束原始 obs（正規化值, [6:78]）分號串接 — bin 校準/前錐分析
+            if len(obs) >= 78:
+                row["obs_lidar72"] = ";".join(f"{v:.3f}" for v in obs[6:78])
 
         if self._sweep_min is not None:
             sm, st = self._sweep_min
@@ -880,7 +885,8 @@ class DiagLoggerNode(Node):
         st = self._status
         if st is not None:
             for k in ("rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
-                      "lag_ms", "lag_corr", "lag_ch"):
+                      "lag_ms", "lag_corr", "lag_ch",
+                      "front_m", "back_m", "left_m", "right_m"):   # ★07-06 方向距離
                 v = st.get(k)
                 if v is not None:
                     row[k] = v

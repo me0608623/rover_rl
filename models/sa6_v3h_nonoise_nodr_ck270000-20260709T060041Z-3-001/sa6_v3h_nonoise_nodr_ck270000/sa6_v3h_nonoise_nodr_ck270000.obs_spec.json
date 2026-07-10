@@ -1,0 +1,73 @@
+{
+  "model_name": "sa6_v3h_nonoise_nodr_ck270000",
+  "source_checkpoint": "logs/rnn_car/sa6_v3h_nonoise_nodr_ne1024_s42/checkpoint_270000.pt",
+  "ckpt_format": "training_state_dict",
+  "raw_obs_dim": 79,
+  "used_obs_dim": 79,
+  "obs_normalizer": { "present": true, "dim": 79, "type": "running_mean_std", "baked_required": true },
+  "feat_normalizer": { "present": true, "dim": 96, "type": "running_mean_std", "baked_required": true },
+  "layout": [
+    { "idx": 0,        "name": "applied_accel",    "group": "ego",   "def": "a=(v_t-v_{t-1})/dt forward linear accel", "normalize": "/max_acceleration=1.0", "range": [-1, 1] },
+    { "idx": 1,        "name": "linear_velocity",  "group": "ego",   "def": "body-frame forward speed v_x", "normalize": "/max_linear_velocity=1.0", "range": [-1, 1] },
+    { "idx": 2,        "name": "angular_velocity", "group": "ego",   "def": "yaw rate omega_z", "normalize": "/max_angular_velocity=1.5", "range": [-1, 1], "note": "divisor 1.5 (obs), NOT action omega_max 1.2" },
+    { "idx": 3,        "name": "body_radius",      "group": "ego",   "def": "collision radius const", "normalize": "raw", "value": 0.35 },
+    { "idx": 4,        "name": "goal_x",           "group": "goal",  "def": "goal forward distance in robot frame (m), + = front", "normalize": "raw_meters" },
+    { "idx": 5,        "name": "goal_y",           "group": "goal",  "def": "goal lateral distance in robot frame (m), + = left, - = right", "normalize": "raw_meters" },
+    { "idx": [6, 78],  "name": "lidar_72",         "group": "lidar", "def": "72 azimuth bins, nearest surface distance per 5deg sector", "normalize": "clamp(d-0.35,0)/20 then clip(0,1)", "range": [0, 1],
+      "bin_angle": "theta=atan2(y_left,x_forward); bin=floor((theta+pi)/(2pi)*72); 5deg/bin",
+      "landmarks": { "lidar[0]@obs6": "-180deg rear", "lidar[18]@obs24": "-90deg right", "lidar[36]@obs42": "0deg front", "lidar[54]@obs60": "+90deg left", "lidar[71]@obs77": "+180deg rear" },
+      "value_meaning": "1.0=clear(>=20m or blind), smaller=closer obstacle" },
+    { "idx": 78,       "name": "time_remaining_ratio", "group": "time", "def": "episode time remaining", "range": [0, 1], "note": "1=start, 0=timeout" }
+  ],
+  "lidar": {
+    "bins": 72,
+    "r_min": 0.25,
+    "r_max": 20.0,
+    "r_robot": 0.35,
+    "z_filter": 0.5,
+    "normalize": "clamp(d - r_robot, min=0) / r_max",
+    "clip": [0.0, 1.0]
+  },
+  "action": {
+    "type": "MultiDiscrete",
+    "bins": [19, 19],
+    "heads": ["linear_accel", "angular_vel"],
+    "output_logits": 38,
+    "deterministic": "argmax_per_head",
+    "decode": "idx in [0,18], center=9, ratio=(idx-9)/9; accel=ratio*a_max(0.5); omega=ratio*omega_max(1.2)"
+  },
+  "physical_limits": {
+    "v_max": 1.0,
+    "v_reverse_max": -0.2,
+    "a_max": 0.5,
+    "omega_max": 1.2,
+    "omega_accel_max": 3.0,
+    "dt": 0.2
+  },
+  "encoder": {
+    "type": "extractor_rnn",
+    "branches": "Conv1d(LiDAR)+ObsMLP+StateMLP -> 96D feat",
+    "rnn_type": "GRU",
+    "hidden_dim": 64,
+    "preprocess_dim": 12,
+    "fc_dim": 64,
+    "wd_middle_dim": 48,
+    "feat_norm": true,
+    "lidar_frame_stack": 1,
+    "rl_input_dim": 91
+  },
+  "act_hist": false,
+  "obs_delay_steps": [0, 0],
+  "training": {
+    "task": "Isaac-Navigation-Charge-VLP16-Curriculum-WD",
+    "curriculum": "warp_drive_single_agent_v3h",
+    "stage": 6,
+    "lidar_noise": "none",
+    "domain_rand": "none",
+    "clean_baseline": true,
+    "iteration": 899,
+    "total_steps": 270000,
+    "terminated_early": true,
+    "wandb_run": "nftufbyv"
+  }
+}

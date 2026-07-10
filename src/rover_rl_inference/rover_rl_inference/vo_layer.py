@@ -63,6 +63,13 @@ class VOParams:
     # 為何能分流「靜止→繞 / 對衝→停」：移動逼近的人會走進側弧 → 側弧 rollout 撞 → 不可行 →
     #   只剩停/倒退（正確讓行）；靜止的人側弧不撞 → 進展獎勵讓繞行弧勝出。分流靠可行性，非權重。
     w_goal: float = 0.0
+    # --- 繞行側 commit（解「往右退→又往左轉」左右橫跳）---
+    # 一旦選定一側繞行(commit_side=±1)，對「弧線終點偏到 commit 反側」的候選加罰，壓過 w_w/w_goal
+    # 往另一側拉的力 → 選定一側走到底。0=關。commit_side 由 node 在 escape 鎖定、過障礙後過期。
+    w_commit: float = 0.0
+    # --- 「鼻子已對準」判據：有 v>0 且 |w|≤此門檻 的可行候選 = 接近直行就能前進 = 鼻子對準開闊側 ---
+    # 卡死逃脫用：一直倒車/原地轉到 straight_feasible 才退出，確保「對準才前進」（仿真人 K 轉）。
+    w_aim_thresh: float = 0.3   # rad/s
     # --- 啟動條件：障礙進入此距離才跑 VO（省運算、避免遠處誤煞）---
     engage_range: float = 6.0   # m
     # --- clearance 退化（解「全候選不可行就急停、不繞」）---
@@ -108,6 +115,13 @@ class VOResult:
     n_obstacles: int         # engage_range 內障礙數
     n_feasible: int          # 可行候選數
     min_ttc: float           # 選定候選的最近碰撞時間（inf=horizon 內安全）
+    # 「最該往哪側轉」提示（w 的符號才是重點）：有可行解→選定弧的 w；全堵死→碰撞時刻最晚
+    # 候選的 w（=最有空間繞過去的方向）。供 node 卡死逃脫選邊用——與 go-around 同源（同一份
+    # rollout），確保「逃脫倒車轉向」和「事後繞行」往同一側，不再打架（倒車左打卻往右前進）。
+    best_turn_w: float = 0.0
+    # 鼻子是否已對準：有 v>0 且 |w|≤w_aim_thresh 的可行候選（接近直行就能前進）。卡死逃脫據此
+    # 決定「還要繼續轉對準」還是「對準了可前進」→ 仿真人「倒車打方向到對準才走」。
+    straight_feasible: bool = False
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -156,7 +170,8 @@ def _rollout(v: float, w: float, robot: RobotState,
 
 def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
                      obstacles: list[Obstacle], p: VOParams,
-                     goal: tuple[float, float] | None = None) -> VOResult:
+                     goal: tuple[float, float] | None = None,
+                     commit_side: int = 0) -> VOResult:
     """VO 主入口：給 RL 期望速度 + 障礙，回最接近且安全的 (v, w)。
 
     goal（odom frame, 選填）：提供時且 p.w_goal>0，成本多加「弧線終點朝向 vs
@@ -175,7 +190,8 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
     if not near:
         # 無近障 → 直接放行 clamp 後 desired（VO 不介入）
         return VOResult(v_des, w_des, engaged=False, blocked=False,
-                        n_obstacles=0, n_feasible=1, min_ttc=math.inf)
+                        n_obstacles=0, n_feasible=1, min_ttc=math.inf,
+                        best_turn_w=w_des, straight_feasible=True)
 
     # 3) dynamic window（以實測速度為中心，window_time 內可達範圍 → 候選夠廣可繞行）
     v_lo = _clamp(robot.v - p.accel_v * p.window_time, p.v_min, p.v_max)
@@ -205,6 +221,10 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
     #   成本 = w_v·Δv² + w_w·Δω²（貼近 RL）+ w_goal·(d_end−d_now)（朝 goal 推進，選填）
     use_goal = goal is not None and p.w_goal > 0.0
     d_now = math.hypot(goal[0] - robot.x, goal[1] - robot.y) if use_goal else 0.0
+    # commit 側偏置：終點偏到已選定繞行側的反側時加罰（壓 w_w/w_goal 往另一側拉→不橫跳）
+    use_commit = commit_side != 0 and p.w_commit > 0.0
+    sin_yaw = math.sin(robot.yaw)
+    cos_yaw = math.cos(robot.yaw)
     best: tuple[float, float] | None = None
     best_cost = math.inf
     best_ttc = math.inf
@@ -213,23 +233,33 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
     # 同 ttc 時偏好較慢（|v| 小）以策安全。
     inf_best: tuple[float, float] | None = None
     inf_best_ttc = -1.0
+    straight_feasible = False   # 有「v>0 且接近直行」可行候選 = 鼻子已對準開闊側
     for v in v_cands:
         for w in w_cands:
             ttc, ex, ey, _eyaw = _rollout(v, w, robot, near, p)
             if ttc == math.inf:  # horizon 內不撞
                 n_feasible += 1
+                if v > 1e-3 and abs(w) <= p.w_aim_thresh:
+                    straight_feasible = True
                 cost = p.w_v * (v - v_des) ** 2 + p.w_w * (w - w_des) ** 2
                 if use_goal:
                     # 進展獎勵：弧線終點離 goal 的距離（越接近 goal=越省）。
                     # d_end−d_now<0 表示有推進 → 降低成本，獎勵真的繞過去往 goal 走。
                     d_end = math.hypot(goal[0] - ex, goal[1] - ey)
                     cost += p.w_goal * (d_end - d_now)
+                if use_commit:
+                    # 終點相對車頭橫向位置 dy_body（>0=左/+y、<0=右/−y）；偏到 commit 反側→加罰。
+                    # commit_side=+1(左)罰右(dy_body<0)；=-1(右)罰左(dy_body>0)。鎖定一側不橫跳。
+                    dy_body = -sin_yaw * (ex - robot.x) + cos_yaw * (ey - robot.y)
+                    cost += p.w_commit * max(0.0, -commit_side * dy_body)
                 if cost < best_cost:
                     best_cost = cost
                     best = (v, w)
                     best_ttc = math.inf
-            elif p.clearance_fallback:
-                # 不可行候選：留住碰撞最晚者（ttc 大 = 撐最久 = 最往空檔挪）
+            else:
+                # 不可行候選：永遠留住碰撞最晚者（ttc 大 = 撐最久 = 最往空檔挪）。
+                # 不再只在 clearance_fallback 時記——其 w 同時是「卡死逃脫該往哪側轉」的提示
+                # （best_turn_w），讓逃脫轉向與 go-around 同源、不打架。
                 if ttc > inf_best_ttc + 1e-3 or (
                         abs(ttc - inf_best_ttc) <= 1e-3
                         and inf_best is not None and abs(v) < abs(inf_best[0])):
@@ -237,15 +267,30 @@ def compute_safe_cmd(v_des: float, w_des: float, robot: RobotState,
                     inf_best = (v, w)
 
     # 6) 全不可行 → fallback
+    # best_turn_w（卡死逃脫選邊提示）= 往「最近障礙的反側」繞——這正是 go-around 可行弧天生會走
+    # 的側（障礙那側的弧會撞→不可行；反側才有解）。用 body-frame 橫向位置判，貼身 penetrating 時
+    # 也穩（ttc 在貼身會全部飽和失真，故不用 ttc）。正前(|y_body|小)→0，留給 commit/clearance。
+    turn_hint = 0.0
+    nb = min(near, key=lambda o: (o.x - robot.x) ** 2 + (o.y - robot.y) ** 2)
+    y_body = -sin_yaw * (nb.x - robot.x) + cos_yaw * (nb.y - robot.y)
+    if y_body > 0.05:          # 最近障礙偏左 → 往右繞（w<0）
+        turn_hint = -p.w_max
+    elif y_body < -0.05:       # 最近障礙偏右 → 往左繞（w>0）
+        turn_hint = p.w_max
+    elif inf_best is not None:  # 正前方對稱 → 退回「碰撞最晚」候選的轉向
+        turn_hint = inf_best[1]
     if best is None:
         if p.clearance_fallback and inf_best is not None:
             # 不急停：慢爬向「碰撞最晚」的方向（保留轉向、線速度封到 v_creep）。
             # 逐拍 20Hz 重規劃 → 往縫隙擠出繞行。仍標 blocked（場面確實全堵）。
             fv = _clamp(inf_best[0], p.v_min, p.v_creep)
             return VOResult(fv, inf_best[1], engaged=True, blocked=True,
-                            n_obstacles=len(near), n_feasible=0, min_ttc=inf_best_ttc)
+                            n_obstacles=len(near), n_feasible=0, min_ttc=inf_best_ttc,
+                            best_turn_w=turn_hint, straight_feasible=straight_feasible)
         return VOResult(0.0, 0.0, engaged=True, blocked=True,
-                        n_obstacles=len(near), n_feasible=0, min_ttc=0.0)
+                        n_obstacles=len(near), n_feasible=0, min_ttc=0.0,
+                        best_turn_w=turn_hint, straight_feasible=straight_feasible)
 
     return VOResult(best[0], best[1], engaged=True, blocked=False,
-                    n_obstacles=len(near), n_feasible=n_feasible, min_ttc=best_ttc)
+                    n_obstacles=len(near), n_feasible=n_feasible, min_ttc=best_ttc,
+                    best_turn_w=best[1], straight_feasible=straight_feasible)

@@ -1,0 +1,49 @@
+# sa5_v3f_react_ne1024_s42_tcadapt/checkpoint_60000.pt — 部署資訊卡 (2026-07-06)
+# ============================================================================
+# 血緣: SA1→SA4 完整課程(sa4_v3f/ckpt_420000, det 88.5) → TC1 走廊特化 60k
+# 驗收: T走廊×full_material det SR=92.7% (n=15,488, 撞牆 0.09%)
+#       20×20 stage4 保留 88.7% (n=12,617) → 單政策部署定版
+# ============================================================================
+
+model:
+  ckpt_file: checkpoint_60000.pt
+  encoder: extractor_rnn          # 3-branch: Conv1d(LiDAR) + StateMLP → 96D
+  rnn_type: RNN                   # vanilla RNN (非 GRU)
+  hidden_dim: 64
+  preprocess_dim: 12              # RNN → 12D 特徵
+  fc_dim: 64
+  feat_norm: false                # ★無 feat_norm (v3f 家族)
+  lidar_frame_stack: 1            # 單幀 (79D obs, 車端無需歷史 buffer)
+
+observation:                       # 79D, CHARGE_USE_ACT_HIST=0
+  dim: 79
+  layout: "[0]=accel [1]=speed [2]=omega [3]=radius [4:6]=goal(dist,angle) [6:78]=lidar72 [78]=time"
+  lidar_bins: 72                  # bin36=正前方, 5°/bin, body frame
+  lidar_r_min: 0.25               # m (VLP-16 實測近盲區)
+  lidar_normalize: 10.0           # ⚠ 筆誤！車端實查 PC charge_env_cfg_vlp16.py::wd_like_sweep_72
+                                  #   ObsTerm 實為 r_max=20.0 / r_robot=0.35（(d-0.35)/(20-0.35) clip[0,1]），
+                                  #   非 /10。部署沿用家族 r_max=20（lidar_preprocessor_params_v3f.yaml）。
+
+policy_head:
+  rl_input_dim: 91                # = 79 obs 直通 + 12 RNN 特徵 concat
+  output: "38 logits = 19 accel + 19 omega (per-head Categorical)"
+  action_decode: "idx9=零點中心對稱; v∈[-1,1]m/s a_max=0.5 ω_max=1.2rad/s dt=0.2s"
+  deterministic: true             # 部署用 argmax
+
+reward_recipe:                    # 訓練時配方 (供 sim2real 對照)
+  penalty_speed_near_obs: 0.8     # react 減速: d<1.2m 罰 前進速度 (d_stop 0.45)
+  penalty_hit: -30                # TC curriculum
+  obs_collision_base: 0.9         # 碰撞判定 = 車心-障礙心 0.9m (無膨脹)
+
+training_scene:
+  task: WD-TCorridor              # 58×20m T 走廊 (bar 57×3.5m + stem 7×15.5m)
+  tc_stage: 1                     # TC1: 靜3+動5, 耐久 75s
+  lidar_noise: v3f 合成模型 (hole 10%/block dropout/per-ring bias) # E1 證與實測雜訊等效
+  domain_rand: 質量±15% 摩擦0.7-1.3 風0-3N 推力5-20N@10% 馬達延遲[0,1]步+lag0.5 輪速±3%
+  obs_delay: [0,0]                # 觀測延遲關(sin波兇手), 馬達延遲開 = noobsdelay 正解
+
+deployment_notes:
+  pipeline: rover_rl v3f (79D 零改動, 參照 deploy_rl_shell v3f 分支 + *_v3f.yaml 校準)
+  shield: "α slew 沿用; 建議加 d_safe<0.5m 減速閘 (詳 shield 階梯)"
+  known_style: "貼身通過為 reward 最優 (中位淨空~0.9m, p5~0.1m 尾部 3-4%) → shield 護尾"
+  fallback_ckpt: sa5_v3f_react_ne1024_s42/checkpoint_60000.pt (20×20 stage4 90.0)

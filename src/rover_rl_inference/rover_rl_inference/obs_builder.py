@@ -144,3 +144,104 @@ def world_goal_to_body(
     c = math.cos(-robot_world_yaw)
     s = math.sin(-robot_world_yaw)
     return c * dx - s * dy, s * dx + c * dy
+
+
+# ============================================================================
+# LV-DOT 動態障礙 channel (30D) — 對齊訓練端 dynamic_obstacles_lvdot
+# ----------------------------------------------------------------------------
+# parity 已驗 (IsaacLab: scripts/.../tools/test_lvdot_parity.py):
+#   本函數的計算 = 訓練 torch 函數 dynamic_obstacles_lvdot，4 情境逐位相同。
+# 特徵順序 per obstacle: [px_norm, py_norm, vx_norm, vy_norm, r, valid]
+#   px/py: body frame 位置 (+x 前, +y 左), ÷max_distance clamp[-1,1]
+#   vx/vy: body frame 相對速度 (障礙−機器人, 轉 body), ÷v_max clamp[-2,2]
+#   r:     等效半徑 (m);  valid: 1=有效, 0=填充/無
+# ============================================================================
+@dataclass(frozen=True)
+class LvdotObsParams:
+    top_k: int = 5
+    max_distance: float = 8.0             # 位置正規化分母 + range cull (訓練一致)
+    v_max: float = 1.5                    # 速度正規化分母 (訓練一致)
+    dynamic_speed_threshold: float = 0.3  # LV-DOT dynamic_velocity_threshold (實測 config)
+
+
+def build_lvdot_channel(
+    obstacles,
+    robot_x: float,
+    robot_y: float,
+    robot_yaw: float,
+    robot_vx_w: float,
+    robot_vy_w: float,
+    params: LvdotObsParams = LvdotObsParams(),
+) -> np.ndarray:
+    """把 LV-DOT/vo_interface tracked obstacles 轉成訓練端 30D 障礙 channel。
+
+    obstacles: iterable，每個有 .x .y .vx .vy .r（odom frame，速度為 LV-DOT 絕對速度）。
+               = vo_interface TrackedObstacle 的 position/velocity/radius，或 vo_layer.Obstacle。
+
+    ⚠ robot_vx_w / robot_vy_w 必須是「世界(odom) frame」速度，不是 body frame twist。
+      差動底盤 body twist (v_fwd, v_lat≈0) → 世界: vx_w=cos(yaw)·v_fwd, vy_w=sin(yaw)·v_fwd。
+      (訓練端用 root_lin_vel_w = 世界 frame；此處也要世界 frame 才對齊 parity。)
+
+    座標/正規化/排序/動態過濾與訓練端 dynamic_obstacles_lvdot 完全一致 (parity 已驗)。
+    """
+    cos_y, sin_y = math.cos(robot_yaw), math.sin(robot_yaw)
+    md, vmax, dth = params.max_distance, params.v_max, params.dynamic_speed_threshold
+    cand = []  # (dist, px_n, py_n, vx_n, vy_n, r)
+    for ob in obstacles:
+        abs_speed = math.hypot(ob.vx, ob.vy)
+        if abs_speed <= dth:            # 動態過濾 (LV-DOT 已只給動態，冗餘但保 parity)
+            continue
+        dx, dy = ob.x - robot_x, ob.y - robot_y
+        dist = math.sqrt(dx * dx + dy * dy + 1e-8)
+        if dist > md:                   # range cull
+            continue
+        px = cos_y * dx + sin_y * dy
+        py = -sin_y * dx + cos_y * dy
+        rvx, rvy = ob.vx - robot_vx_w, ob.vy - robot_vy_w
+        vxb = cos_y * rvx + sin_y * rvy
+        vyb = -sin_y * rvx + cos_y * rvy
+        px_n = float(np.clip(px / md, -1.0, 1.0))
+        py_n = float(np.clip(py / md, -1.0, 1.0))
+        vx_n = float(np.clip(vxb / vmax, -2.0, 2.0))
+        vy_n = float(np.clip(vyb / vmax, -2.0, 2.0))
+        cand.append((dist, px_n, py_n, vx_n, vy_n, float(ob.r)))
+    cand.sort(key=lambda t: t[0])       # 由近到遠
+    out = np.zeros(params.top_k * 6, dtype=np.float32)
+    for slot in range(min(params.top_k, len(cand))):
+        _, px_n, py_n, vx_n, vy_n, r = cand[slot]
+        out[slot * 6:slot * 6 + 6] = [px_n, py_n, vx_n, vy_n, r, 1.0]  # valid=1
+    return out
+
+
+def build_obs_lvdot_109d(
+    *,
+    last_accel: float,
+    linear_vel: float,
+    angular_vel: float,
+    goal_body_x: float,
+    goal_body_y: float,
+    lidar_sweep_72: np.ndarray,
+    elapsed_s: float,
+    obstacles,
+    robot_x: float,
+    robot_y: float,
+    robot_yaw: float,
+    robot_vx_w: float,
+    robot_vy_w: float,
+    params: ObsParams = ObsParams(),
+    lvdot_params: LvdotObsParams = LvdotObsParams(),
+) -> np.ndarray:
+    """109D obs = build_obs_79d (79D) + LV-DOT 動態障礙 channel (30D)。
+
+    對齊訓練端 CHARGE_USE_LVDOT_OBS=1 佈局:
+        ego(4) + goal(2) + LiDAR(72) + time(1) + dynamic_obstacles(30) = 109D
+    (障礙 channel 接在 time 之後，與訓練 concat 順序逐字一致。)
+    """
+    o79 = build_obs_79d(
+        last_accel, linear_vel, angular_vel, goal_body_x, goal_body_y,
+        lidar_sweep_72, elapsed_s, params,
+    )
+    ch = build_lvdot_channel(
+        obstacles, robot_x, robot_y, robot_yaw, robot_vx_w, robot_vy_w, lvdot_params,
+    )
+    return np.concatenate([o79, ch]).astype(np.float32)  # 109D

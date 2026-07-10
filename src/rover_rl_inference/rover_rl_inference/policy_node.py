@@ -139,16 +139,29 @@ class PolicyNode(Node):
         self.declare_parameter("topic_cmd_vel", "/input/nav_cmd_vel")
         self.declare_parameter("topic_ndt_pose", "/ndt_pose")
         self.declare_parameter("topic_markers", "~/markers")
+        self.declare_parameter("topic_trail", "/rover_rl/trail")
         self.declare_parameter("topic_obs_debug", "~/obs_debug")
         self.declare_parameter("publish_obs_debug", False)
         # qos
         self.declare_parameter("lidar_qos_best_effort", True)
+        # Vehicle trail for RViz: accumulated odom poses as nav_msgs/Path.
+        self.declare_parameter("publish_trail", True)
+        self.declare_parameter("trail_rate_hz", 5.0)
+        self.declare_parameter("trail_min_distance_m", 0.05)
+        self.declare_parameter("trail_max_points", 2000)
+        # 把「policy 推論時實際餵進網路的 72D sweep」印進 deploy log（節流）。
+        # 這是 _tick_inference 真正傳給 build_obs_raw 的那條（正規化 [0,1]，1=無回波/>=r_max），
+        # 與 preprocessor 發出的 topic、status 給 TUI 的可能因 inline_fallback / 過期而不同。
+        self.declare_parameter("log_sweep72", True)
+        self.declare_parameter("log_sweep72_period_s", 2.0)
         # LiDAR
         self.declare_parameter("lidar_yaw_offset_deg", 0.0)
         self.declare_parameter("lidar_z_filter_m", 0.5)
         self.declare_parameter("lidar_r_min_m", 0.9)
         self.declare_parameter("lidar_r_max_m", 20.0)
         self.declare_parameter("lidar_motion_compensation", True)
+        # 前方 ±30° 扇區「填滿率」用：bin < 此距離視為「打在近物(人)上」。供前方煞判「人全身堵滿車頭」
+        self.declare_parameter("front_block_close_m", 1.2)
         # obs normalizer (與訓練端對齊)
         # 這幾個 max_* 是 obs 正規化的分母，必須跟訓練端 obs_functions.py 完全一致；
         # 不一致 → policy 看到的數值尺度錯位，車會原地震/亂走（sim-to-real mismatch）。
@@ -191,6 +204,13 @@ class PolicyNode(Node):
         self.declare_parameter("goal_frame", "map")
         self.declare_parameter("base_frame", "base_footprint")
         self.declare_parameter("goal_tolerance_m", 0.6)
+        # 終點朝向對齊（RL 只訓練到達位置、不管終點朝向；到達單一 goal 後用 RViz 2D Goal
+        # 箭頭的 orientation 原地轉對齊）。只對 single goal_pose 生效，routing path 終點不對齊。
+        self.declare_parameter("goal_align_yaw_enable", True)
+        self.declare_parameter("goal_align_yaw_tol_deg", 8.0)   # yaw 誤差小於此 → 視為對齊完成、停
+        self.declare_parameter("goal_align_kp", 1.2)            # 比例增益：w = kp·yaw_err
+        self.declare_parameter("goal_align_w_max", 0.6)         # 原地轉上限(rad/s，柔和)
+        self.declare_parameter("goal_align_w_min", 0.15)        # 死區地板：底盤低於此轉不動 → 補到此值
         self.declare_parameter("path_lookahead_m", 2.0)
         self.declare_parameter("require_ndt", False)
         # safety
@@ -241,9 +261,17 @@ class PolicyNode(Node):
         self.topic_cmd = gp("topic_cmd_vel").get_parameter_value().string_value
         self.topic_ndt = gp("topic_ndt_pose").get_parameter_value().string_value
         self.topic_markers = gp("topic_markers").get_parameter_value().string_value
+        self.topic_trail = gp("topic_trail").get_parameter_value().string_value
         self.topic_obs_debug = gp("topic_obs_debug").get_parameter_value().string_value
         self.publish_obs_debug = bool(gp("publish_obs_debug").value)
         self.lidar_qos_be = bool(gp("lidar_qos_best_effort").value)
+        self.publish_trail = bool(gp("publish_trail").value)
+        self.trail_rate_hz = float(gp("trail_rate_hz").value)
+        self.trail_min_distance_m = max(0.0, float(gp("trail_min_distance_m").value))
+        self.trail_max_points = max(2, int(gp("trail_max_points").value))
+        self.log_sweep72 = bool(gp("log_sweep72").value)
+        self.log_sweep72_period_s = float(gp("log_sweep72_period_s").value)
+        self.front_block_close_m = float(gp("front_block_close_m").value)
         self.lidar_yaw_offset = math.radians(float(gp("lidar_yaw_offset_deg").value))
         self.lidar_z_filter = float(gp("lidar_z_filter_m").value)
         self.lidar_r_min = float(gp("lidar_r_min_m").value)
@@ -281,6 +309,11 @@ class PolicyNode(Node):
         self.goal_frame = gp("goal_frame").get_parameter_value().string_value
         self.base_frame = gp("base_frame").get_parameter_value().string_value
         self.goal_tolerance = float(gp("goal_tolerance_m").value)
+        self.goal_align_enable = bool(gp("goal_align_yaw_enable").value)
+        self.goal_align_yaw_tol = math.radians(float(gp("goal_align_yaw_tol_deg").value))
+        self.goal_align_kp = float(gp("goal_align_kp").value)
+        self.goal_align_w_max = float(gp("goal_align_w_max").value)
+        self.goal_align_w_min = float(gp("goal_align_w_min").value)
         self.path_lookahead = float(gp("path_lookahead_m").value)
         self.require_ndt = bool(gp("require_ndt").value)
         self.safety_estop_m = float(gp("safety_lidar_emergency_stop_m").value)
@@ -368,8 +401,16 @@ class PolicyNode(Node):
         self._target_v = 0.0
         self._target_w = 0.0
         self._target_set_t = 0.0
+        # 終點朝向對齊：goal 的 yaw（goal frame；None=無方向資訊/path 不對齊）+ 是否正在對齊
+        self._goal_yaw: float | None = None
+        self._aligning = False
+        # 對齊完成閂：到達 tol 後鎖 True，不再因越界小抖動反覆觸發 bang-bang；新 goal/path 才解鎖
+        self._align_done = False
         # 上次 sweep（給 marker 用）
         self._last_sweep: np.ndarray | None = None
+        # RViz trail：累積 /odom pose 成 nav_msgs/Path。frame 固定為 odom 訊息 frame。
+        self._trail = NavPath()
+        self._trail_last_xy: tuple[float, float] | None = None
         # 上次 subgoal（給 marker 用）
         self._last_subgoal_body: tuple[float, float] | None = None
         self._last_subgoal_source: str | None = None
@@ -437,6 +478,10 @@ class PolicyNode(Node):
             self.create_publisher(MarkerArray, self.topic_markers, 10)
             if self.publish_markers else None
         )
+        self.pub_trail = (
+            self.create_publisher(NavPath, self.topic_trail, 10)
+            if self.publish_trail else None
+        )
         self.pub_obs = (
             self.create_publisher(Float32MultiArray, self.topic_obs_debug, 10)
             if self.publish_obs_debug else None
@@ -458,6 +503,10 @@ class PolicyNode(Node):
         if self.publish_markers:
             self.timer_marker = self.create_timer(
                 1.0 / max(self.marker_rate_hz, 1.0), self._tick_marker,
+            )
+        if self.publish_trail:
+            self.timer_trail = self.create_timer(
+                1.0 / max(self.trail_rate_hz, 1.0), self._tick_trail,
             )
         self.timer_heartbeat = self.create_timer(2.0, self._tick_heartbeat)
         self.timer_status = self.create_timer(0.2, self._publish_status)
@@ -572,12 +621,46 @@ class PolicyNode(Node):
             self._odom_v = tw.linear.x
             self._odom_w = tw.angular.z
             self._odom_t = time.monotonic()
+            self._append_trail_pose_locked(msg)
+
+    def _append_trail_pose_locked(self, msg: Odometry) -> None:
+        if not self.publish_trail:
+            return
+        frame = msg.header.frame_id or self.odom_frame or "odom"
+        p = msg.pose.pose.position
+        if self._trail.header.frame_id and self._trail.header.frame_id != frame:
+            self._trail = NavPath()
+            self._trail_last_xy = None
+        if self._trail_last_xy is not None:
+            dx = p.x - self._trail_last_xy[0]
+            dy = p.y - self._trail_last_xy[1]
+            if math.hypot(dx, dy) < self.trail_min_distance_m:
+                return
+
+        ps = PoseStamped()
+        ps.header.frame_id = frame
+        ps.header.stamp = msg.header.stamp
+        if ps.header.stamp.sec == 0 and ps.header.stamp.nanosec == 0:
+            ps.header.stamp = self.get_clock().now().to_msg()
+        ps.pose = msg.pose.pose
+        ps.pose.position.z = 0.0
+        self._trail.header.frame_id = frame
+        self._trail.header.stamp = ps.header.stamp
+        self._trail.poses.append(ps)
+        self._trail_last_xy = (p.x, p.y)
+        if len(self._trail.poses) > self.trail_max_points:
+            del self._trail.poses[:len(self._trail.poses) - self.trail_max_points]
 
     def _cb_goal(self, msg: PoseStamped) -> None:
         # 新目標 = 新 episode：reset RNN hidden（清掉上一段的記憶）與 cmd filter，
         # 並重置 elapsed 計時（episode_horizon 從 0 起算），對齊訓練時每 episode 的初始狀態
         frame = msg.header.frame_id or self.goal_frame
         self.subgoals.set_single_goal(msg.pose.position.x, msg.pose.position.y, frame)
+        # 記下 RViz 2D Goal 箭頭方向（goal frame 的 yaw），到達後原地轉對齊；重置對齊狀態
+        q = msg.pose.orientation
+        self._goal_yaw = _yaw_from_quat(q.x, q.y, q.z, q.w)
+        self._aligning = False
+        self._align_done = False
         # 手動 2D Goal Pose = 放棄正在 republish 的 routing 路徑，讓手點目標立即生效。
         # 清掉舊 path + 取消 prefer_path（否則 select() 會持續回傳舊 path 的 path_final，
         # 新 goal 永遠被忽略——這是「path_final 到達後按 2D Goal Pose 沒反應」的主因）。
@@ -615,6 +698,10 @@ class PolicyNode(Node):
         # 真的換了一條新路徑（含手動 goal 後重新請求 routing）：開新 episode。
         self._last_path_sig = sig
         self.subgoals.set_path(pts, frame)
+        # routing path 終點不做朝向對齊（path pose 朝向常無意義）→ 清掉 goal_yaw
+        self._goal_yaw = None
+        self._aligning = False
+        self._align_done = False
         # 收到（新）path 就讓 path 蓋過單一 goal_pose（routing 規劃出的路徑優先於手點目標）
         self.subgoals.prefer_path = True
         self.runner.reset()
@@ -880,6 +967,30 @@ class PolicyNode(Node):
             with self._lock:
                 self._last_subgoal_body = (gx, gy)
                 self._last_subgoal_source = f"{choice.source}/{robot_pose.source}"
+            # 終點朝向對齊（RL 沒訓練到這個，補在 policy 外）：只對單一 goal_pose 生效，
+            # 且需有 goal_yaw。robot_yaw_use 與 goal_yaw 同在 choice.frame，可直接相減。
+            if (self.goal_align_enable and choice.source == "goal_pose"
+                    and self._goal_yaw is not None and not self._align_done):
+                yaw_err = math.atan2(math.sin(self._goal_yaw - robot_yaw_use),
+                                     math.cos(self._goal_yaw - robot_yaw_use))
+                if abs(yaw_err) > self.goal_align_yaw_tol:
+                    w_cmd = max(-self.goal_align_w_max,
+                                min(self.goal_align_w_max, self.goal_align_kp * yaw_err))
+                    # 死區地板：底盤低於 w_min 轉不動，補到 w_min 確保真的會轉
+                    if abs(w_cmd) < self.goal_align_w_min:
+                        w_cmd = math.copysign(self.goal_align_w_min, w_cmd)
+                    with self._lock:
+                        self._target_v = 0.0
+                        self._target_w = w_cmd
+                        self._target_set_t = now
+                        self._aligning = True
+                    self.get_logger().info(
+                        f"終點對齊：yaw_err={math.degrees(yaw_err):+.1f}° → w={w_cmd:+.2f}",
+                        throttle_duration_sec=1.0)
+                    return
+                # 已在容差內 → 鎖定完成，之後即使越界小抖動也不再轉（防 bang-bang）
+                self._aligning = False
+                self._align_done = True
             return self._set_target_stop(
                 f"到達 {choice.source} (dist={dist:.2f})", warn=False,
             )
@@ -904,6 +1015,18 @@ class PolicyNode(Node):
                 motion_compensation=motion_comp,
             )
         sweep = sweep_active
+        # 把 policy 真正吃到的 72D sweep 印進 deploy log（節流）：正規化值，最近距離換算成公尺附註，
+        # 方便事後對照「網路實際看到的障礙分布」與 preprocessor / status 是否一致。
+        if self.log_sweep72:
+            vals = " ".join(f"{x:.3f}" for x in sweep)
+            near_norm = float(np.min(sweep)) if sweep.size else float("nan")
+            near_m = (near_norm * (self.lidar_r_max - self.obs_params.robot_radius)
+                      + self.obs_params.robot_radius)
+            self.get_logger().info(
+                f"[sweep72/{sweep_source_tag}] 最近={near_m:.2f}m(norm {near_norm:.3f}) "
+                f"[{vals}]",
+                throttle_duration_sec=self.log_sweep72_period_s,
+            )
         with self._lock:
             self._last_sweep = sweep
             self._sweep_source = sweep_source_tag
@@ -1081,6 +1204,20 @@ class PolicyNode(Node):
         )
         self.pub_markers.publish(marr)
 
+    # ──────────────────────────── Timer: vehicle trail (Path) ────────────────────────────
+
+    def _tick_trail(self) -> None:
+        if self.pub_trail is None:
+            return
+        with self._lock:
+            if not self._trail.poses:
+                return
+            msg = NavPath()
+            msg.header = self._trail.header
+            msg.poses = list(self._trail.poses)
+        msg.header.stamp = self.get_clock().now().to_msg()
+        self.pub_trail.publish(msg)
+
     # ──────────────────────────── Heartbeat (0.5 Hz) ────────────────────────────
 
     def _sweep_to_meters(self, sweep_norm) -> "np.ndarray | None":
@@ -1115,7 +1252,7 @@ class PolicyNode(Node):
             sent_w = self.cmd_filter._last_w
 
         # sweep → 公尺；最近距離 + 四向扇區（bin: 36=前 54=左 18=右 0=後，每 bin 5°）
-        nearest_m = front_m = back_m = left_m = right_m = None
+        nearest_m = front_m = back_m = left_m = right_m = front_block_ratio = None
         meters = self._sweep_to_meters(sweep)
         if meters is not None and len(meters) == 72:
             def _sec(idxs):
@@ -1126,6 +1263,10 @@ class PolicyNode(Node):
             left_m = _sec(np.r_[46:63])
             back_m = _sec(np.r_[64:72, 0:10])
             right_m = _sec(np.r_[10:27])
+            # 前方 ±30° 扇區「填滿率」：bins 30-42 (bin36=前、每bin5°、±30°=13bins) 中
+            # 有多少比例 < close 閾值 = 「打在人身上」。1.0=整扇區都是近物(人全身堵滿車頭)；
+            # 低=只部分擋(人偏一側/有縫)。供前方煞判「該停 vs 該繞」。
+            front_block_ratio = round(float(np.mean(meters[np.r_[30:43]] < self.front_block_close_m)), 2)
 
         # 機器人在 map frame 位姿（走 TF map→base；來源 tf / odom_only）
         rp = self._robot_pose_in_map(odom_x, odom_y, odom_yaw)
@@ -1175,6 +1316,7 @@ class PolicyNode(Node):
             "lidar_src": sweep_src,
             "nearest_m": nearest_m,
             "front_m": front_m, "back_m": back_m, "left_m": left_m, "right_m": right_m,
+            "front_block_ratio": front_block_ratio,  # ±30° 前方扇區近物填滿率(0~1)，供前方煞判「全身堵滿」
             "odom_age": round(odom_age, 3) if odom_age != float("inf") else None,
             "ndt_age": round(self.localizer.ndt_age_s, 2),
             "ndt_ok": bool(self.localizer.is_ndt_stable()),
@@ -1186,6 +1328,7 @@ class PolicyNode(Node):
             "goal_dist": round(goal_dist, 2) if goal_dist is not None else None,
             "goal_ang_deg": round(goal_ang, 1) if goal_ang is not None else None,
             "goal_src": subgoal_src,
+            "aligning": bool(self._aligning),   # 到達後正在原地轉對齊 goal 朝向
             # 導航型態：path=routing 多 waypoint 路徑導航 / single=單一 goal_pose 導航 / None=無目標
             "nav_type": _nav_type(subgoal_src),
             "path_n": path_n if path_n > 0 else None,

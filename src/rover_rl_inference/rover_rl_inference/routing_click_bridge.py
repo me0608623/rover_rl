@@ -99,7 +99,9 @@ class RoutingClickBridge(Node):
         self._click_count += 1
 
         if self._click_count % 2 == 1:
-            # 奇數次 → 設起點
+            # 奇數次 → 設起點。開始一段新路線：先清掉上一段的起/終點 marker，
+            # 否則舊 marker（lifetime 30s）會殘留，與新路線同時顯示成「兩條」。
+            self._clear_markers()
             self._origin = nearest
             self.get_logger().info(f"[1/2] 起點選定: {nearest}  (距離點擊 {dist:.2f}m)")
             self._publish_markers(origin=nearest, dest=None)
@@ -126,6 +128,20 @@ class RoutingClickBridge(Node):
             ) if f.result() else None
         )
 
+    def _clear_markers(self):
+        # 發 DELETEALL 清掉本節點所有選點 marker（起點/終點 sphere + text），
+        # 兩個 namespace 各發一顆，確保 RViz 不殘留上一段路線的標記。
+        markers = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        for ns in ("routing_click", "routing_click_text"):
+            m = Marker()
+            m.header.frame_id = "world"
+            m.header.stamp = now
+            m.ns = ns
+            m.action = Marker.DELETEALL
+            markers.markers.append(m)
+        self.marker_pub.publish(markers)
+
     def _publish_markers(self, origin: str | None, dest: str | None):
         markers = MarkerArray()
         now = self.get_clock().now().to_msg()
@@ -145,7 +161,7 @@ class RoutingClickBridge(Node):
             m.action = Marker.ADD
             m.pose.position.x = x
             m.pose.position.y = y
-            m.pose.position.z = 0.3
+            m.pose.position.z = 0.0
             m.pose.orientation.w = 1.0
             m.scale.x = m.scale.y = m.scale.z = scale
             m.color.r, m.color.g, m.color.b = color_rgb
@@ -161,7 +177,7 @@ class RoutingClickBridge(Node):
             t.action = Marker.ADD
             t.pose.position.x = x
             t.pose.position.y = y
-            t.pose.position.z = 0.8
+            t.pose.position.z = 0.0
             t.pose.orientation.w = 1.0
             t.scale.z = 0.4
             t.color.r = t.color.g = t.color.b = 1.0

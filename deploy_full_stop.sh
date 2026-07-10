@@ -11,6 +11,9 @@ for pat in \
   "ndt_localizer_launch" "points_downsample_launch" "map_loader_launch" "tf_static_launch" \
   "rover_rl_inference/lib/rover_rl_inference/policy_node" \
   "rover_rl_inference/lib/rover_rl_inference/vo_safety" \
+  "rover_rl_inference/lib/rover_rl_inference/recovery_supervisor" \
+  "orca_filter/lib/orca_filter/orca_safety" \
+  "rover_rl_inference/lib/rover_rl_inference/pingpong_test" \
   "rover_rl_inference/lib/rover_rl_inference/lidar_preprocessor" \
   "rover_rl_inference/lib/rover_rl_inference/bev_play" \
   "rover_rl_inference/lib/rover_rl_inference/diag_logger" \
@@ -29,10 +32,10 @@ done
 sleep 3
 
 echo "[deploy_full_stop] 3) 檢查殘留..."
-n=$(ps -eo cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|routing_engine|routing_to_path|routing_click|local_costmap|global_costmap|mot_node|mot_marker|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | wc -l)
+n=$(ps -eo cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|pingpong_test|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|routing_engine|routing_to_path|routing_click|local_costmap|global_costmap|mot_node|mot_marker|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | wc -l)
 if [ "$n" -eq 0 ]; then
   echo "[deploy_full_stop] ✅ 全部已停、清乾淨 (殘留 0)"
 else
   echo "[deploy_full_stop] ⚠ 仍有 $n 個殘留:"
-  ps -eo pid,cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|routing|costmap|mot_node|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | head
+  ps -eo pid,cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|routing|costmap|mot_node|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | head
 fi

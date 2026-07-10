@@ -70,7 +70,7 @@ def build_marker_array(
         m.action = Marker.ADD
         m.pose.position.x = float(subgoal_xy[0])
         m.pose.position.y = float(subgoal_xy[1])
-        m.pose.position.z = 0.15
+        m.pose.position.z = 0.0
         m.pose.orientation.w = 1.0
         m.scale.x = 0.25
         m.scale.y = 0.25
@@ -86,12 +86,12 @@ def build_marker_array(
     m.id = 2
     m.type = Marker.ARROW
     m.action = Marker.ADD
-    p_start = Point(); p_start.x = 0.0; p_start.y = 0.0; p_start.z = 0.2
+    p_start = Point(); p_start.x = 0.0; p_start.y = 0.0; p_start.z = 0.0
     # 速度向量在 body frame：方向是 cmd_w（轉向）+ cmd_v（前進）。簡單顯示前向長度
     p_end = Point()
     p_end.x = float(cmd_v) * 1.0
     p_end.y = 0.0
-    p_end.z = 0.2
+    p_end.z = 0.0
     m.points.append(p_start)
     m.points.append(p_end)
     m.scale.x = 0.05   # 桿
@@ -110,11 +110,11 @@ def build_marker_array(
         m.id = 3
         m.type = Marker.LINE_STRIP
         m.action = Marker.ADD
-        p0 = Point(); p0.x = 0.0; p0.y = 0.0; p0.z = 0.1
+        p0 = Point(); p0.x = 0.0; p0.y = 0.0; p0.z = 0.0
         p1 = Point()
         p1.x = math.cos(angle) * dist
         p1.y = math.sin(angle) * dist
-        p1.z = 0.1
+        p1.z = 0.0
         m.points.append(p0)
         m.points.append(p1)
         m.scale.x = 0.03
@@ -131,7 +131,7 @@ def build_marker_array(
     m.action = Marker.ADD
     m.pose.position.x = 0.0
     m.pose.position.y = 0.0
-    m.pose.position.z = 1.0
+    m.pose.position.z = 0.0
     m.scale.z = 0.3
     m.color = _color(1.0, 1.0, 1.0, 1.0)
     src = subgoal_source or "—"

@@ -100,8 +100,13 @@ class VOSafetyNode(Node):
         # --- 卡死逃脫（opt-in）：blocked+停住超過 N 秒且後方有空間 → 慢退開出空間再繞 ---
         gp("stuck_escape_enable", False) # True=啟用卡死後退逃脫；False(預設)=堵死就停在原地
         gp("stuck_timeout_s", 3.0)       # blocked+停住連續多久才觸發後退（設長避免有人只是路過就亂退）
-        gp("rear_clear_min_m", 1.2)      # 後方 LiDAR 淨空(policy status back_m)需大於此才敢退（防倒退撞牆）
+        gp("rear_clear_min_m", 1.2)      # 後退【中止】門檻：back_m 掉到此值→立刻停（防倒退撞牆/人）
+        gp("rear_clear_start_m", 1.2)    # 後退【觸發】門檻：back_m 需 > 此值才敢啟動後退（純 LiDAR，牆/人都算）
+        gp("escape_block_if_rear_person", False) # 後方額外用 VO 追蹤人擋退（後方 LV-DOT 覆蓋僅~2%，雞肋；預設關）
+        gp("escape_rear_person_range_m", 2.0)    # 後方多遠內有追蹤到的人就擋退（m，僅 enable 時作用）
         gp("escape_reverse_v", -0.2)     # 逃脫後退速度（m/s，負值；慢退）
+        gp("escape_reverse_accel", 0.3)  # ★建立倒退速度時的「溫柔加速度」(m/s²)：對齊人工示範慢慢加速，
+                                         #   不共用底盤 accel_v(1.2)那種猛倒。只管「越退越快」的建立段。
         gp("escape_max_dist_m", 1.0)     # 後退距離上限：退這麼多仍堵死→放棄停車（防前方一直逼→無限後退）
         gp("escape_turn_w", 0.0)         # 後退時朝「LiDAR 較開側」轉的角速度（rad/s）；0=直退（舊行為）
         gp("escape_turn_min_side_m", 0.8)  # 轉向側的 LiDAR 淨空需 > 此才邊退邊轉；兩側都窄→直直退（純退讓）
@@ -118,6 +123,41 @@ class VOSafetyNode(Node):
         gp("front_brake_enable", False)  # True=啟用前方 LiDAR 安全煞（預設版開，滿血版不設→關）
         gp("front_brake_slow_m", 0.6)    # front_m ≤ 此值 → 線性減速（介入起點）
         gp("front_brake_stop_m", 0.5)    # front_m ≤ 此值 → 禁止前進（必停；仍可倒退/原地轉逃離）
+        # 前方煞「直退避讓」（opt-in）：≤stop 且後方夠空 → 直直倒車退開，退到 ≥release 才收（遲滯防抖）。
+        # 純直退（w=0），適用「牆等靜物 VO 看不到」場景；後方被擋則不退、退回只停。
+        gp("front_brake_reverse", False)   # True=觸發 stop 時直退避讓；False=只停+保留 RL 轉向
+        gp("front_brake_release_m", 0.65)  # 倒車退到 front_m ≥ 此值才收手（須 > slow_m，遲滯）
+        gp("front_brake_reverse_delay_s", 2.0)  # ≤stop 先停住連續這麼久才開始退（仿舊 stuck_escape 2s）
+        # 前方煞「讓 VO 繞」：前方 front_m 若是 VO 追蹤的障礙(人)造成 → 交給 VO 繞/停/退，front-brake
+        # 讓開（否則硬停會砍掉繞行的前進弧）。只對「VO 看不到的物(牆)」硬管；另設絕對緊急距離兜底。
+        gp("front_brake_defer_to_vo", True)     # True=VO 看得到的前方障礙交給 VO；False=一律硬管(舊行為)
+        gp("front_brake_defer_cone_deg", 45.0)  # 判「前方障礙」的錐角(±deg)
+        gp("front_brake_emergency_m", 0.55)     # 絕對硬停底線：任何物(含 VO 正在繞的人)到此距離一律停
+        # --- 前方「定時硬凍結」（opt-in，獨立於 front_brake_enable）---
+        # 近障(front_m≤trigger) → v/w 瞬間全歸 0、凍結 hold_s 秒 → 時間到「無條件」把控制權交回 RL，
+        # 即使障礙還在也放行（RL 自身 LiDAR sweep 仍會避）。解除後須退到 ≥rearm_m 才允許再次觸發，
+        # 避免同一障礙每 hold_s 秒重觸發抽動。吃 RL front_m（含牆任何物）。
+        gp("front_freeze_enable", False)     # True=啟用兩段式前方安全（0.7m freeze + 0.5m 硬停後退）
+        # 第一段 freeze：front_m ≤ trigger → 停 hold_s → 交回 RL（暫停讓 RL 重試）
+        gp("front_freeze_trigger_m", 0.7)    # front_m ≤ 此值 → 觸發 freeze
+        gp("front_freeze_hold_s", 1.0)       # freeze 持續秒數（到點交回 RL）
+        gp("front_freeze_rearm_m", 0.9)      # freeze 解除後退到 front_m ≥ 此值才能再次觸發（遲滯，須 > trigger）
+        # 第二段硬停+後退：front_m ≤ hardstop_m → 持續硬停（車過不了此距離）；持續 ≤hardstop_m 達
+        #   dwell_s 秒 → 觸發後退（用 escape_reverse_v/accel，受後方安全檢查），退到 front_m ≥ trigger 才收。
+        gp("front_hardstop_m", 0.5)          # front_m ≤ 此值 → 強制硬停（持續，禁前進）
+        gp("front_hardstop_dwell_s", 1.0)    # 前方持續 ≤hardstop_m 這麼久才觸發後退（確認障礙沒走）
+        # ★前方「全身堵滿」才停：front_m 近 + ±30°扇區填滿率 ≥ 此值才算「人正對堵死」→ 停。
+        # 填滿率低（人偏一側/有縫）→ 不停，讓 RL/VO 繞。取代舊「單點近就停」。
+        gp("front_block_ratio_thresh", 0.8)     # ±30° 前方近物覆蓋率門檻(0~1)；0.8=80%bin是近物才停
+        # ★「嚴格前方」模式（TUI 'f' 鍵熱切換）：ON 時 VO 只處理「前方±cone° 且(卡住≥stuck_s 或
+        #   直衝車端)」的障礙；側邊/路過的人忽略。用途：讓 VO 不再對側向路人減速，只擋真正威脅。
+        gp("vo_strict_front", False)            # True=啟用嚴格前方過濾（運行時由 topic toggle）
+        gp("topic_strict_front_toggle", "/vo_safety/strict_front_toggle")
+        gp("strict_front_cone_deg", 15.0)       # 嚴格模式前方錐角(±deg)
+        gp("strict_front_stuck_s", 2.0)         # 障礙在錐內停滯≥此秒才算「卡住」
+        gp("strict_front_stuck_vel", 0.3)       # 障礙速度低於此(m/s)才算「停滯」
+        gp("strict_front_closing_ms", 0.15)     # 接近率(closing)>此 m/s 才算「直衝車端」
+        gp("strict_front_lateral_ms", 0.25)     # 同時橫向相對速<此才算「直直衝」(非橫越)
         # --- 靜止人源（★只滿血版 vo_params_full.yaml 開；預設版不設→關）---
         # 站著不動的人 LV-DOT 不判 dynamic（YOLO↔3D 關聯常斷）→ VO 看不到。此源自建：拿 YOLO
         # person 2D + visual_bboxes 3D 做方位角關聯，補「人的靜態位置障礙」給 VO（v=0，只避人不避牆）。
@@ -168,7 +208,11 @@ class VOSafetyNode(Node):
         self.stuck_escape_enable = bool(g("stuck_escape_enable").value)
         self.stuck_timeout_s = float(g("stuck_timeout_s").value)
         self.rear_clear_min = float(g("rear_clear_min_m").value)
+        self.rear_clear_start = float(g("rear_clear_start_m").value)
+        self.escape_block_if_rear_person = bool(g("escape_block_if_rear_person").value)
+        self.escape_rear_person_range = float(g("escape_rear_person_range_m").value)
         self.escape_reverse_v = float(g("escape_reverse_v").value)
+        self.escape_reverse_accel = float(g("escape_reverse_accel").value)
         self.escape_max_dist = float(g("escape_max_dist_m").value)
         self.escape_turn_w = float(g("escape_turn_w").value)
         self.escape_turn_min_side = float(g("escape_turn_min_side_m").value)
@@ -179,6 +223,28 @@ class VOSafetyNode(Node):
         self.front_brake_enable = bool(g("front_brake_enable").value)
         self.front_slow_m = float(g("front_brake_slow_m").value)
         self.front_stop_m = float(g("front_brake_stop_m").value)
+        self.front_brake_reverse = bool(g("front_brake_reverse").value)
+        self.front_release_m = float(g("front_brake_release_m").value)
+        self.front_reverse_delay = float(g("front_brake_reverse_delay_s").value)
+        self.front_defer_to_vo = bool(g("front_brake_defer_to_vo").value)
+        self.front_defer_cone = math.radians(float(g("front_brake_defer_cone_deg").value))
+        self.front_emergency_m = float(g("front_brake_emergency_m").value)
+        # 前方定時硬凍結
+        self.front_freeze_enable = bool(g("front_freeze_enable").value)
+        self.front_freeze_trigger_m = float(g("front_freeze_trigger_m").value)
+        self.front_freeze_hold_s = float(g("front_freeze_hold_s").value)
+        self.front_freeze_rearm_m = float(g("front_freeze_rearm_m").value)
+        self.front_hardstop_m = float(g("front_hardstop_m").value)
+        self.front_hardstop_dwell_s = float(g("front_hardstop_dwell_s").value)
+        self.front_block_ratio_thresh = float(g("front_block_ratio_thresh").value)
+        # 嚴格前方模式
+        self._strict_front = bool(g("vo_strict_front").value)
+        topic_strict = g("topic_strict_front_toggle").get_parameter_value().string_value
+        self.strict_cone = math.radians(float(g("strict_front_cone_deg").value))
+        self.strict_stuck_s = float(g("strict_front_stuck_s").value)
+        self.strict_stuck_vel = float(g("strict_front_stuck_vel").value)
+        self.strict_closing = float(g("strict_front_closing_ms").value)
+        self.strict_lateral = float(g("strict_front_lateral_ms").value)
         # 靜止人源
         self.static_human_enable = bool(g("static_human_enable").value)
         self.topic_yolo = g("topic_yolo").get_parameter_value().string_value
@@ -210,6 +276,7 @@ class VOSafetyNode(Node):
         self._left_m: float | None = None   # 左側 LiDAR 淨空（escape 牆感知轉向用）
         self._right_m: float | None = None  # 右側 LiDAR 淨空
         self._front_m: float | None = None  # 前方 LiDAR 最近距（前方安全煞用；含牆任何物）
+        self._front_block_ratio: float | None = None  # ±30° 前方扇區填滿率（0~1）
         self._sweep_t = 0.0                  # policy status（含 front_m）最後到達 monotonic 時間
         # 靜止人源快取
         self._yolo_betas: list[float] = []  # YOLO person 相機方位（rad，右正）
@@ -217,7 +284,16 @@ class VOSafetyNode(Node):
         self._visual_boxes: list[tuple[float, float, float]] = []  # (x,y,r) odom
         self._visual_t = 0.0
         self._human_obs: list[Obstacle] = []  # 本拍補的人源障礙（供 status/cone 檢查）
-        self._front_brake = ""               # 前方安全煞狀態："stop"/"slow"/""（供 status）
+        self._front_brake = ""               # 前方安全煞狀態："stop"/"slow"/"reverse"/""（供 status）
+        self._front_brake_prev = ""          # 前一拍前方煞狀態（狀態變化 log 用）
+        self._front_reversing = False        # 前方煞直退避讓遲滯狀態
+        self._front_freeze_since = None      # 定時凍結起算 monotonic（None=未凍結）
+        self._front_freeze_armed = True      # 是否允許觸發凍結（False=待退到 rearm 外重置）
+        self._front_hardstop_since = None    # 前方硬停(≤hardstop_m)持續起算 monotonic（dwell 計時）
+        self._front_hardstop_reversing = False  # 硬停後退相位是否進行中
+        # 嚴格前方模式：錐內障礙年齡追蹤 {pos_grid: [first_seen, last_seen]}
+        self._cone_age: dict[tuple, list[float]] = {}
+        self._front_stop_since = None        # 進入前方 stop 區的 monotonic 時間（2s 才退用）
         self._stuck_since: float | None = None  # 開始 blocked+停住的 monotonic 時間
         self._escaping = False       # 是否正在後退逃脫
         self._escape_start_xy = (0.0, 0.0)  # 後退起點 odom（量後退距離）
@@ -245,6 +321,9 @@ class VOSafetyNode(Node):
         if self.static_human_enable:
             self.create_subscription(Detection2DArray, self.topic_yolo, self._cb_yolo, 10)
             self.create_subscription(MarkerArray, self.topic_visual, self._cb_visual, 5)
+        # 嚴格前方模式熱切換（TUI 'f' 鍵發 Empty）
+        from std_msgs.msg import Empty as EmptyMsg
+        self.create_subscription(EmptyMsg, topic_strict, self._cb_strict_toggle, 5)
 
         self.create_timer(1.0 / ctrl_hz, self._tick_ctrl)
 
@@ -302,6 +381,7 @@ class VOSafetyNode(Node):
         self._left_m = _safe_float(d.get("left_m"))
         self._right_m = _safe_float(d.get("right_m"))
         self._front_m = _safe_float(d.get("front_m"))  # 前方安全煞用
+        self._front_block_ratio = _safe_float(d.get("front_block_ratio"))  # ±30° 前方填滿率
         self._sweep_t = time.monotonic()               # 前方安全煞的新鮮度基準
         gd = _safe_float(d.get("goal_dist"))
         ga = _safe_float(d.get("goal_ang_deg"))
@@ -394,17 +474,193 @@ class VOSafetyNode(Node):
             out.append(Obstacle(x=ox, y=oy, vx=0.0, vy=0.0, r=r))
         return out
 
+    def _front_vo_obstacle_surface_dist(self) -> float | None:
+        """前錐(±front_defer_cone)、engage_range 內，最近 VO 追蹤障礙的「表面距離」(車中心↔障礙心 − r)。
+
+        用來判斷 front_m 是不是「VO 看得到的障礙(人)」造成：若某 tracked 障礙的表面距離 ≈ front_m，
+        表示前方那顆 VO 有在管 → front-brake 讓開交給 VO 繞/停/退；否則(front_m 明顯更近)是 VO
+        看不到的物(牆) → front-brake 自己硬管。無前錐障礙 → None。
+        """
+        if self._robot is None:
+            return None
+        sy, cy = math.sin(self._robot.yaw), math.cos(self._robot.yaw)
+        rng2 = self.vo.engage_range * self.vo.engage_range
+        best = None
+        for ob in self._obstacles + self._human_obs:
+            dx, dy = ob.x - self._robot.x, ob.y - self._robot.y
+            if dx * dx + dy * dy > rng2:
+                continue
+            xb = cy * dx + sy * dy
+            if xb <= 0.0:
+                continue
+            yb = -sy * dx + cy * dy
+            if abs(math.atan2(yb, xb)) > self.front_defer_cone:
+                continue
+            surf = math.hypot(dx, dy) - ob.r
+            if best is None or surf < best:
+                best = surf
+        return best
+
+    def _cb_strict_toggle(self, msg) -> None:
+        self._strict_front = not self._strict_front
+        self._cone_age.clear()
+        self.get_logger().warn(
+            f"VO 嚴格前方模式 → {'ON（只處理前方±%.0f° 卡≥%.0fs 或直衝車端）' % (math.degrees(self.strict_cone), self.strict_stuck_s) if self._strict_front else 'OFF（全向）'}")
+
+    def _strict_front_filter(self, obstacles: list, now: float) -> list:
+        """嚴格前方模式：只保留「前方±cone° 且(卡住≥stuck_s 或 直衝車端)」的障礙。
+        側/後方、路過橫越的人忽略。卡住=在錐內停滯≥stuck_s；直衝=接近率>closing 且橫向< lateral。"""
+        if self._robot is None:
+            return obstacles
+        sy, cy = math.sin(self._robot.yaw), math.cos(self._robot.yaw)
+        kept, seen = [], set()
+        for ob in obstacles:
+            dx, dy = ob.x - self._robot.x, ob.y - self._robot.y
+            xb = cy * dx + sy * dy           # 前向
+            if xb <= 0.3:                    # 不明確在前方 → 略過
+                continue
+            yb = -sy * dx + cy * dy          # 左
+            if math.atan2(abs(yb), xb) > self.strict_cone:   # 超出 ±cone°
+                continue
+            key = (round(ob.x / 0.3), round(ob.y / 0.3))
+            seen.add(key)
+            rec = self._cone_age.setdefault(key, [now, now])
+            rec[1] = now                      # 更新最後見到
+            age = now - rec[0]
+            # 接近/橫向相對速度（odom 系，2D）
+            rng = math.hypot(dx, dy)
+            rvx, rvy = ob.vx - self._robot.v, ob.vy - 0.0   # robot.v 是線速度(沿 heading)，近似
+            # robot 速度向量（沿 heading）：v·(cos yaw, sin yaw)；較準的做法
+            rvx = ob.vx - self._robot.v * cy
+            rvy = ob.vy - self._robot.v * sy
+            range_rate = (dx * rvx + dy * rvy) / rng        # >0 遠離、<0 接近
+            closing = -range_rate
+            phx, phy = dx / rng, dy / rng
+            lat = math.hypot(rvx - range_rate * phx, rvy - range_rate * phy)
+            stuck = (age >= self.strict_stuck_s
+                     and math.hypot(ob.vx, ob.vy) < self.strict_stuck_vel)
+            approaching = closing > self.strict_closing and lat < self.strict_lateral
+            if stuck or approaching:
+                kept.append(ob)
+        # 清掉離開錐超過 1.5s 的 key
+        self._cone_age = {k: v for k, v in self._cone_age.items()
+                          if k in seen or (now - v[1]) < 1.5}
+        return kept
+
+    def _front_freeze_step(self, f: float, now: float):
+        """兩段式前方安全狀態機。回傳 (v', w', 狀態字) 或 None（不介入）.
+
+        第二段（近，優先）f ≤ hardstop_m(0.5)：
+          - 持續硬停 (0,0,"stop")，車過不了此距離；
+          - 前方持續 ≤hardstop_m 達 dwell_s 秒且後方淨空 → 觸發後退 (escape_reverse_v,0,"reverse")，
+            退到 f ≥ trigger(0.7) 或後方不淨空才收。
+        第一段（遠）hardstop_m < f ≤ trigger(0.7)：
+          - freeze：v/w 全歸 0 停 hold_s(1s) → 交回 RL；f ≥ rearm(0.9) 才能再次觸發（遲滯）。
+        ⚠ freeze 交回 RL 後於 0.5~0.7 區間不擋前進；真正的前向硬地板是 0.5m 那段（hardstop）。
+        """
+        rear_ok = (self._back_m is not None and self._back_m > self.rear_clear_min
+                   and not self._rear_person_near())
+        # 退到 rearm 外 → 重新武裝 freeze
+        if not self._front_freeze_armed and f >= self.front_freeze_rearm_m:
+            self._front_freeze_armed = True
+        # ── 後退相位（一旦啟動，退到 f≥trigger 或後方不淨空才收）──
+        if self._front_hardstop_reversing:
+            if f < self.front_freeze_trigger_m and rear_ok:
+                return self.escape_reverse_v, 0.0, "reverse"
+            self._front_hardstop_reversing = False
+            self._front_hardstop_since = None
+        # ── 第二段：硬停 + dwell → 後退 ──
+        if f <= self.front_hardstop_m:
+            if self._front_hardstop_since is None:
+                self._front_hardstop_since = now
+            if (now - self._front_hardstop_since) >= self.front_hardstop_dwell_s and rear_ok:
+                self._front_hardstop_reversing = True
+                return self.escape_reverse_v, 0.0, "reverse"
+            return 0.0, 0.0, "stop"              # 硬停（dwell 中 或 後方不淨空 → 只停）
+        self._front_hardstop_since = None        # 離開 hardstop 區 → 清 dwell
+        # ── 第一段：freeze（hardstop_m < f ≤ trigger）──
+        if self._front_freeze_since is not None:
+            if (now - self._front_freeze_since) < self.front_freeze_hold_s:
+                return 0.0, 0.0, "freeze"
+            self._front_freeze_since = None      # 時間到 → 交回 RL、解武裝
+            self._front_freeze_armed = False
+            return None
+        if self._front_freeze_armed and f <= self.front_freeze_trigger_m:
+            self._front_freeze_since = now       # 觸發 freeze
+            return 0.0, 0.0, "freeze"
+        return None
+
     def _apply_front_brake(self, v: float, w: float) -> tuple[float, float, str]:
         """前方 LiDAR 安全煞：吃 RL front_m（含牆任何物）. 回傳 (v', w', 狀態字).
 
-        front_m ≤ stop → 禁止前進（v 鉗到 ≤0，仍可倒退/原地轉逃離）＝必停；
-        stop < front_m ≤ slow → 線性縮前進速度（介入減速）。轉向(w)不動。
+        front_m ≤ stop → 禁止前進（v 鉗到 ≤0）＝必停；stop < front_m ≤ slow → 線性縮前進速度。
+        front_brake_reverse=True 時：≤stop **先停住連續 reverse_delay_s（≈2s，同舊 stuck_escape
+          的 stuck_timeout）** 且後方夠空 → 才直直倒車避讓（v=escape_reverse_v, w=0），退到
+          front_m ≥ release 才收（遲滯防前後抖）；後方被擋/未知 → 不退、退回只停。
         """
+        now = time.monotonic()
+        sweep_ok = (self._front_m is not None
+                    and (now - self._sweep_t) <= self.timeout_goal)
+        # ── 定時硬凍結（opt-in，優先於 front_brake，獨立開關）──
+        # 近障→v/w 全歸 0 凍結 hold_s→無條件交回 RL；解除後退到 rearm 外才重新武裝。
+        if self.front_freeze_enable and sweep_ok:
+            fr = self._front_freeze_step(self._front_m, now)
+            if fr is not None:
+                return fr
+        elif not sweep_ok:
+            self._front_freeze_since = None
+            self._front_hardstop_since = None
+            self._front_hardstop_reversing = False
+            self._front_freeze_armed = True
         # 逾時（policy status 停發）→ 不亂煞，退回原輸出（VO desired 看門狗會另行處理 policy 掛掉）
-        if (not self.front_brake_enable or self._front_m is None
-                or (time.monotonic() - self._sweep_t) > self.timeout_goal):
+        if not self.front_brake_enable or not sweep_ok:
+            self._front_reversing = False
+            self._front_stop_since = None
             return v, w, ""
         f = self._front_m
+        # ── ★倒退鎖定（latch，2026-07-07 修「倒退時左右甩頭」）──
+        # 已在倒退中 → 只認 front_m 遲滯（≥release 收）或後方不安全才收手；**繞過下面被
+        # front_block_ratio 抖動觸發的「解除」早退**。否則 ratio 一抖 → 早退中斷倒退 → 空檔漏
+        # RL 的亂甩 ±ω 出去 → 倒退段左右翻邊。鎖定期間 w 固定為 _escape_w 的 commit 側（≤escape_turn_w，
+        # 不會是 RL 的 0.66），commit_until 續命避免中途過期翻側 → 乾淨的單側 K 轉倒退。
+        if self.front_brake_reverse and self._front_reversing:
+            rear_ok = (self._back_m is not None
+                       and self._back_m > self.rear_clear_min + 0.15)
+            if f < self.front_release_m and rear_ok:
+                self._commit_until = now + self.commit_hold_s   # 倒退中持續鎖側，防 commit 過期翻邊
+                return self.escape_reverse_v, self._escape_w(0.0), "reverse"
+            self._front_reversing = False   # 到 release 或後方不安全 → 收，落入下面正常判斷
+        # ── ★「全身堵滿」才停：±30° 前方扇區填滿率 ≥ thresh 才算「人正對堵死」→ 走停/退。
+        #   填滿率低（人偏一側/有縫、或單根柱子）→ 不停，交給 RL/VO 繞過去。
+        #   emergency 是絕對底線：任何物(不管填不填滿)到此距離一律停（安全網）。──
+        blocked = (self._front_block_ratio is not None
+                   and self._front_block_ratio >= self.front_block_ratio_thresh)
+        if not blocked and f > self.front_emergency_m:
+            self._front_reversing = False
+            self._front_stop_since = None
+            return v, w, ""      # 沒堵滿 → 不停，讓 RL/VO 繞
+        # 直退避讓：≤stop 先停、停住滿 reverse_delay 且後方空才退（仿舊 stuck_escape 的 2s 才退）
+        if self.front_brake_reverse:
+            rear_ok = self._back_m is not None and self._back_m > self.rear_clear_min + 0.15
+            if f > self.front_stop_m:
+                self._front_stop_since = None   # 離開停車區 → 清停留計時
+            if self._front_reversing:
+                if f >= self.front_release_m or not rear_ok:
+                    self._front_reversing = False
+            elif f <= self.front_stop_m:
+                if self._front_stop_since is None:
+                    self._front_stop_since = now                  # 進停車區起算停留
+                if (now - self._front_stop_since) >= self.front_reverse_delay and rear_ok:
+                    if not self._front_reversing:
+                        # ★開始退：以「左右哪邊空間多」鎖定繞行側（對齊人工示範 K 轉），
+                        #   之後倒退＋前進 go-around 都沿此側連續畫弧，不橫跳。
+                        ew0 = self._escape_w(0.0)
+                        self._commit_side = 0 if ew0 == 0.0 else (1 if ew0 > 0.0 else -1)
+                        self._commit_until = now + self.commit_hold_s
+                    self._front_reversing = True                  # 停滿 delay 且後方空 → 開始退
+            if self._front_reversing:
+                # 朝較開側轉著退（非純直退）；escape_turn_w=0 時退化回直退（w=0）
+                return self.escape_reverse_v, self._escape_w(0.0), "reverse"
         if f <= self.front_stop_m:
             return min(v, 0.0), w, "stop"
         if f <= self.front_slow_m and v > 0.0:
@@ -435,6 +691,9 @@ class VOSafetyNode(Node):
             obstacles = obstacles + self._human_obs
         else:
             self._human_obs = []
+        # 嚴格前方模式（TUI 'f' 切換）：只留前方±cone° 且(卡≥stuck_s 或直衝車端)的障礙
+        if self._strict_front:
+            obstacles = self._strict_front_filter(obstacles, now)
 
         goal = self._goal_in_odom(now)   # odom-frame goal（None=無/逾時，退回純貼近 RL）
         self._goal_active = goal is not None and self.vo.w_goal > 0.0
@@ -462,11 +721,16 @@ class VOSafetyNode(Node):
         # 仿真人 K 轉：①還堵死→倒車開空間 ②有前進解但鼻子沒對準→停止後退、原地轉對準
         # ③鼻子對準(straight_feasible，接近直行就能前進)→退出，go-around 前進接手。
         # 後方淨空(back_m)掉到門檻下立刻中止倒車（防倒退撞牆，安全優先）；對準階段不倒車則不受此限。
-        rear_ok = self._back_m is not None and self._back_m > self.rear_clear_min
-        # 觸發需比「中止門檻」多 0.15m 餘裕（遲滯）：否則 back_m 在 rear_clear_min 邊界因 LiDAR
-        # 噪聲抖動 → 觸發後下一拍 back_m 略降就立刻中止，等於只退一拍(≈1cm)退不動（實測 bug）。
+        # ★另補：後方有 VO 追蹤到的人(rear_person)→ 一律不准退（觸發前擋、退到一半也中止）。
+        rear_person = self._rear_person_near()
+        rear_ok = (self._back_m is not None and self._back_m > self.rear_clear_min
+                   and not rear_person)
+        # 觸發門檻 rear_clear_start（純 LiDAR，牆/人都算）獨立於中止門檻 rear_clear_min：
+        # 後方 back_m 需 > rear_clear_start 才敢啟動後退（後方 1.2m 內有任何東西就不退）；
+        # start > min 天然提供遲滯，避免在門檻邊界抖動→退一拍就中止（實測 bug）。
         rear_ok_start = (self._back_m is not None
-                         and self._back_m > self.rear_clear_min + 0.15)
+                         and self._back_m > self.rear_clear_start
+                         and not rear_person)
         if self.stuck_escape_enable:
             if self._escaping:
                 # 已後退距離（從起點 odom 量）
@@ -490,9 +754,9 @@ class VOSafetyNode(Node):
                     self._escaping = False
                     self._stuck_since = None
                     bm_str = "未知" if self._back_m is None else f"{self._back_m:.1f}m"
-                    self.get_logger().warn(
-                        f"VO 逃脫中止：後方淨空 {bm_str}≤{self.rear_clear_min:.1f}m"
-                        "（有人擋後方/接近牆/淨空未知）→ 停車")
+                    reason = ("後方偵測到人" if rear_person
+                              else f"後方淨空 {bm_str}≤{self.rear_clear_min:.1f}m（接近牆/淨空未知）")
+                    self.get_logger().warn(f"VO 逃脫中止：{reason} → 停車")
                 elif res.blocked and rev_dist >= self.escape_max_dist:  # 退滿上限仍堵 → 放棄
                     self._escaping = False
                     self._stuck_since = None
@@ -542,7 +806,18 @@ class VOSafetyNode(Node):
         # 前方 LiDAR 安全煞（只預設版）：吃 RL front_m，≤stop 禁前進、≤slow 減速（含牆任何物）。
         # 放最後、蓋過 VO/逃脫輸出 → 距離硬底線，不論障礙是人是牆一律生效。
         tv, tw, self._front_brake = self._apply_front_brake(tv, tw)
-        self._publish_slew(tv, tw)
+        # 前方煞狀態變化 → log（供盯 log 觀察；純觀察不影響控制）
+        if self._front_brake != self._front_brake_prev:
+            fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
+            if self._front_brake:
+                self.get_logger().warn(f"前方煞 → {self._front_brake}（front_m={fm}m）")
+            else:
+                self.get_logger().info(f"前方煞 → 解除/讓VO繞（front_m={fm}m）")
+            self._front_brake_prev = self._front_brake
+        if self._front_brake in ("stop", "reverse", "freeze"):
+            self._publish_brake(tv, tw)   # 安全煞：前進速度瞬間歸零（不 slew 慢收→不多衝 ~0.1m）
+        else:
+            self._publish_slew(tv, tw)
         self._publish_status(res=res, intervening=intervening, obs_stale=obs_stale)
 
     def _forward_cone_clear(self) -> bool:
@@ -570,15 +845,38 @@ class VOSafetyNode(Node):
                 return False             # 前錐內有近障 → 鼻子尚未對準空檔
         return True
 
+    def _rear_person_near(self) -> bool:
+        """後方半平面 escape_rear_person_range 內是否有「VO 追蹤到的障礙(人)」→ 有則禁止後退.
+
+        補足 back_m(LiDAR)只在 rear_clear_min≈0.85m 內才擋的盲區：人在 0.85m~range 之間時
+        LiDAR back_m 放行、但車會退向他。用 tracked 障礙(self._obstacles + _human_obs，來自
+        LV-DOT 動態人)在後向(車身 x_body<0)判定；靜態牆不在 tracked、仍由 back_m 管。
+        無車姿/未啟用 → 視為無人(False，不擋)。
+        """
+        if self._robot is None or not self.escape_block_if_rear_person:
+            return False
+        sy = math.sin(self._robot.yaw)
+        cy = math.cos(self._robot.yaw)
+        rng2 = self.escape_rear_person_range * self.escape_rear_person_range
+        for ob in self._obstacles + self._human_obs:
+            dx = ob.x - self._robot.x
+            dy = ob.y - self._robot.y
+            if dx * dx + dy * dy > rng2:
+                continue
+            x_body = cy * dx + sy * dy   # 前向分量（<0=車身後方）
+            if x_body < 0.0:
+                return True              # 後方半平面 range 內有追蹤到的人 → 擋退
+        return False
+
     def _escape_w(self, hint_w: float = 0.0) -> float:
         """後退逃脫時的轉向角速度（方向跟 rollout 同源 + 牆安全閘）.
 
-        想轉哪側的優先序：
-          1. **已 commit 側**（escape 一開始鎖定後就沿用，最高優先）——best_turn_w 在障礙近正前方時
-             會因 turn_hint 的 ±0.05 窄帶 + 追蹤噪聲每拍翻號 → 若讓它蓋過 commit，轉向會左右橫跳
-             （「往右退卻甩頭到左」）。故鎖定後只認 commit，唯牆安全閘可翻邊。
-          2. VO rollout 提示 best_turn_w（**僅未鎖定時**用來選初始側，讓逃脫轉向與 go-around 同側）。
-          3. LiDAR 較開側 left_m/right_m（前兩者都沒有時墊底）。
+        想轉哪側的優先序（★2026-07-07 改：對齊人工示範「往較開側 K 轉」，開側升為主依據）：
+          1. **已 commit 側**（escape 一開始鎖定後就沿用，最高優先）——避免鎖定後左右橫跳
+             （「往右退卻甩頭到左」）。鎖定後只認 commit，唯牆安全閘可翻邊。
+          2. **LiDAR 較開側 left_m/right_m（未鎖定時的主要依據）**：哪邊空間多就往哪邊 K 轉，
+             與人工示範一致（第一次往右、第二次往左，都朝當下較開側）。
+          3. VO rollout 提示 best_turn_w（僅左右淨空都未知時墊底）。
         ⚠ VO 看不到靜態牆 → left_m/right_m 只當**安全閘**：欲轉側淨空 ≤ min_side（近牆）→ 不
           倒車轉進牆，改另一開側；兩側都窄 → 直直後退（純退讓）。
         left_m=+y/左→w>0(CCW)；right_m=−y/右→w<0。escape_turn_w=0 → 0（直退）。
@@ -592,15 +890,15 @@ class VOSafetyNode(Node):
         right_open = rm is None or rm > self.escape_turn_min_side
         if not left_open and not right_open:
             return 0.0   # 兩側都確定窄 → 直直退（純退讓）
-        # 想轉方向：commit（鎖定側，最高優先）> 提示（僅未鎖定選初始側）> 較開側
+        # 想轉方向：commit（鎖定側，最高優先）> 較開側（主依據，對齊人工示範）> rollout 提示（墊底）
         if self._commit_side != 0:
             want_left = self._commit_side > 0
-        elif abs(hint_w) > 1e-3:
-            want_left = hint_w > 0.0
         elif lm is not None and rm is not None:
-            want_left = lm >= rm
+            want_left = lm >= rm       # ★哪邊空間多往哪轉（left_m/right_m 較開側）
+        elif abs(hint_w) > 1e-3:
+            want_left = hint_w > 0.0    # 左右淨空未知才退回 rollout 提示
         else:
-            return 0.0   # 無提示、無 commit、無左右資訊 → 不瞎轉，直退
+            return 0.0   # 無 commit、無左右資訊、無提示 → 不瞎轉，直退
         # 牆安全閘：想轉側近牆 → 改另一開側；另一側也窄 → 直退
         if want_left:
             if left_open:
@@ -610,9 +908,29 @@ class VOSafetyNode(Node):
             return -self.escape_turn_w
         return self.escape_turn_w if left_open else 0.0
 
+    def _lin_max_dv(self, target_v: float) -> float:
+        """本拍線速度可變化量上限：★正在「建立倒退速度」(往更負走且目標<0)時用溫柔 escape_reverse_accel
+        （對齊人工示範慢慢加速）；其餘（前進、從倒退收回 0）用底盤 accel_v。"""
+        if target_v < self._out_v and target_v < 0.0:
+            return self.escape_reverse_accel * self.vo.ctrl_dt
+        return self.vo.accel_v * self.vo.ctrl_dt
+
     def _publish_slew(self, target_v: float, target_w: float) -> None:
-        max_dv = self.vo.accel_v * self.vo.ctrl_dt
+        max_dv = self._lin_max_dv(target_v)
         max_dw = self.vo.accel_w * self.vo.ctrl_dt
+        self._out_v += _clamp(target_v - self._out_v, -max_dv, max_dv)
+        self._out_w += _clamp(target_w - self._out_w, -max_dw, max_dw)
+        self._emit(self._out_v, self._out_w)
+
+    def _publish_brake(self, target_v: float, target_w: float) -> None:
+        """安全煞專用：前進速度**瞬間歸零**（不走 accel slew 慢收，那會多前衝 ~0.04–0.1m→撞）。
+        反向（倒車避讓）用溫柔 escape_reverse_accel 慢慢建立（對齊人工示範，非猛倒）；轉向照常 slew。
+        """
+        max_dv = self._lin_max_dv(target_v)
+        max_dw = self.vo.accel_w * self.vo.ctrl_dt
+        if self._out_v > 0.0:
+            self._out_v = 0.0                     # 立即殺前進（不創造前衝空間）
+        # 反向目標（倒車）從 0 溫柔往負建立；停車目標=0 則維持 0
         self._out_v += _clamp(target_v - self._out_v, -max_dv, max_dv)
         self._out_w += _clamp(target_w - self._out_w, -max_dw, max_dw)
         self._emit(self._out_v, self._out_w)
@@ -660,8 +978,9 @@ class VOSafetyNode(Node):
             "back_m": (None if self._back_m is None else round(self._back_m, 2)),
             # 前方安全煞（只預設版）+ 靜止人源（只滿血版）
             "front_m": (None if self._front_m is None else round(self._front_m, 2)),
-            "front_brake": self._front_brake,   # ""/"slow"/"stop"
+            "front_brake": self._front_brake,   # ""/"slow"/"stop"/"reverse"/"freeze"
             "n_human": len(self._human_obs),    # 本拍補的靜止人源障礙數
+            "strict_front": bool(self._strict_front),  # 嚴格前方模式（TUI 'f' 切換）
         }
         if res is not None:
             d.update({

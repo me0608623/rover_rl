@@ -47,7 +47,7 @@ from launch.actions import (
 )
 from launch.conditions import IfCondition   # 依 bool 參數決定節點是否啟動
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration
+from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
 
 
@@ -64,6 +64,7 @@ def generate_launch_description():
                                        "lidar_preprocessor_params.yaml")
     # diag_logger 設定真值（auto_rearm / goal_change_eps_m / wandb 等都在這）
     diag_params_file = os.path.join(rl_pkg, "config", "diag_logger_params.yaml")
+    recovery_params_file = os.path.join(rl_pkg, "config", "recovery_supervisor_params.yaml")
 
     # ── args ──
     # 全部宣告為 LaunchConfiguration（延遲取值），實際預設值在 return 區的
@@ -333,19 +334,22 @@ def generate_launch_description():
     # 用 OpaqueFunction 在啟動時讀取參數真值：
     #   - model_path 為空時不覆寫（保留 yaml 預設，避免空字串蓋掉）
     #   - initial_mode 一律覆寫（首次部署建議 idle，確認後再切 nav）
-    #   - enable_vo=true 時把 policy 輸出改道到 /rover_rl/cmd_vel_desired，
-    #     讓 VO 安全層接手後才送進 mux（policy 自己不直接發 /input/nav_cmd_vel）
+    #   - enable_vo/enable_orca/enable_recovery=true 時把 policy 輸出改道到
+    #     /rover_rl/cmd_vel_desired，讓外層 wrapper 接手後才送進 mux
+    #     （policy 自己不直接發 /input/nav_cmd_vel）
     def make_policy_node(context, *args, **kwargs):
         mp = LaunchConfiguration("model_path").perform(context)
         mode = LaunchConfiguration("initial_mode").perform(context)
         lv = LaunchConfiguration("log_level").perform(context)
         vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
+        orca_on = LaunchConfiguration("enable_orca").perform(context).lower() == "true"
+        recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
         extra = {}
         if mp:
             extra["model_path"] = mp     # 非空才覆寫
         extra["initial_mode"] = mode
-        if vo_on:
-            extra["topic_cmd_vel"] = "/rover_rl/cmd_vel_desired"   # 改道給 VO
+        if vo_on or orca_on or recovery_on:
+            extra["topic_cmd_vel"] = "/rover_rl/cmd_vel_desired"   # 改道給外層 wrapper
         return [Node(
             package="rover_rl_inference",
             executable="policy_node",
@@ -434,19 +438,112 @@ def generate_launch_description():
     )
 
     # ── Part 11: VO 安全層（夾在 RL policy 與底盤 mux 之間）──
-    # policy → /rover_rl/cmd_vel_desired → [vo_safety] → /input/nav_cmd_vel → mux
+    # 一般模式:
+    #   policy → /rover_rl/cmd_vel_desired → [vo_safety] → /input/nav_cmd_vel → mux
+    # Recovery 模式:
+    #   policy → /rover_rl/cmd_vel_desired → [vo_safety] → /rover_rl/cmd_vel_recovery_in
+    #          → [recovery_supervisor] → /input/nav_cmd_vel → mux
     # 吃 vo_interface/tracked_obstacles（KF 平滑速度）做動態障礙預測式避障/煞停濾波。
     # ⚠️ enable_vo 預設跟隨 enable_lvdot；首次仍請先架空 + 單獨驗證行為。
-    vo_params = os.path.join(rl_pkg, "config", "vo_params.yaml")
-    vo_safety_node = Node(
-        package="rover_rl_inference",
-        executable="vo_safety",
-        name="vo_safety_node",
+    # VO 參數檔可用 vo_params_file:= 覆寫（預設 vo_params.yaml；滿血版帶 vo_params_full.yaml）。
+    # 兩份完全獨立、同一個 vo_safety_node，換 yaml 就換行為，不互相干擾。
+    def make_vo_safety_node(context, *args, **kwargs):
+        vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
+        if not vo_on:
+            return []
+        recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
+        lv = LaunchConfiguration("log_level").perform(context)
+        extra = {}
+        if recovery_on:
+            # Keep VO's ordinary dynamic-obstacle filtering, but replace VO's own
+            # backing-up escape with recovery_supervisor downstream.
+            extra.update({
+                "topic_cmd_out": "/rover_rl/cmd_vel_recovery_in",
+                "stuck_escape_enable": False,
+                "front_brake_reverse": False,
+                "front_hardstop_dwell_s": 999.0,
+            })
+        params = [LaunchConfiguration("vo_params_file")]
+        if extra:
+            params.append(extra)
+        return [Node(
+            package="rover_rl_inference",
+            executable="vo_safety",
+            name="vo_safety_node",
+            output="screen",
+            emulate_tty=True,
+            parameters=params,
+            arguments=["--ros-args", "--log-level", lv],
+        )]
+    vo_safety_node = OpaqueFunction(function=make_vo_safety_node)
+
+    # ── Part 11b: ORCA 安全層（獨立於 VO，enable_orca 控制）──
+    # policy → /rover_rl/cmd_vel_desired → [orca_safety] → /input/nav_cmd_vel → mux
+    # 吃 vo_interface/tracked_obstacles 跑 RVO2 non-cooperative 避讓 + lateral_evasion。
+    # 與 vo_safety_node 互斥（deploy_select 保證 enable_vo 與 enable_orca 不同時 true）。
+    # Recovery 啟用時也停用 ORCA，避免多個 wrapper 同時發布 /input/nav_cmd_vel。
+    # 安全網：看門狗 + front_brake（吃 policy status front_m）+ slew 限速。無 escape/commit。
+    orca_safety_node = Node(
+        package="orca_filter",
+        executable="orca_safety",
+        name="orca_safety_node",
         output="screen",
         emulate_tty=True,
-        parameters=[vo_params],
+        parameters=[LaunchConfiguration("orca_params_file")],
         arguments=["--ros-args", "--log-level", log_level],
-        condition=IfCondition(LaunchConfiguration("enable_vo")),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration("enable_orca"), "' == 'true' and '",
+            LaunchConfiguration("enable_recovery"), "' != 'true'"
+        ])),
+    )
+
+    # ── Part 11c: Recovery Supervisor（獨立 cmd_vel wrapper）──
+    # 無 VO:
+    #   policy → /rover_rl/cmd_vel_desired → [recovery_supervisor] → /input/nav_cmd_vel → mux
+    # 有 VO:
+    #   policy → VO → /rover_rl/cmd_vel_recovery_in → [recovery_supervisor] → /input/nav_cmd_vel
+    def make_recovery_supervisor_node(context, *args, **kwargs):
+        recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
+        if not recovery_on:
+            return []
+        vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
+        lv = LaunchConfiguration("log_level").perform(context)
+        extra = {
+            "topic_cmd_in": (
+                "/rover_rl/cmd_vel_recovery_in"
+                if vo_on else "/rover_rl/cmd_vel_desired"
+            )
+        }
+        return [Node(
+            package="rover_rl_inference",
+            executable="recovery_supervisor",
+            name="recovery_supervisor_node",
+            output="screen",
+            emulate_tty=True,
+            parameters=[LaunchConfiguration("recovery_params_file"), extra],
+            arguments=["--ros-args", "--log-level", lv],
+        )]
+    recovery_supervisor_node = OpaqueFunction(function=make_recovery_supervisor_node)
+
+    # ── Part 12: 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）──
+    # 把車手動開到 A/B 任一點停穩 → 自動規劃往對向點，A↔B 無限來回，供反覆測避障。
+    # 與 RL 推論/避障完全解耦：只訂閱 policy status、呼叫 routing、必要時切 mode=nav。
+    pingpong_test_node = Node(
+        package="rover_rl_inference",
+        executable="pingpong_test",
+        name="pingpong_test",
+        output="screen",
+        emulate_tty=True,
+        parameters=[{
+            "point_a": LaunchConfiguration("pingpong_a"),
+            "point_b": LaunchConfiguration("pingpong_b"),
+            "building": "itc",
+            "floor": "3",
+            "auto_set_nav": LaunchConfiguration("pingpong_auto_nav"),
+            "auto_continue": LaunchConfiguration("pingpong_auto_continue"),
+        }],
+        arguments=["--ros-args", "--log-level", log_level],
+        condition=IfCondition(LaunchConfiguration("enable_pingpong")),
     )
 
     # ── Banner ──
@@ -511,6 +608,38 @@ def generate_launch_description():
                                           "vo_interface/tracked_obstacles，需 lv-dot 在跑）；開啟同時會把 "
                                           "policy 輸出改道到 /rover_rl/cmd_vel_desired。"
                                           "首次驗證可顯式 enable_vo:=false 關閉"),
+        DeclareLaunchArgument("vo_params_file",
+                              default_value=os.path.join(rl_pkg, "config", "vo_params.yaml"),
+                              description="VO 安全層參數檔。預設 vo_params.yaml；"
+                                          "滿血版帶 vo_params_full.yaml（engage_range=4m + 積極繞行，"
+                                          "與預設完全獨立）。deploy_rl_shell 選 VO=Y 後可互動選滿血版"),
+        DeclareLaunchArgument("enable_orca", default_value="false",
+                              description="ORCA 安全層（RL→ORCA→mux，RVO2 non-cooperative 避讓）。"
+                                          "啟用時 policy 輸出改道到 /rover_rl/cmd_vel_desired → "
+                                          "orca_safety_node → /input/nav_cmd_vel。與 enable_vo 互斥。"),
+        DeclareLaunchArgument("orca_params_file",
+                              default_value=os.path.join(
+                                  get_package_share_directory("orca_filter"), "config", "orca_params.yaml"),
+                              description="ORCA 安全層參數檔（orca_filter/config/orca_params.yaml）。"),
+        DeclareLaunchArgument("enable_recovery", default_value="false",
+                              description="Recovery Supervisor 脫困 wrapper。啟用時 policy 輸出改道到 "
+                                          "/rover_rl/cmd_vel_desired；若 enable_vo=true，流程為 "
+                                          "RL→VO→recovery_supervisor→/input/nav_cmd_vel，"
+                                          "並關閉 VO 內建倒退逃脫，讓 Recovery 專管倒退/脫困。"),
+        DeclareLaunchArgument("recovery_params_file",
+                              default_value=recovery_params_file,
+                              description="Recovery Supervisor 參數檔。"),
+        DeclareLaunchArgument("enable_pingpong", default_value="false",
+                              description="兩固定點往返避障測試：車停在 A/B 任一點即自動往對向點來回"),
+        DeclareLaunchArgument("pingpong_a", default_value="c24",
+                              description="往返測試 A 點（routing 拓撲節點名）"),
+        DeclareLaunchArgument("pingpong_b", default_value="c27",
+                              description="往返測試 B 點（routing 拓撲節點名）"),
+        DeclareLaunchArgument("pingpong_auto_nav", default_value="true",
+                              description="往返測試啟動時自動切 mode=nav 讓 RL 接手"),
+        DeclareLaunchArgument("pingpong_auto_continue", default_value="false",
+                              description="往返測試全自動模式：就緒後不必按空白鍵、停穩自動出發下一段"
+                                          "（執行中可用 TUI 'a' 鍵熱切換）"),
         DeclareLaunchArgument("map_file",
                               default_value="/home/aa/maps/4v3F.yaml"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -552,4 +681,9 @@ def generate_launch_description():
 
         # VO 安全層（預設關，enable_vo:=true 開啟）
         vo_safety_node,
+        orca_safety_node,
+        recovery_supervisor_node,
+
+        # 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）
+        pingpong_test_node,
     ])

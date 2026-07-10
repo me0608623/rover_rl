@@ -1,0 +1,71 @@
+# sa6_v3h_nonoise_nodr_ck270000 — 部署資訊卡
+# 來源 checkpoint: logs/rnn_car/sa6_v3h_nonoise_nodr_ne1024_s42/checkpoint_270000.pt
+# 產生時間: 2026-07-09 (machine B / 5070)。★SA6 手動中止的 best 存檔點 (iter ~900)。
+# ★所有數值皆從 checkpoint(權重+args) 與訓練端 config 抄，非憑印象。
+
+model:
+  ckpt_file: checkpoint_270000.pt
+  ckpt_format: training_state_dict          # ★非 TorchScript；要 .ts 需在有 export_policy.py 的機器 bake
+  encoder: extractor_rnn                     # 3-branch: Conv1d(LiDAR) + ObsMLP + StateMLP -> 96D
+  rnn_type: GRU
+  hidden_dim: 64
+  preprocess_dim: 12
+  feat_norm: true
+  lidar_frame_stack: 1                        # 單幀，無 history stacking
+
+observation:
+  dim: 79
+  layout: "[0]=applied_accel [1]=speed [2]=omega [3]=body_radius(const 0.35) [4:6]=goal_dxdy(body-frame) [6:78]=lidar_72 [78]=time"
+  lidar_bins: 72
+  lidar_r_min: 0.25                           # VLP-16 實測盲區 (v3, 2026-06-08)：< r_min 的命中 -> r_max
+  lidar_r_max: 20.0
+  lidar_r_robot: 0.35                          # ROBOT_BODY_RADIUS
+  lidar_z_filter: 0.5                          # 濾地板/天花板/z=-10 鬼影
+  lidar_normalize: "clamp(d - r_robot, min=0) / r_max, then clip(0,1)"
+  obs_normalizer: baked_in_checkpoint         # running mean/var, dim 79 — deploy 必 bake
+  feat_normalizer: baked_in_checkpoint        # running mean/var, dim 96 — deploy 必 bake
+
+policy_head:
+  rl_input_dim: 91                            # encoder 輸出餵給 policy head
+  output: 38                                  # MultiDiscrete([19,19]) = linear_accel(19) x angular_vel(19)
+  action_decode: "idx in [0,18], center=9, ratio=(idx-9)/9; accel=ratio*a_max; omega=ratio*omega_max"
+  deterministic: argmax_per_head              # 部署用 argmax（各 head 獨立）
+
+physical_limits:                              # ★車端 act_max_* 必須完全一致，勿 extrapolate
+  v_max: 1.0
+  v_reverse_max: -0.2                          # reverse_velocity_scale=0.2（前進偏好）
+  a_max: 0.5
+  omega_max: 1.2                              # rad/s（2026-06-02: 2.0->1.2 對齊馬達 profile_omega_max；★車端勿設 0.785）
+  omega_accel_max: 3.0
+  dt: 0.2                                      # decimation=20, sim.dt=0.01
+
+training_scene:
+  task: Isaac-Navigation-Charge-VLP16-Curriculum-WD
+  curriculum: warp_drive_single_agent_v3h
+  stage: 6                                     # SA6_dense_avoid（9 障礙 slots + near_miss 0.20 高速擦身，無 head_on）
+  obstacle_speed: 0.90
+  gamma: 0.996
+  ent_linear: 0.008
+  ent_angular: 0.015
+  lidar_noise: none                           # ★clean baseline：無合成雜訊
+  domain_rand: none                           # ★clean baseline：無 DR（physics/actuator/wind/push 全中性化）
+  obs_delay: [0, 0]
+  seed: 42
+  num_envs: 1024
+  resumed_from: logs/rnn_car/sa5_v3h_nonoise_nodr_ne1024_s42_resume2/checkpoint_90000.pt
+
+checkpoint_state:
+  iteration: 899                              # ★SA6 手動中止 (iter ~993/1400) 的 best 存檔點 (iter 900)
+  total_steps: 270000
+  train_SR_at_ckpt: "~0.89"                   # 匯出當下 WandB SR 平台 (run nftufbyv)
+  wandb_run: nftufbyv
+  note: "SA6 於 iter ~993/1400 手動中止（非完訓）；此為最新已存 checkpoint（iter 900→993 未存檔）"
+
+deployment_notes:
+  pipeline: "raw_obs(79) -> obs_normalizer(baked) -> extractor(96) -> feat_normalizer(baked) -> fc_front(64) -> GRU(64) -> fc_middle(48) -> policy_head(91->38)"
+  corresponds_to: "沿 v3f 車端管線（79D obs, act_hist OFF, r_min 0.25）；車端啟動用 *_v3f.yaml 家族"
+  warnings:
+    - "★clean baseline（無雜訊/無 DR）= sim2real 對照臂，非 treatment；用來量 sim->real gap，勿當雜訊 treatment。"
+    - "★obs_normalizer + feat_normalizer 必須 bake 進部署模型，否則維度/尺度不符 -> 車原地爆走。"
+    - "★這顆是 SA6 中止 (iter ~993/1400) 的 best 存檔點 (iter 900)，非完訓；訓練環境含 goal-resample WARN 場景。"
+    - "★.pt 是訓練格式 state_dict；要車端可直接載入的 TorchScript，需在有 scripts/export_policy.py 的機器（machine A 或車端 rover_rl）跑 bake。"

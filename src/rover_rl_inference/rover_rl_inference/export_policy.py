@@ -34,8 +34,16 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-MODELS_PATH = REPO_ROOT / "scripts/reinforcement_learning/skrl/models/modular_rnn_models.py"
+# 載入訓練端網路定義的順序：① 車端本地副本（rover_rl_inference/training_models/）
+# → ② PC 端 IsaacLab 訓練 repo（scripts/reinforcement_learning/...）。
+# 車端無 IsaacLab，故把 modular_rnn_models.py（純 torch）同步一份到 training_models/；
+# PC 端無該副本時 fallback 原 IsaacLab 路徑，行為不變。
+_LOCAL_MODELS = Path(__file__).resolve().parent / "training_models" / "modular_rnn_models.py"
+if _LOCAL_MODELS.exists():
+    MODELS_PATH = _LOCAL_MODELS
+else:
+    REPO_ROOT = Path(__file__).resolve().parents[4]
+    MODELS_PATH = REPO_ROOT / "scripts/reinforcement_learning/skrl/models/modular_rnn_models.py"
 
 
 def _load_training_models():
@@ -78,6 +86,28 @@ class PreprocessNormalizer(nn.Module):
             -self.clip, self.clip,
         )
         return normed.index_select(-1, self.policy_idx)
+
+
+class FeatNormalizer(nn.Module):
+    """Extractor 輸出 feat (96D) 的 running mean/var 正規化。
+
+    v3h（feat_norm=true）訓練時 extractor → feat_normalizer → rnn；feat_normalizer 的
+    mean/var 必須 bake 進 .ts，否則 feat 尺度錯 → 車原地爆走。
+    舊架構（feat_norm=false，如 v3f/tcadapt）checkpoint 無此 normalizer → 用 identity
+    （mean=0/std=1），行為與舊 Bundle（無此步驟）完全一致，向後相容。
+    """
+
+    def __init__(self, mean: torch.Tensor, var: torch.Tensor, clip: float = 5.0):
+        super().__init__()
+        self.register_buffer("feat_mean", mean.clone())
+        self.register_buffer("feat_std", var.clone().sqrt())
+        self.clip = float(clip)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(
+            (feat - self.feat_mean) / (self.feat_std + 1e-8),
+            -self.clip, self.clip,
+        )
 
 
 class RNNStep(nn.Module):
@@ -125,11 +155,12 @@ class Bundle(nn.Module):
     torch.jit.script 對純 Python int 屬性的型別推斷常出錯，存成 buffer 可安全保留。
     """
 
-    def __init__(self, preprocess, extractor, rnn, policy, raw_obs_dim,
+    def __init__(self, preprocess, extractor, feat_normalizer, rnn, policy, raw_obs_dim,
                  used_obs_dim, hidden_dim, preprocess_dim, total_logits):
         super().__init__()
         self.preprocess = preprocess
         self.extractor = extractor
+        self.feat_normalizer = feat_normalizer
         self.rnn = rnn
         self.policy = policy
         self.register_buffer("_meta_dims",
@@ -140,6 +171,7 @@ class Bundle(nn.Module):
     def forward(self, obs_raw: torch.Tensor, hidden: torch.Tensor):
         obs79 = self.preprocess(obs_raw)
         feat = self.extractor(obs79)
+        feat = self.feat_normalizer(feat)   # v3h: extractor → feat_normalizer → rnn（舊模型 identity）
         pp, new_hidden = self.rnn(feat, hidden)
         rl_in = torch.cat([obs79, pp], dim=-1)
         logits = self.policy(rl_in)
@@ -354,6 +386,25 @@ def export(args):
     rnn_step = RNNStep(rnn.eval()).eval()
     pol = PolicyOnly(policy_head.eval()).eval()
 
+    # feat_normalizer：v3h（feat_norm=true）有獨立 running mean/var (96D)；
+    # 舊架構（feat_norm=false，v3f/tcadapt 等）checkpoint 無此 key → identity（不改 feat），
+    # 行為與舊 Bundle（無此步驟）一致，向後相容。
+    feat_dim = extractor.output_dim   # 96
+    feat_norm_dict = ckpt.get("feat_normalizer")
+    if feat_norm_dict and "mean" in feat_norm_dict:
+        feat_mean = feat_norm_dict["mean"].float().cpu()
+        feat_var = feat_norm_dict["var"].float().cpu()
+        if feat_mean.numel() != feat_dim:
+            raise ValueError(
+                f"feat_normalizer dim {feat_mean.numel()} != extractor.output {feat_dim}"
+            )
+        print(f"[CFG] feat_normalizer: baked (dim={feat_mean.numel()})")
+    else:
+        print("[CFG] feat_normalizer: absent → identity (feat_norm=false)")
+        feat_mean = torch.zeros(feat_dim)
+        feat_var = torch.ones(feat_dim)
+    feat_norm = FeatNormalizer(feat_mean, feat_var).eval()
+
     # 各子模組先用 jit.trace（餵 dummy 輸入記錄計算圖），整體 Bundle 再用 jit.script。
     # 採 trace+script 混合：子模組無控制流，trace 足夠且穩；外層 Bundle 用 script
     # 保留 meta buffer 與明確的多輸出 forward 介面
@@ -362,6 +413,7 @@ def export(args):
     with torch.no_grad():
         traced_pre = torch.jit.trace(pre, sample_raw)
         traced_ext = torch.jit.trace(ext, torch.zeros(1, cfg["used_obs_dim"]))
+        traced_feat = torch.jit.trace(feat_norm, torch.zeros(1, feat_dim))
         traced_rnn = torch.jit.trace(rnn_step,
                                       (torch.zeros(1, extractor.output_dim), sample_hidden))
         traced_pol = torch.jit.trace(pol, torch.zeros(1, head_input_dim))
@@ -369,6 +421,7 @@ def export(args):
     bundle = Bundle(
         preprocess=traced_pre,
         extractor=traced_ext,
+        feat_normalizer=traced_feat,
         rnn=traced_rnn,
         policy=traced_pol,
         raw_obs_dim=cfg["raw_obs_dim"],
@@ -388,6 +441,7 @@ def export(args):
     with torch.no_grad():
         o79 = reloaded.preprocess(sample_raw)
         f = reloaded.extractor(o79)
+        f = reloaded.feat_normalizer(f)
         p, h = reloaded.rnn(f, sample_hidden)
         rl_in = torch.cat([o79, p], dim=-1)
         logits = reloaded.policy(rl_in)

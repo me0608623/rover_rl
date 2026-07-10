@@ -41,10 +41,16 @@ setup(
             "diag_logger = rover_rl_inference.diag_logger_node:main",
             # 離線分析 diag_logger 產生的 CSV（速度三層對比、延遲、晃動報告）
             "analyze_diag = rover_rl_inference.analyze_diag:main",
+            # 彙整往返測試 session 指標 → SR/TO/CR 論文對比表（CSV/Markdown/LaTeX/wandb）
+            "pingpong_report = rover_rl_inference.pingpong_report:main",
             # 繁中 curses 即時狀態儀表板（純訂閱純渲染，需真實 TTY）
             "status_tui = rover_rl_inference.status_tui_node:main",
             # VO 安全層：夾在 RL 與底盤間，用 LV-DOT 動態障礙做預測式避障濾波
             "vo_safety = rover_rl_inference.vo_safety_node:main",
+            # Recovery Supervisor：RL 外層脫困 wrapper，保守接管 cmd_vel 後再交還 RL
+            "recovery_supervisor = rover_rl_inference.recovery_supervisor_node:main",
+            # 兩固定點往返避障測試：車停在 A/B 任一點即自動規劃往對向點，無限來回
+            "pingpong_test = rover_rl_inference.pingpong_test_node:main",
         ],
     },
 )

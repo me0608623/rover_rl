@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>orca_filter</name>
+  <version>0.1.0</version>
+  <description>
+    ORCA (RVO2) 安全過濾器 — 車端部署版。從 IsaacLab play_eval/rvo2_safety_filter.py
+    抽取純核心(無 Isaac 依賴),non-cooperative 設計(ego_responsibility=1.0 + obs_inflation=1.8,
+    行人不會避讓機器人 → 機器人扛 100% 避讓 + 障礙半徑 ×1.8 提早反應)。
+    bystander_node 為旁觀測試:訂 LV-DOT /vo_interface/tracked_obstacles + /odom,
+    跑 ORCA,印建議速度 + RViz 可視化,不發 cmd_vel、不控制車。
+  </description>
+  <maintainer email="gpt0608626@gmail.com">aa</maintainer>
+  <license>MIT</license>
+
+  <!-- vo_interface 提供 TrackedObstacleArray msg,須先 build -->
+  <depend>vo_interface</depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>visualization_msgs</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <!-- pyrvo2 非 apt 套件,需 pip 使用者模式安裝(已裝於 ~/.local);見 README -->
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

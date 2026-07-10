@@ -1,0 +1,225 @@
+recovery_supervisor_node:
+  ros__parameters:
+    # =========================
+    # Topic / 資料流設定
+    # =========================
+    # Recovery Supervisor 是 cmd_vel wrapper：
+    #   無 VO 時：policy_node -> /rover_rl/cmd_vel_desired -> recovery -> /input/nav_cmd_vel
+    #   有 VO 時：policy_node -> VO -> /rover_rl/cmd_vel_recovery_in -> recovery -> /input/nav_cmd_vel
+    # 一般不要在這裡手動改 topic；launch 會在 enable_vo=true 時覆寫 topic_cmd_in。
+
+    # 輸入速度命令 topic。預設接 RL policy 的期望速度；VO 模式下 launch 會覆寫成
+    # /rover_rl/cmd_vel_recovery_in。若改錯，Recovery 會收不到 cmd，車會停住。
+    topic_cmd_in: "/rover_rl/cmd_vel_desired"
+
+    # 輸出速度命令 topic。真車部署通常要送 /input/nav_cmd_vel 給 mux/底盤。
+    # 若只是離線測試，可改到 debug topic，避免真的控制車。
+    topic_cmd_out: "/input/nav_cmd_vel"
+
+    # 里程計 topic，用來估計倒退距離與 temporary local goal 誤差。
+    # 如果 odom 掉線超過 timeout_odom_s，Recovery 會輸出 0 當 fail-safe。
+    topic_odom: "/odom"
+
+    # policy_node 發布的 JSON 狀態，Recovery 從這裡讀 front_m/back_m/left_m/right_m/
+    # goal_dist/front_block_ratio。若此 topic 沒資料，Recovery 不會觸發倒退。
+    topic_policy_status: "/rover_rl_policy/status"
+
+    # =========================
+    # 迴圈頻率與 CSV 紀錄
+    # =========================
+    # 控制迴圈頻率 Hz。20Hz 對 cmd_vel wrapper 足夠；調太低反應慢，調太高通常沒有明顯好處。
+    ctrl_rate_hz: 20.0
+
+    # Recovery 自己的 ~/status 發布頻率 Hz。只影響監看，不影響控制。
+    status_rate_hz: 5.0
+
+    # 是否寫 CSV log。建議真車測試保持 true，方便分析為什麼觸發/為什麼停止。
+    csv_log_enable: true
+
+    # CSV 輸出資料夾。每次啟動會建立 recovery_ticks_*.csv 與 recovery_events_*.csv。
+    csv_log_dir: "/home/aa/rover_rl/logs/recovery"
+
+    # tick CSV 每幾列 flush 一次。數字越小越不怕斷電丟資料，但磁碟寫入較頻繁。
+    # 若要即時 tail 分析可設 1；一般測試 20 即可。
+    csv_flush_every_rows: 20
+
+    # =========================
+    # Watchdog / 資料逾時保護
+    # =========================
+    # cmd_vel 輸入超過此秒數沒更新就輸出 0。調小更保守但可能因短暫 jitter 停車；
+    # 調大可容忍延遲，但上游掛掉時停車較慢。
+    timeout_cmd_s: 0.5
+
+    # odom 超過此秒數沒更新就輸出 0。倒退距離依賴 odom，真車建議不要設太大。
+    timeout_odom_s: 0.3
+
+    # policy status 超過此秒數沒更新時不觸發 recovery。調太小可能因 status jitter 不觸發；
+    # 調太大可能用到舊 LiDAR 狀態。
+    timeout_status_s: 1.0
+
+    # =========================
+    # Recovery 觸發條件
+    # =========================
+    # 目前觸發邏輯：
+    #   前方 bins 被堵住：
+    #      front_m <= front_blocked_m
+    #      且 front_block_ratio >= front_block_ratio_thresh
+    #   以上條件連續持續 front_blocked_dwell_s 秒才觸發。
+    #   front_hard_blocked_m 目前設 0.0，等於停用「極近硬堵 + cmd 接近停止」旁路；
+    #   目的是讓倒退觸發只跟前方 LiDAR bins 是否真的堵住有關，方便現場判斷與調參。
+    #
+    # no_progress / rl_hesitating 目前只寫入 trigger_reason 與 CSV，方便分析；
+    # 不再直接觸發倒退，避免靜態障礙可繞時過早 recovery。
+
+    # 前方最近障礙距離門檻，單位 m。現在採較明確的近距離觸發：
+    # front_m <= 0.60 且 bins 填滿率達標，連續 2 秒才倒退。
+    # 若仍太容易觸發可降到 0.55；若人貼到前方仍不觸發，可升到 0.65。
+    front_blocked_m: 0.60
+
+    # 前方 LiDAR bins 填滿率門檻。1.0 表示前方扇區幾乎整片都是近物；
+    # 0.70 表示約 70% 前方 bins 被近物佔住才觸發。這比 0.9 容易抓到真人站在正前方，
+    # 但仍比單點 front_m 更不容易被柱子/單側障礙誤觸發。
+    # 若「可繞障礙」也觸發，調高到 0.75~0.85；若人正前方擋住卻不退，調低到 0.65。
+    front_block_ratio_thresh: 0.70
+
+    # 極近硬堵旁路距離，單位 m。現在設 0.0 表示停用此旁路，避免「速度條件」影響倒退判斷。
+    # 若之後想恢復極近安全底線，可設回 0.55~0.60；但那會讓 ratio 不達標時也可能觸發。
+    front_hard_blocked_m: 0.0
+
+    # 極近硬堵時，輸入線速度必須小於此值才開始計時。Recovery 在 VO 模式下接的是 VO 輸出，
+    # 所以這通常表示 VO/front_brake 已經停車。調大會更容易觸發；調小更保守。
+    front_hard_block_cmd_v_abs_mps: 0.08
+
+    # 極近硬堵時允許的輸入角速度，單位 rad/s。這裡故意放寬：前方 0.6m 內且線速度已停住時，
+    # 即使 VO/RL 還在小幅原地轉，也應開始累積倒退計時；否則會一直 stop/turn 很久才退。
+    # 若你想「只要還在轉就不倒退」，再降到 0.15~0.25。
+    front_hard_block_cmd_w_abs_radps: 0.70
+
+    # 前方堵住必須連續維持多久才觸發倒退，單位秒。越大越不容易誤觸發，
+    # 讓 RL/VO 有更多時間嘗試繞開；越小反應更快，但路過或短暫貼近更容易觸發。
+    # 你原本 VO 倒退邏輯約 2 秒，因此這裡設 2.0。
+    front_blocked_dwell_s: 2.0
+
+    # 判斷可以交還 RL 的前方清空距離，單位 m。越大代表退/繞到更開才放手；
+    # 越小會更早交還 RL。若 recovery 結束太早又立刻撞近，調大；若一直不交還，調小。
+    front_clear_m: 1.2
+
+    # 開始倒退前要求後方至少有多少距離，單位 m。越大越保守，後方不夠空就不倒退；
+    # 越小越容易倒退但較危險。若常常不敢倒退，可小降；若倒退接近後方物體，調大。
+    rear_clear_start_m: 0.8
+
+    # 倒退過程中後方低於此距離就停止倒退，單位 m。這是倒退安全底線。
+    # 目前 0.65 較保守；若後方空間小但仍需要退，可小降到 0.55，但風險較高。
+    rear_clear_stop_m: 0.65
+
+    # 選左右 gap 時，單側至少多遠才算有基本空間，單位 m。此值目前只輔助選側。
+    # 若走廊很窄，可降到 0.45~0.5；若希望只走更寬空間，可升到 0.7。
+    side_clear_min_m: 0.55
+
+    # =========================
+    # 分析用觸發輔助量
+    # =========================
+    # 以下目前不直接決定是否觸發 recovery，只用來記錄 no_progress / rl_hesitating，
+    # 幫你從 CSV 判斷 RL 是不是卡住或猶豫。
+
+    # 計算 goal distance 是否有進步的時間窗，單位秒。越大越平滑但反應慢；
+    # 越小越敏感但容易受 odom/goal 抖動影響。
+    no_progress_window_s: 2.5
+
+    # 在 no_progress_window_s 內，goal distance 至少要下降多少 m 才算有進步。
+    # 數字越大越容易被判定 no_progress；數字越小越寬鬆。
+    no_progress_min_delta_m: 0.15
+
+    # 判斷 RL 線速度接近 0 的門檻，單位 m/s。越大越容易認為 RL 在猶豫；
+    # 越小則只有幾乎完全不動才算 hesitating。
+    rl_hesitate_v_abs_mps: 0.05
+
+    # 判斷 RL 猶豫的時間窗，單位秒。越大越保守；越小越敏感。
+    rl_hesitate_window_s: 1.0
+
+    # 一次 recovery 結束後，至少隔多久才允許再次觸發，單位秒。
+    # 若 recovery 反覆連續觸發，調大到 3~5；若真的需要連續脫困，調小。
+    trigger_cooldown_s: 2.0
+
+    # =========================
+    # RECOVERY_STOP / BACKUP / 掃描旋轉
+    # =========================
+    # 進 recovery 後先停多久，單位秒。調大可讓底盤速度穩定歸零再倒退；
+    # 調太大會顯得反應慢。一般 0.2~0.5。
+    stop_duration_s: 0.3
+
+    # 倒退速度，單位 m/s。程式會強制取負值。絕對值越大退更快但風險更高；
+    # 若差點撞人或後方不穩，不要加快速度，優先調距離/觸發條件。
+    backup_v_mps: -0.2
+
+    # 倒退最長時間，單位秒。倒退會在「達到 backup_dist_m」或「達到此時間」
+    # 或「後方不安全」任一條件成立時停止。若退不夠就轉，通常要增加此值。
+    backup_time_s: 3.2
+
+    # 倒退目標距離，單位 m。越大會退得更開再轉；太大可能離路徑太遠或碰後方。
+    # 目前配合 -0.2m/s 與 3.2s，實際約可退到 0.6m。
+    backup_dist_m: 0.6
+
+    # 若後方不安全，不能倒退時的原地掃描角速度，單位 rad/s。
+    # 越大轉得快但較突兀；越小較穩但掃描慢。
+    rotate_scan_w_radps: 0.35
+
+    # 後方不安全時，原地小角度掃描多久，單位秒。越大掃描角度越多；
+    # 太大會原地轉太久。
+    rotate_scan_time_s: 0.8
+
+    # =========================
+    # Temporary Local Goal / 傳統控制器
+    # =========================
+    # local goal 會在選 gap 當下用 robot frame 產生：
+    #   左側較空：x=local_goal_x_m, y=+local_goal_y_m
+    #   右側較空：x=local_goal_x_m, y=-local_goal_y_m
+
+    # temporary local goal 的前向距離，單位 m。越大 recovery 會往前帶更遠；
+    # 太大可能靠近障礙。若 recovery 轉完還不夠脫困，可小增到 1.1。
+    local_goal_x_m: 0.9
+
+    # temporary local goal 的側向偏移，單位 m。越大越積極往側邊閃；
+    # 太大在窄走廊可能撞牆或偏離路線。若繞得不夠大可加到 1.25~1.4；走廊窄可降到 0.8。
+    local_goal_y_m: 1.25
+
+    # 到 local goal 多近算到達，單位 m。越大越早交還 RL；
+    # 越小要求更精準，但可能因控制誤差一直進不了完成條件。
+    local_goal_tolerance_m: 0.22
+
+    # 進入 RECOVERY_GO_LOCAL 後，至少走多久才允許因 front_clear_m 交還 RL。
+    # 這避免「倒退完前方剛好變乾淨，但側向還沒繞開」就太早回到 RL，導致又貼到障礙旁邊。
+    # 若仍太早交還，調到 1.5~2.0；若 recovery 太拖，降到 0.8。
+    local_go_min_time_s: 1.2
+
+    # recovery local controller 最大前進速度，單位 m/s。越大脫困快但風險高；
+    # 若接近人或牆，建議 0.2~0.3。
+    local_ctrl_v_max: 0.35
+
+    # recovery local controller 最大角速度，單位 rad/s。越大轉向更積極；
+    # 太大會甩頭或貼近障礙。若轉太猛，降到 0.4~0.5。
+    local_ctrl_w_max: 0.6
+
+    # local controller 的線速度比例增益。越大越快往 local goal 前進；
+    # 太大容易衝，太小會拖太久導致 recovery timeout。
+    local_ctrl_k_v: 0.5
+
+    # local controller 的角速度比例增益。越大越快朝 local goal 轉向；
+    # 太大會震盪，太小會轉不過去。
+    local_ctrl_k_w: 1.0
+
+    # =========================
+    # Recovery 全域安全限制
+    # =========================
+    # 單次 recovery 最長時間，單位秒。超過會中止並準備交還 RL/計失敗。
+    # 目前採 5.5s：stop 約 0.3s + backup 最多約 3.2s + go_local 至少約 1.2s，
+    # 留少量緩衝但避免 recovery 接管太久而動作不自然。
+    recovery_max_time_s: 5.5
+
+    # 連續 recovery 失敗幾次後進 STUCK 並輸出 0，避免無限倒退/亂轉。
+    # 若測試階段不想太容易停死，可調到 5；正式安全場景保留 3 較保守。
+    max_fail_count: 3
+
+    # Recovery 完成後，交還 RL 前先停多久，單位秒。可避免剛脫困時速度突變。
+    # 太大會有明顯頓挫；太小可能 RL 立刻接手造成晃動。
+    return_stop_s: 0.2
