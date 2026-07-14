@@ -4,7 +4,7 @@
   <name>vo_interface</name>
   <version>0.1.0</version>
   <description>
-    LV-DOT 動態障礙物 → Velocity Obstacle 介面節點。訂閱 onboard_detector 的 dynamic_bboxes，
+    LV-DOT 動態障礙物 → Velocity Obstacle 介面節點。訂閱 onboard_detector 的 dynamic_obstacles，
     自行做 constant-velocity Kalman 追蹤，輸出帶持久 ID / 平滑速度 / 協方差 / track age 的
     TrackedObstacleArray，供下游 VO 規劃器使用。不修改 LV-DOT（純訂閱）。
   </description>
@@ -17,6 +17,7 @@
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>visualization_msgs</depend>
+  <depend>onboard_detector</depend>
 
   <!-- python 節點執行期依賴 -->
   <exec_depend>rclpy</exec_depend>

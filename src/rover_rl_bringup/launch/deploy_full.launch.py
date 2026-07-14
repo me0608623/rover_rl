@@ -344,11 +344,12 @@ def generate_launch_description():
         vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
         orca_on = LaunchConfiguration("enable_orca").perform(context).lower() == "true"
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
+        mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
         extra = {}
         if mp:
             extra["model_path"] = mp     # 非空才覆寫
         extra["initial_mode"] = mode
-        if vo_on or orca_on or recovery_on:
+        if vo_on or orca_on or recovery_on or mppi_on:
             extra["topic_cmd_vel"] = "/rover_rl/cmd_vel_desired"   # 改道給外層 wrapper
         return [Node(
             package="rover_rl_inference",
@@ -428,7 +429,7 @@ def generate_launch_description():
         parameters=[lvdot_params],
         condition=IfCondition(LaunchConfiguration("enable_lvdot")),
     )
-    # YOLOv11 視覺輔助（需 ultralytics，預設關閉）
+    # YOLOv11 視覺輔助：預設跟隨 LV-DOT，一併啟停；仍可顯式 false 關閉。
     lvdot_yolo_node = Node(
         package="onboard_detector",
         executable="yolov11_detector_node.py",
@@ -436,6 +437,49 @@ def generate_launch_description():
         output="screen",
         condition=IfCondition(LaunchConfiguration("enable_lvdot_yolo")),
     )
+
+    # ── Part 10b: MPPI 靜態避障層（RL 導航 + MPPI 靜態 + VO 動態，三層協作）──
+    # policy → /rover_rl/cmd_vel_desired → [MPPI static_guard] → /rover_rl/cmd_vel_mppi → VO → …
+    # MPPI 吃 RL 意圖當 reference（導航），只用 /campusrover_local_costmap 做靜態避障，
+    # dynamic critic 關（yaml），啟動即 autostart。輸出下一站：VO 開→cmd_vel_mppi；
+    # 無 VO 有 recovery→cmd_vel_recovery_in；都無→直接 /input/nav_cmd_vel。
+    def make_mppi_static_guard_node(context, *args, **kwargs):
+        mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
+        if not mppi_on:
+            return []
+        vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
+        recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
+        lv = LaunchConfiguration("log_level").perform(context)
+        if vo_on:
+            out_topic = "/rover_rl/cmd_vel_mppi"
+        elif recovery_on:
+            out_topic = "/rover_rl/cmd_vel_recovery_in"
+        else:
+            out_topic = "/input/nav_cmd_vel"
+        cm_pkg = get_package_share_directory("campusrover_move")
+        mppi_cfg = LaunchConfiguration("mppi_params_file").perform(context)
+        if not mppi_cfg:
+            mppi_cfg = os.path.join(cm_pkg, "config", "mppi_static_guard.yaml")
+        costmap_topic = LaunchConfiguration("mppi_costmap_topic").perform(context)
+        return [Node(
+            package="campusrover_move",
+            executable="mppi_planner",
+            name="mppi_planner_node",
+            output="screen",
+            emulate_tty=True,
+            parameters=[mppi_cfg],
+            arguments=["--ros-args", "--log-level", lv],
+            remappings=[
+                ("reference_cmd", "/rover_rl/cmd_vel_desired"),
+                ("costmap", costmap_topic),
+                ("cmd_vel", out_topic),
+                ("odom", "/odom"),
+                ("global_path", "/rover_rl/_mppi_unused_path"),
+                ("elevator_path", "/rover_rl/_mppi_unused_elevator"),
+                ("dynamic_obstacles", "/rover_rl/_mppi_unused_dynobs"),
+            ],
+        )]
+    mppi_static_guard_node = OpaqueFunction(function=make_mppi_static_guard_node)
 
     # ── Part 11: VO 安全層（夾在 RL policy 與底盤 mux 之間）──
     # 一般模式:
@@ -452,8 +496,15 @@ def generate_launch_description():
         if not vo_on:
             return []
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
+        static_avoid_on = LaunchConfiguration("enable_static_avoid").perform(context).lower() == "true"
+        mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
         lv = LaunchConfiguration("log_level").perform(context)
         extra = {}
+        if static_avoid_on:
+            extra["static_avoid_enable"] = True
+        if mppi_on:
+            # 三層協作：RL→MPPI(靜態)→VO(動態)。VO 改吃 MPPI 靜態濾波後的輸出。
+            extra["topic_cmd_in"] = "/rover_rl/cmd_vel_mppi"
         if recovery_on:
             # Keep VO's ordinary dynamic-obstacle filtering, but replace VO's own
             # backing-up escape with recovery_supervisor downstream.
@@ -600,8 +651,9 @@ def generate_launch_description():
                               description="覆寫 yaml：新目標 vs 同終點重複發布的位移門檻(m)。空=走 yaml"),
         DeclareLaunchArgument("enable_lvdot", default_value="true",
                               description="LV-DOT 動態障礙物偵測（→ /onboard_detector/*）"),
-        DeclareLaunchArgument("enable_lvdot_yolo", default_value="false",
-                              description="LV-DOT YOLOv11 視覺輔助（需 ultralytics，預設關）"),
+        DeclareLaunchArgument("enable_lvdot_yolo",
+                              default_value=LaunchConfiguration("enable_lvdot"),
+                              description="LV-DOT YOLOv11 視覺輔助（需 ultralytics；預設跟隨 enable_lvdot）"),
         DeclareLaunchArgument("enable_vo", default_value=LaunchConfiguration("enable_lvdot"),
                               description="VO 安全層（RL→VO→mux，吃 vo_interface 動態障礙避障）。"
                                           "預設跟隨 enable_lvdot（有 LV-DOT 才開 VO，因 VO 障礙來自 "
@@ -613,6 +665,20 @@ def generate_launch_description():
                               description="VO 安全層參數檔。預設 vo_params.yaml；"
                                           "滿血版帶 vo_params_full.yaml（engage_range=4m + 積極繞行，"
                                           "與預設完全獨立）。deploy_rl_shell 選 VO=Y 後可互動選滿血版"),
+        DeclareLaunchArgument("enable_static_avoid", default_value="false",
+                              description="VO 內建靜態早期避障：吃 policy LiDAR front/left/right，"
+                                          "3m 內提早減速並往空側轉。需 enable_vo=true。"),
+        DeclareLaunchArgument("enable_mppi", default_value="false",
+                              description="MPPI 靜態避障層（RL 導航 + MPPI 靜態 + VO 動態）。"
+                                          "啟用時 policy 輸出改道 /rover_rl/cmd_vel_desired → "
+                                          "MPPI(static_guard) → /rover_rl/cmd_vel_mppi → VO → mux。"
+                                          "MPPI 吃 RL 意圖當 reference、只用 local costmap 避靜態、"
+                                          "dynamic critic 關（讓 VO 管動態）。需 campusrover_move 已 build。"),
+        DeclareLaunchArgument("mppi_params_file", default_value="",
+                              description="MPPI static_guard 參數檔。空=用 campusrover_move 內建 "
+                                          "config/mppi_static_guard.yaml"),
+        DeclareLaunchArgument("mppi_costmap_topic", default_value="/campusrover_local_costmap",
+                              description="MPPI 靜態避障吃的 local costmap topic（需 enable_costmap）"),
         DeclareLaunchArgument("enable_orca", default_value="false",
                               description="ORCA 安全層（RL→ORCA→mux，RVO2 non-cooperative 避讓）。"
                                           "啟用時 policy 輸出改道到 /rover_rl/cmd_vel_desired → "
@@ -678,6 +744,9 @@ def generate_launch_description():
         # LV-DOT 動態障礙物偵測
         lvdot_detector_node,
         lvdot_yolo_node,
+
+        # MPPI 靜態避障層（預設關，enable_mppi:=true 開啟；RL→MPPI→VO 三層協作）
+        mppi_static_guard_node,
 
         # VO 安全層（預設關，enable_vo:=true 開啟）
         vo_safety_node,

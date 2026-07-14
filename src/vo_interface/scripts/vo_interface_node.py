@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """vo_interface_node — LV-DOT 動態障礙物 → Velocity Obstacle 介面。
 
-純訂閱 onboard_detector 的 /dynamic_bboxes（MarkerArray，只含幾何），
+訂閱 onboard_detector 的正式 /dynamic_obstacles（帶量測時間、持久 ID 與幾何），
 自行做 constant-velocity Kalman 追蹤，輸出帶「持久 ID / 平滑絕對速度 / 協方差 /
 track age」的 TrackedObstacleArray，供下游 VO 規劃器使用。完全不修改 LV-DOT。
 
-為何不直接用 LV-DOT 的 box.Vx/Vy？
-  ① LV-DOT 原生 box.id 是每幀索引、非持久（VO 要 ID 做時間平滑）；
-  ② LiDAR-only 速度估計偏跳（本專案實測），VO 對速度跳動極敏感；
-  ③ 自做 CV-KF 可 coasting 補平 dynamic_bboxes 的斷續發布 → 給 VO 更連續的障礙物流。
+正式 API 已提供持久 ID；本節點仍從 timestamped 位置用 CV-KF 平滑速度，因為
+LiDAR-only 原生速度偏跳、VO 對速度跳動極敏感。短暫漏偵可 coasting，但整個來源
+中斷超過 source_timeout_s 時會立即清空，禁止永久外推鬼影。
 """
 import math
+import time
 
 import numpy as np
 import rclpy
@@ -19,6 +19,7 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from std_msgs.msg import Header
 from geometry_msgs.msg import Point, Vector3
 from visualization_msgs.msg import Marker, MarkerArray
+from onboard_detector.msg import DynamicObstacleArray
 
 from vo_interface.msg import TrackedObstacle, TrackedObstacleArray
 
@@ -32,9 +33,8 @@ class CVTrack:
 
     _next_id = 1
 
-    def __init__(self, px, py, size, t, sigma_a, sigma_z):
-        self.id = CVTrack._next_id
-        CVTrack._next_id += 1
+    def __init__(self, source_id, px, py, size, t, sigma_a, sigma_z):
+        self.id = int(source_id)
         self.x = np.array([px, py, 0.0, 0.0], dtype=float)
         # 初始：位置依量測噪音、速度大不確定（尚未觀測）
         self.P = np.diag([sigma_z ** 2, sigma_z ** 2, 4.0, 4.0])
@@ -95,7 +95,7 @@ class VOInterfaceNode(Node):
     def __init__(self):
         super().__init__("vo_interface")
 
-        self.declare_parameter("input_topic", "/onboard_detector/dynamic_bboxes")
+        self.declare_parameter("input_topic", "/onboard_detector/dynamic_obstacles")
         self.declare_parameter("output_topic", "/vo_interface/tracked_obstacles")
         self.declare_parameter("marker_topic", "/vo_interface/markers")
         self.declare_parameter("frame_id", "odom")          # fallback；優先用 marker 自帶 frame
@@ -103,6 +103,7 @@ class VOInterfaceNode(Node):
         self.declare_parameter("assoc_max_dist", 0.7)       # 配對最大距離 (m)
         self.declare_parameter("min_hits", 3)               # 連續命中幾次才算確認 track（才輸出）
         self.declare_parameter("max_misses", 10)            # 連續漏配幾次才刪除（coasting 上限）
+        self.declare_parameter("source_timeout_s", 0.5)     # 整個 detector topic 中斷時清空 track
         self.declare_parameter("process_noise_accel", 2.0)  # sigma_a (m/s^2)：人加減速的尺度
         self.declare_parameter("meas_noise_pos", 0.10)      # sigma_z (m)：偵測位置噪音
         self.declare_parameter("vel_confidence_time", 0.5)  # 達到滿可信度所需的 track age (s)
@@ -118,6 +119,7 @@ class VOInterfaceNode(Node):
         self.assoc_max_dist = float(g("assoc_max_dist").value)
         self.min_hits = int(g("min_hits").value)
         self.max_misses = int(g("max_misses").value)
+        self.source_timeout = float(g("source_timeout_s").value)
         self.sigma_a = float(g("process_noise_accel").value)
         self.sigma_z = float(g("meas_noise_pos").value)
         self.vel_conf_time = float(g("vel_confidence_time").value)
@@ -125,13 +127,14 @@ class VOInterfaceNode(Node):
         self.publish_markers = bool(g("publish_markers").value)
 
         self.tracks = []          # list[CVTrack]
-        self.latest_dets = None   # (frame_id, [(cx,cy,size3), ...]) 最近一筆量測
+        self.latest_dets = None   # [(source_id,cx,cy,size3), ...] 最近一筆量測
         self.det_frame_id = self.frame_id_fallback
+        self.last_source_rx = None
 
         sensor_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
                                 history=HistoryPolicy.KEEP_LAST)
-        self.sub = self.create_subscription(MarkerArray, self.input_topic,
-                                            self._markers_cb, sensor_qos)
+        self.sub = self.create_subscription(DynamicObstacleArray, self.input_topic,
+                                            self._obstacles_cb, sensor_qos)
         self.pub = self.create_publisher(TrackedObstacleArray, self.output_topic, 10)
         self.marker_pub = (self.create_publisher(MarkerArray, self.marker_topic, 10)
                            if self.publish_markers else None)
@@ -142,23 +145,20 @@ class VOInterfaceNode(Node):
             f"[vo_interface] 訂閱 {self.input_topic} → 發布 {self.output_topic} "
             f"@ {self.rate_hz:.0f}Hz；assoc<{self.assoc_max_dist}m, min_hits={self.min_hits}")
 
-    # ---- 量測：把 LINE_LIST 邊界框 marker 還原成 (中心, 尺寸) ----
-    def _markers_cb(self, msg: MarkerArray):
+    # ---- 正式 timestamped detector 量測 ----
+    def _obstacles_cb(self, msg: DynamicObstacleArray):
+        self.last_source_rx = time.monotonic()
+        if not msg.source_valid:
+            if self.tracks:
+                self.get_logger().warn("LV-DOT 回報 source_valid=false；立即清空所有 track")
+            self.tracks.clear()
+            self.latest_dets = []
+            return
         dets = []
-        frame = self.frame_id_fallback
-        for m in msg.markers:
-            if m.header.frame_id:
-                frame = m.header.frame_id
-            if not m.points:
-                continue
-            cx = m.pose.position.x
-            cy = m.pose.position.y
-            xs = [p.x for p in m.points]
-            ys = [p.y for p in m.points]
-            zs = [p.z for p in m.points]
-            size = (max(xs) - min(xs), max(ys) - min(ys), max(zs) - min(zs))
-            dets.append((cx, cy, size))
-        self.det_frame_id = frame
+        for ob in msg.obstacles:
+            size = (ob.size.x, ob.size.y, ob.size.z)
+            dets.append((int(ob.id), ob.position.x, ob.position.y, size))
+        self.det_frame_id = msg.header.frame_id or self.frame_id_fallback
         self.latest_dets = dets
 
     def _now(self):
@@ -167,6 +167,15 @@ class VOInterfaceNode(Node):
     # ---- 主迴圈：predict → 配對 latest_dets → update/coast → publish ----
     def _tick(self):
         t = self._now()
+        source_age = math.inf if self.last_source_rx is None else time.monotonic() - self.last_source_rx
+        if source_age > self.source_timeout:
+            if self.tracks:
+                self.get_logger().warn(
+                    f"LV-DOT source timeout > {self.source_timeout:.2f}s；清空 {len(self.tracks)} 個 track")
+            self.tracks.clear()
+            self.latest_dets = None
+            self._publish(t)
+            return
         for trk in self.tracks:
             trk.predict(t)
 
@@ -182,25 +191,17 @@ class VOInterfaceNode(Node):
         self._publish(t)
 
     def _associate_and_update(self, dets, t):
-        # greedy 最近鄰配對（障礙物數量少，夠用且穩定）
+        # 正式 detector API 已提供持久 ID；以 ID 做一對一配對，不再從 Marker 幾何猜 ID。
         unmatched_dets = set(range(len(dets)))
-        pairs = []  # (dist, trk_idx, det_idx)
+        det_by_id = {source_id: di for di, (source_id, _cx, _cy, _s) in enumerate(dets)}
+        used_trk = set()
         for ti, trk in enumerate(self.tracks):
-            tx, ty = trk.pos
-            for di, (cx, cy, _s) in enumerate(dets):
-                d = math.hypot(cx - tx, cy - ty)
-                if d <= self.assoc_max_dist:
-                    pairs.append((d, ti, di))
-        pairs.sort(key=lambda p: p[0])
-
-        used_trk, used_det = set(), set()
-        for d, ti, di in pairs:
-            if ti in used_trk or di in used_det:
+            di = det_by_id.get(trk.id)
+            if di is None:
                 continue
             used_trk.add(ti)
-            used_det.add(di)
             unmatched_dets.discard(di)
-            cx, cy, size = dets[di]
+            _source_id, cx, cy, size = dets[di]
             self.tracks[ti].update(cx, cy, size)
 
         # 未命中的既有 track → coasting（predict 已做，這裡只記 miss）
@@ -210,8 +211,8 @@ class VOInterfaceNode(Node):
 
         # 未配對到的偵測 → 新生 track
         for di in unmatched_dets:
-            cx, cy, size = dets[di]
-            self.tracks.append(CVTrack(cx, cy, size, t, self.sigma_a, self.sigma_z))
+            source_id, cx, cy, size = dets[di]
+            self.tracks.append(CVTrack(source_id, cx, cy, size, t, self.sigma_a, self.sigma_z))
 
     def _vel_confidence(self, trk, t):
         # 由 track age 與速度協方差跡共同決定（年輕或速度不確定 → 低）

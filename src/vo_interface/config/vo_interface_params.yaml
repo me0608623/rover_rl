@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    input_topic: /onboard_detector/dynamic_bboxes   # LV-DOT 動態框（只取幾何，速度自己重估）
+    input_topic: /onboard_detector/dynamic_obstacles # 正式 timestamped LV-DOT 障礙介面
     output_topic: /vo_interface/tracked_obstacles    # 給 VO 規劃器訂閱
     marker_topic: /vo_interface/markers              # RViz 視覺化（速度箭頭 + ID/age）
     frame_id: odom                                   # fallback；優先用 marker 自帶 frame（= LV-DOT vis_frame）
@@ -9,6 +9,7 @@
     assoc_max_dist: 0.7          # 配對最大距離 (m)。人一步約 0.5m，>此值視為不同物
     min_hits: 3                  # 連續命中幾次才確認 track 並輸出（濾掉一閃即逝的偽偵測）
     max_misses: 10               # 連續漏配幾次才刪 track（~0.5s coasting，補平 dynamic_bboxes 斷續）
+    source_timeout_s: 0.5        # detector topic 完全中斷時清空 track，禁止永久定速鬼影
     process_noise_accel: 2.0     # sigma_a (m/s^2)：人加減速尺度。調大→更跟得上變速但更跳
     meas_noise_pos: 0.10         # sigma_z (m)：偵測位置噪音。調大→更平滑但更鈍
     vel_confidence_time: 0.5     # track age 達此值 (s) 速度可信度才滿（VO 可用此 gate 年輕 track）

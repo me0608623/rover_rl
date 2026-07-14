@@ -29,6 +29,11 @@ namespace onboardDetector{
         this->A = A;
     }
 
+    void kalman_filter::setQ(const MatrixXd& Q)
+    {
+        this->Q = Q;
+    }
+
     void kalman_filter::estimate(const MatrixXd& z, const MatrixXd& u)
     {
         // predict
@@ -59,4 +64,11 @@ namespace onboardDetector{
         }
     }
 
+    double kalman_filter::covariance(int row, int col) const
+    {
+        if (!this->is_initialized || row < 0 || col < 0 || row >= this->P.rows() || col >= this->P.cols()) {
+            return 0.0;
+        }
+        return this->P(row, col);
+    }
 }

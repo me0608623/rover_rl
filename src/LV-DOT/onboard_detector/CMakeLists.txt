@@ -27,8 +27,10 @@ find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-# generate service interfaces
+# generate detector data interfaces
 rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/DynamicObstacle.msg"
+  "msg/DynamicObstacleArray.msg"
   "srv/GetDynamicObstacles.srv"
   DEPENDENCIES geometry_msgs std_msgs
 )

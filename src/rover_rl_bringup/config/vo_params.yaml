@@ -41,6 +41,15 @@
 vo_safety_node:
   ros__parameters:
 
+    # ── 靜止行人源：YOLO person × LV-DOT visual 3D 框 ──
+    # lv-dot 預設連帶啟動 YOLO；關聯成功後把站著的人當 v=0 障礙送進 VO。
+    # 任一資料逾時就不補障礙，未啟 lv-dot/YOLO 時只會安全退化，不影響 LiDAR 保護。
+    static_human_enable: true
+    static_human_assoc_tol_deg: 12.0
+    static_human_timeout_s: 0.5
+    static_human_radius_max: 0.45
+    static_human_dedup_m: 0.6
+
     # ========================================================================
     # A. 行為調校（最常動的旋鈕——先看這區）
     # ========================================================================
@@ -159,6 +168,25 @@ vo_safety_node:
     # 【調小】更貼近「RL 多慢 VO 多慢」，RL 縮手時容易原地轉卡住。
     # 【安全】輸出仍 ≤ max(v_des, 此值)；RL 正常驅動(v_des≥此值)時完全不生效 → 不會無故加速。
     # 【範圍】預設 0.45（繞行弧半徑 ≈0.45/1.2≈0.38m）；只在 RL 縮手+近障時生效。
+
+    # ── 靜態早期避障（部署端 deterministic bias；deploy_rl_shell 可互動開關）──
+    # 用 policy status 的 LiDAR front/left/right，不依賴 LV-DOT。front_m < range 時開始：
+    #   1. 正向速度隨距離降低
+    #   2. 預選較開側並鎖側，把同一側送進 VO 的 DWA 式 rollout 評分
+    #   3. 2~3m 仍強制給最低角速度，不再只減速直走；正中央對稱時固定選右避免 w≈0
+    # 目的：讓車在約 3m 就開始畫繞行弧，不等貼近後才停或左右翻轉。
+    static_avoid_enable: false
+    static_avoid_range_m: 3.0
+    static_avoid_stop_m: 0.8
+    static_avoid_turn_gain: 0.45
+    static_avoid_w_max: 0.6
+    static_avoid_w_min_far: 0.35
+    static_avoid_w_min_near: 0.55
+    static_avoid_v_min_scale: 0.25
+    static_avoid_side_deadband_m: 0.25
+    static_avoid_side_norm_m: 2.0
+    static_avoid_side_clear_m: 1.0
+    static_avoid_commit_hold_s: 1.0
 
     # ========================================================================
     # B. 安全幾何（撞半徑三件套——和 A 的 margin 一起決定「撞不撞」）
@@ -302,7 +330,7 @@ vo_safety_node:
     # ── 成本權重（只在「多條可行候選」裡挑一條時生效；不決定能不能走）──
     w_v: 1.0
     # 【做什麼】「貼合 RL 線速度意圖」的權重，當基準=1.0，其他權重相對它調。一般不動。
-    w_w: 0.4
+    w_w: 0.15
     # 【做什麼】「貼合 RL 角速度意圖」的權重——越大越不願意偏離 RL 的轉向(=越不愛自己轉=偏停)。
     # 【調大】更貼 RL 轉向、抽動少，但「靜止人在前」會不敢轉 → 退回慢爬卡死。
     # 【調小】更敢自己 committed 繞行靜止障礙。

@@ -51,7 +51,7 @@
     # DBSCAN Common
     ground_height: 0.2                 # 低於此高度(m)視為地面，濾除
     roof_height: 2.0                   # 高於此高度(m)視為天花板，濾除
-    lidar_min_range: 0.9               # lidar XY 距離 < 此值的點丟棄（VLP-16 盲區 + 車自身結構，
+    lidar_min_range: 0.5               # lidar XY 距離 < 此值的點丟棄（縮小近場盲區；需確認車身反射不誤報）
                                        # 之前車旁 0.7m 一直冒「動態框」就是自身點抖動）
 
     # DBSCAN visual param
@@ -103,6 +103,9 @@
                                        # 清空動態框+警告（否則 30Hz 重發過期框=假延遲）
     dynamic_consistency_threshold: 4   # was 6：放寬，間歇的人較易湊滿一致性窗。誤報需實測
                                        # 撐到 10 幀太難；6 幀(~0.3s)+ 80%容忍(5/6) 兼顧抑噪與可達成
+    yolo_ttl: 0.25                     # YOLO 結果超過此秒數不得再與 3D 框關聯
+    yolo_sync_tolerance: 0.15          # YOLO 影像與 LiDAR 量測時間差上限(s)
+    yolo_bbox_iou_threshold: 0.1       # 2D YOLO 框與 3D 投影框的最低 IOU，拒絕擦邊誤配
 
     # Constrain size
     target_constrain_size: true    # 2026-06-10 re-enable：目前目標=抓行人，only 人形尺寸可同時

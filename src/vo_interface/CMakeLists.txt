@@ -9,6 +9,7 @@ find_package(ament_cmake REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(onboard_detector REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 # 產生 VO 介面訊息
@@ -29,5 +30,5 @@ install(DIRECTORY launch config
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_export_dependencies(rosidl_default_runtime)
+ament_export_dependencies(rosidl_default_runtime onboard_detector)
 ament_package()

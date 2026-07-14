@@ -7,6 +7,46 @@
 #include <sstream>  // 動態障礙終端輸出用
 
 namespace onboardDetector{
+    // 方形 cost matrix 的 Hungarian 最小成本一對一指派；row -> column。
+    static std::vector<int> hungarianAssignment(const std::vector<std::vector<double>>& cost){
+        const int n = static_cast<int>(cost.size());
+        std::vector<double> u(n + 1), v(n + 1);
+        std::vector<int> p(n + 1), way(n + 1);
+        for (int i = 1; i <= n; ++i){
+            p[0] = i;
+            int j0 = 0;
+            std::vector<double> minv(n + 1, std::numeric_limits<double>::infinity());
+            std::vector<bool> used(n + 1, false);
+            do {
+                used[j0] = true;
+                const int i0 = p[j0];
+                double delta = std::numeric_limits<double>::infinity();
+                int j1 = 0;
+                for (int j = 1; j <= n; ++j){
+                    if (used[j]) continue;
+                    const double cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                    if (cur < minv[j]) { minv[j] = cur; way[j] = j0; }
+                    if (minv[j] < delta) { delta = minv[j]; j1 = j; }
+                }
+                for (int j = 0; j <= n; ++j){
+                    if (used[j]) { u[p[j]] += delta; v[j] -= delta; }
+                    else minv[j] -= delta;
+                }
+                j0 = j1;
+            } while (p[j0] != 0);
+            do {
+                const int j1 = way[j0];
+                p[j0] = p[j1];
+                j0 = j1;
+            } while (j0 != 0);
+        }
+        std::vector<int> rowToCol(n, -1);
+        for (int j = 1; j <= n; ++j){
+            if (p[j] > 0) rowToCol[p[j] - 1] = j - 1;
+        }
+        return rowToCol;
+    }
+
     dynamicDetector::dynamicDetector() : rclcpp::Node("dynamic_detector"){
         this->ns_ = "onboard_detector";
         this->hint_ = "[onboardDetector]";
@@ -273,6 +313,10 @@ namespace onboardDetector{
         this->dynamicConsistThresh_ = this->getParamHelper<int>("dynamic_consistency_threshold", 3);
         cout << this->hint_ << ": Threshold for dynamic consistency check is set to: " << this->dynamicConsistThresh_ << endl;
 
+        this->yoloTtl_ = this->getParamHelper<double>("yolo_ttl", 0.25);
+        this->yoloSyncTolerance_ = this->getParamHelper<double>("yolo_sync_tolerance", 0.15);
+        this->yoloBBoxIouThreshold_ = this->getParamHelper<double>("yolo_bbox_iou_threshold", 0.1);
+
         if (this->histSize_ < this->forceDynaCheckRange_+1){
             RCLCPP_ERROR(this->get_logger(), "history length is too short to perform force-dynamic");
         }
@@ -339,6 +383,8 @@ namespace onboardDetector{
 
         // dynamic bounding box pub
         this->dynamicBBoxesPub_ = this->create_publisher<MarkerArrayMsg>(this->ns_ + "/dynamic_bboxes", 10);
+        this->dynamicObstaclesPub_ = this->create_publisher<onboard_detector::msg::DynamicObstacleArray>(
+            this->ns_ + "/dynamic_obstacles", 10);
 
         // filtered depth pointcloud pub
         this->filteredDepthPointsPub_ = this->create_publisher<PointCloud2Msg>(this->ns_ + "/filtered_depth_cloud", 10);
@@ -402,9 +448,6 @@ namespace onboardDetector{
         // timers
         auto period = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::duration<double>(this->dt_));
         this->detectionTimer_ = this->create_wall_timer(period, std::bind(&dynamicDetector::detectionCB, this));
-        this->lidarDetectionTimer_ = this->create_wall_timer(period, std::bind(&dynamicDetector::lidarDetectionCB, this));
-        this->trackingTimer_ = this->create_wall_timer(period, std::bind(&dynamicDetector::trackingCB, this));
-        this->classificationTimer_ = this->create_wall_timer(period, std::bind(&dynamicDetector::classificationCB, this));
         this->visTimer_ = this->create_wall_timer(period, std::bind(&dynamicDetector::visCB, this));
 
 		// get dynamic obstacle service (lambda to disambiguate the overloaded name)
@@ -533,6 +576,22 @@ namespace onboardDetector{
 
     void dynamicDetector::lidarPoseCB(const PointCloud2Msg::ConstSharedPtr& cloudMsg, const PoseStampedMsg::ConstSharedPtr& pose){
         this->lastSyncTime_ = std::chrono::steady_clock::now();
+        this->previousDetectionStamp_ = this->detectionStamp_;
+        this->detectionStamp_ = rclcpp::Time(cloudMsg->header.stamp);
+        if (this->previousDetectionStamp_.nanoseconds() > 0){
+            this->currentDt_ = std::max(0.01, std::min(0.5, (this->detectionStamp_ - this->previousDetectionStamp_).seconds()));
+        }
+        ++this->lidarSequence_;
+
+        // 必須先用本次同步 pose 更新 LiDAR 外參，再轉換本次點雲。
+        Eigen::Matrix4d lidarPoseMatrix;
+        this->getLidarPose(pose, lidarPoseMatrix);
+        this->positionLidar_ = lidarPoseMatrix.block<3, 1>(0, 3);
+        this->orientationLidar_ = lidarPoseMatrix.block<3, 3>(0, 0);
+        this->position_ = Eigen::Vector3d(pose->pose.position.x, pose->pose.position.y, pose->pose.position.z);
+        this->orientation_ = Eigen::Quaterniond(pose->pose.orientation.w, pose->pose.orientation.x,
+                                                pose->pose.orientation.y, pose->pose.orientation.z).toRotationMatrix();
+        this->hasSensorPose_ = true;
         // for visualization
         this->latestCloud_ = cloudMsg;
 
@@ -616,26 +675,25 @@ namespace onboardDetector{
         outputCloud.header.frame_id = this->visFrame_;
         this->downSamplePointsPub_->publish(outputCloud);
 
-        // store current position and orientation
-        Eigen::Matrix4d lidarPoseMatrix;
-        this->getLidarPose(pose, lidarPoseMatrix);
-
-        this->position_(0) = pose->pose.position.x;
-        this->position_(1) = pose->pose.position.y;
-        this->position_(2) = pose->pose.position.z;
-        Eigen::Quaterniond quat;
-        quat = Eigen::Quaterniond(pose->pose.orientation.w, pose->pose.orientation.x, pose->pose.orientation.y, pose->pose.orientation.z);
-        Eigen::Matrix3d rot = quat.toRotationMatrix();
-        this->orientation_ = rot;
-
-        this->positionLidar_(0) = lidarPoseMatrix(0, 3);
-        this->positionLidar_(1) = lidarPoseMatrix(1, 3);
-        this->positionLidar_(2) = lidarPoseMatrix(2, 3);
-        this->orientationLidar_ = lidarPoseMatrix.block<3, 3>(0, 0);
     }
 
     void dynamicDetector::lidarOdomCB(const PointCloud2Msg::ConstSharedPtr& cloudMsg, const OdometryMsg::ConstSharedPtr& odom){
         this->lastSyncTime_ = std::chrono::steady_clock::now();
+        this->previousDetectionStamp_ = this->detectionStamp_;
+        this->detectionStamp_ = rclcpp::Time(cloudMsg->header.stamp);
+        if (this->previousDetectionStamp_.nanoseconds() > 0){
+            this->currentDt_ = std::max(0.01, std::min(0.5, (this->detectionStamp_ - this->previousDetectionStamp_).seconds()));
+        }
+        ++this->lidarSequence_;
+
+        Eigen::Matrix4d lidarPoseMatrix;
+        this->getLidarPose(odom, lidarPoseMatrix);
+        this->positionLidar_ = lidarPoseMatrix.block<3, 1>(0, 3);
+        this->orientationLidar_ = lidarPoseMatrix.block<3, 3>(0, 0);
+        this->position_ = Eigen::Vector3d(odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z);
+        this->orientation_ = Eigen::Quaterniond(odom->pose.pose.orientation.w, odom->pose.pose.orientation.x,
+                                                odom->pose.pose.orientation.y, odom->pose.pose.orientation.z).toRotationMatrix();
+        this->hasSensorPose_ = true;
         // for visualization
         this->latestCloud_ = cloudMsg;
 
@@ -719,22 +777,6 @@ namespace onboardDetector{
         outputCloud.header.frame_id = this->visFrame_;
         this->downSamplePointsPub_->publish(outputCloud);
         
-        // store current position and orientation
-        Eigen::Matrix4d lidarPoseMatrix;
-        this->getLidarPose(odom, lidarPoseMatrix);
-
-        this->position_(0) = odom->pose.pose.position.x;
-        this->position_(1) = odom->pose.pose.position.y;
-        this->position_(2) = odom->pose.pose.position.z;
-        Eigen::Quaterniond quat;
-        quat = Eigen::Quaterniond(odom->pose.pose.orientation.w, odom->pose.pose.orientation.x, odom->pose.pose.orientation.y, odom->pose.pose.orientation.z);
-        Eigen::Matrix3d rot = quat.toRotationMatrix();
-        this->orientation_ = rot;
-
-        this->positionLidar_(0) = lidarPoseMatrix(0, 3);
-        this->positionLidar_(1) = lidarPoseMatrix(1, 3);
-        this->positionLidar_(2) = lidarPoseMatrix(2, 3);
-        this->orientationLidar_ = lidarPoseMatrix.block<3, 3>(0, 0);
     }
 
     void dynamicDetector::colorImgCB(const ImageMsg::ConstSharedPtr& img){
@@ -744,6 +786,8 @@ namespace onboardDetector{
 
     void dynamicDetector::yoloDetectionCB(const vision_msgs::msg::Detection2DArray::ConstSharedPtr& detections){
         this->yoloDetectionResults_ = *detections;
+        this->yoloDetectionStamp_ = rclcpp::Time(detections->header.stamp);
+        this->lastYoloReceiveTime_ = std::chrono::steady_clock::now();
     }
 
    
@@ -752,6 +796,12 @@ namespace onboardDetector{
     }
 
     void dynamicDetector::detectionCB(){
+        // 每筆 LiDAR 量測只處理一次；避免 10Hz 點雲被 20Hz timer 重複加入追蹤歷史。
+        if (this->lidarSequence_ == this->processedLidarSequence_ || this->lidarCloud_ == NULL){
+            return;
+        }
+        this->processedLidarSequence_ = this->lidarSequence_;
+        this->lidarDetect();
         // detection thread
         this->dbscanDetect();
         this->uvDetect();
@@ -760,12 +810,27 @@ namespace onboardDetector{
         // ros::Time end = this->now();
         // ROS_INFO("filtering time: %f", (end - start).toSec());
         this->newDetectFlag_ = true; // get a new detection
+        // 同一量測在同一 callback 內完成關聯與分類，避免多 timer 排程順序造成新 stamp 配到舊 track。
+        this->trackingCB();
+        this->classificationCB();
     }
 
     void dynamicDetector::trackingCB(){
+        if (!this->newDetectFlag_){
+            return;
+        }
         // data association thread
         std::vector<int> bestMatch; // for each current detection, which index of previous obstacle match
         this->boxAssociation(bestMatch);
+        if (this->filteredBBoxes_.empty()){
+            this->boxHist_.clear();
+            this->pcHist_.clear();
+            this->pcCenterHist_.clear();
+            this->filters_.clear();
+            this->trackedBBoxes_.clear();
+            this->dynamicBBoxes_.clear();
+            return;
+        }
         // kalman filter tracking
         if (bestMatch.size()){
             this->kalmanFilterAndUpdateHist(bestMatch);
@@ -774,6 +839,8 @@ namespace onboardDetector{
             this->boxHist_.clear();
             this->pcHist_.clear();
             this->pcCenterHist_.clear();
+            this->filters_.clear();
+            this->trackedBBoxes_.clear();
         }
     }
 
@@ -831,9 +898,10 @@ namespace onboardDetector{
             int numPoints = currPc.size(); // it changes within loop
             int votes = 0;
 
-            Vbox(0) = (this->boxHist_[i][0].x - this->boxHist_[i][curFrameGap].x)/(this->dt_*curFrameGap);
-            Vbox(1) = (this->boxHist_[i][0].y - this->boxHist_[i][curFrameGap].y)/(this->dt_*curFrameGap);
-            Vbox(2) = (this->boxHist_[i][0].z - this->boxHist_[i][curFrameGap].z)/(this->dt_*curFrameGap);
+            const double histDt = std::max(1e-3, this->boxHist_[i][0].stamp_sec - this->boxHist_[i][curFrameGap].stamp_sec);
+            Vbox(0) = (this->boxHist_[i][0].x - this->boxHist_[i][curFrameGap].x)/histDt;
+            Vbox(1) = (this->boxHist_[i][0].y - this->boxHist_[i][curFrameGap].y)/histDt;
+            Vbox(2) = (this->boxHist_[i][0].z - this->boxHist_[i][curFrameGap].z)/histDt;
             Vkf(0) = this->boxHist_[i][0].Vx;
             Vkf(1) = this->boxHist_[i][0].Vy;
 
@@ -848,7 +916,7 @@ namespace onboardDetector{
                         nearestVect = currPc[j]-prevPc[k];
                     }
                 }
-                Vcur = nearestVect/(this->dt_*curFrameGap); Vcur(2) = 0;
+                Vcur = nearestVect/histDt; Vcur(2) = 0;
                 double velSim = Vcur.dot(Vbox)/(Vcur.norm()*Vbox.norm());
 
                 if (velSim < 0){
@@ -963,6 +1031,15 @@ namespace onboardDetector{
         this->publish3dBox(this->filteredBBoxes_, this->filteredBBoxesPub_, 0, 1, 1);
         this->publish3dBox(this->trackedBBoxes_, this->trackedBBoxesPub_, 1, 1, 0);
         this->publish3dBox(this->dynamicBBoxes_, this->dynamicBBoxesPub_, 0, 0, 1);
+        // 正式資料介面每筆 LiDAR 量測只發布一次；stale 時另發一次空陣列。
+        // Marker 仍可依 RViz 所需固定頻率重畫，但下游 tracker 不得把同一量測重複算成新 hit。
+        const bool stale = syncAge > this->staleTimeout_;
+        if (this->processedLidarSequence_ != this->publishedDynamicSequence_ || (stale && !this->publishedStaleEmpty_)){
+            this->publishDynamicObstacles();
+            this->publishedDynamicSequence_ = this->processedLidarSequence_;
+            this->publishedStaleEmpty_ = stale;
+        }
+        if (!stale) this->publishedStaleEmpty_ = false;
 
         this->publishLidarClusters(); // colored clusters
         this->publishFilteredPoints();
@@ -1267,8 +1344,19 @@ namespace onboardDetector{
         this->filteredBBoxesBeforeYolo_ = filteredBBoxesTemp; // for visualization
 
 
-        // STEP 5: If YOLO detection results are available, improve the classification and splitting potential incorrect bboxes
-        if (this->yoloDetectionResults_.detections.size() != 0){
+        // STEP 5: YOLO 必須同時「尚未逾時」且影像時間與本次 LiDAR 足夠接近，才可做 2D↔3D 關聯。
+        const double yoloAge = (this->lastYoloReceiveTime_ == std::chrono::steady_clock::time_point::min())
+            ? std::numeric_limits<double>::infinity()
+            : std::chrono::duration<double>(std::chrono::steady_clock::now() - this->lastYoloReceiveTime_).count();
+        const double yoloSyncError = (this->yoloDetectionStamp_.nanoseconds() > 0 && this->detectionStamp_.nanoseconds() > 0)
+            ? std::abs((this->yoloDetectionStamp_ - this->detectionStamp_).seconds())
+            : std::numeric_limits<double>::infinity();
+        const bool yoloUsable = yoloAge <= this->yoloTtl_ && yoloSyncError <= this->yoloSyncTolerance_;
+        if (!yoloUsable && !this->yoloDetectionResults_.detections.empty()){
+            RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+                "[onboardDetector]: 忽略過期/不同步 YOLO（age=%.3fs sync_error=%.3fs）", yoloAge, yoloSyncError);
+        }
+        if (yoloUsable && this->yoloDetectionResults_.detections.size() != 0){
             std::vector<int> best3DBBoxForYOLO(this->yoloDetectionResults_.detections.size(), -1);
 
             // Project 2D bbox in color image plane from 3D
@@ -1359,7 +1447,7 @@ namespace onboardDetector{
                     }
                 }
 
-                if (bestIOU > 0.0){
+                if (bestIOU >= this->yoloBBoxIouThreshold_){
                     best3DBBoxForYOLO[i] = bestIdx;
                 }
             }
@@ -1393,6 +1481,8 @@ namespace onboardDetector{
                 if (yoloIndices.size() == 1) {
                     filteredBBoxesTemp[idx3D].is_dynamic = true;
                     filteredBBoxesTemp[idx3D].is_human = true;
+                    const auto &det = this->yoloDetectionResults_.detections[yoloIndices[0]];
+                    filteredBBoxesTemp[idx3D].confidence = det.results.empty() ? 0.7 : det.results[0].hypothesis.score;
                     newFilteredBBoxes.push_back(filteredBBoxesTemp[idx3D]);
                     newFilteredPcClusters.push_back(filteredPcClustersTemp[idx3D]);
                     newFilteredPcClusterCenters.push_back(filteredPcClusterCentersTemp[idx3D]);
@@ -1495,6 +1585,8 @@ namespace onboardDetector{
 
                             newBox.is_dynamic = true;
                             newBox.is_human = true;
+                            const auto &det = this->yoloDetectionResults_.detections[yidx];
+                            newBox.confidence = det.results.empty() ? 0.7 : det.results[0].hypothesis.score;
 
                             stddev = computeStd(subCloud, center);
                             newFilteredBBoxes.push_back(newBox);
@@ -1509,6 +1601,11 @@ namespace onboardDetector{
             filteredPcClustersTemp = newFilteredPcClusters;
             filteredPcClusterCentersTemp = newFilteredPcClusterCenters;
             filteredPcClusterStdsTemp = newFilteredPcClusterStds;
+        }
+        const double stampSec = this->detectionStamp_.nanoseconds() * 1e-9;
+        for (auto &box : filteredBBoxesTemp){
+            box.stamp_sec = stampSec;
+            if (box.confidence <= 0.0) box.confidence = 0.5;
         }
         this->filteredBBoxes_ = filteredBBoxesTemp;
         this->filteredPcClusters_ = filteredPcClustersTemp;
@@ -1877,13 +1974,13 @@ namespace onboardDetector{
         onboardDetector::box3D propedBBox;
         for (size_t i=0 ; i<this->boxHist_.size() ; i++){
             propedBBox = this->boxHist_[i][0];
-            propedBBox.x += propedBBox.Vx*this->dt_;
-            propedBBox.y += propedBBox.Vy*this->dt_;
+            propedBBox.x += propedBBox.Vx*this->currentDt_;
+            propedBBox.y += propedBBox.Vy*this->currentDt_;
             propedBBoxes.push_back(propedBBox);
 
             Eigen::Vector3d propedPcCenter = this->pcCenterHist_[i][0];
-            propedPcCenter(0) += propedBBox.Vx*this->dt_;
-            propedPcCenter(1) += propedBBox.Vy*this->dt_;
+            propedPcCenter(0) += propedBBox.Vx*this->currentDt_;
+            propedPcCenter(1) += propedBBox.Vy*this->currentDt_;
             propedPcCenters.push_back(propedPcCenter);
         }
     }
@@ -1891,35 +1988,41 @@ namespace onboardDetector{
     void dynamicDetector::findBestMatch(const std::vector<onboardDetector::box3D>& prevBBoxes, const std::vector<Eigen::VectorXd>& prevBBoxesFeat, 
                                         const std::vector<onboardDetector::box3D>& propedBBoxes, const std::vector<Eigen::VectorXd>& propedBBoxesFeat, 
                                         const std::vector<Eigen::VectorXd>& currBBoxesFeat, std::vector<int>& bestMatch){
-        int numObjs = this->filteredBBoxes_.size();
-        std::vector<double> bestSims; // best similarity
-        bestSims.resize(numObjs, 0);
+        (void)prevBBoxes;
+        (void)prevBBoxesFeat;
+        (void)propedBBoxesFeat;
+        (void)currBBoxesFeat;
+        const int nCurr = static_cast<int>(this->filteredBBoxes_.size());
+        const int nPrev = static_cast<int>(propedBBoxes.size());
+        bestMatch.assign(nCurr, -1);
+        if (nCurr == 0 || nPrev == 0) return;
 
-        for (int i=0 ; i<numObjs ; i++){
-            double bestSim = -1.;
-            int bestMatchInd = -1;
-            onboardDetector::box3D currBBox = this->filteredBBoxes_[i];
-            
-            for (size_t j=0 ; j<propedBBoxes.size() ; j++){
-                onboardDetector::box3D propedBBox = propedBBoxes[j];
-                double propedWidth = std::max(propedBBox.x_width, propedBBox.y_width);
-                double currWidth = std::max(currBBox.x_width, currBBox.y_width);
-                if (std::abs(propedWidth - currWidth) < this->maxMatchSizeRange_){
-                    if (pow(pow(propedBBox.x - currBBox.x, 2) + pow(propedBBox.y - currBBox.y, 2), 0.5) < this->maxMatchRange_){
-                        // calculate the velocity feature based on propedBBox and currBBox
-                        double simPrev = prevBBoxesFeat[j].dot(currBBoxesFeat[i])/(prevBBoxesFeat[j].norm()*currBBoxesFeat[i].norm());
-                        double simProped = propedBBoxesFeat[j].dot(currBBoxesFeat[i])/(propedBBoxesFeat[j].norm()*currBBoxesFeat[i].norm());
-                        double sim = simPrev + simProped;
-                        if (sim > bestSim){
-                            bestSim = sim;
-                            bestMatchInd = j;
-                        }
-                    }
-
+        const int n = std::max(nCurr, nPrev);
+        const double invalidCost = 1e6;
+        const double unmatchedCost = this->maxMatchRange_ + this->maxMatchSizeRange_ + 1.0;
+        std::vector<std::vector<double>> cost(n, std::vector<double>(n, unmatchedCost));
+        for (int i = 0; i < nCurr; ++i){
+            const auto &curr = this->filteredBBoxes_[i];
+            for (int j = 0; j < nPrev; ++j){
+                const auto &prev = propedBBoxes[j];
+                const double dist = std::hypot(prev.x - curr.x, prev.y - curr.y);
+                const double prevWidth = std::max(prev.x_width, prev.y_width);
+                const double currWidth = std::max(curr.x_width, curr.y_width);
+                const double sizeDiff = std::abs(prevWidth - currWidth);
+                if (dist <= this->maxMatchRange_ && sizeDiff <= this->maxMatchSizeRange_){
+                    // 全域成本：位置為主、尺寸為輔；Hungarian 保證任一舊 track 最多只配一個新框。
+                    cost[i][j] = dist + 0.25 * sizeDiff;
+                } else {
+                    cost[i][j] = invalidCost;
                 }
             }
-            bestSims[i] = bestSim;
-            bestMatch[i] = bestMatchInd;
+        }
+        const auto assignment = hungarianAssignment(cost);
+        for (int i = 0; i < nCurr; ++i){
+            const int j = assignment[i];
+            if (j >= 0 && j < nPrev && cost[i][j] < invalidCost){
+                bestMatch[i] = j;
+            }
         }
     }
 
@@ -1954,6 +2057,10 @@ namespace onboardDetector{
 
                 Eigen::MatrixXd Z;
                 this->getKalmanObservationAcc(currDetectedBBox, bestMatch[i], Z);
+                MatrixXd statesDt, ADt, BDt, HDt, PDt, QDt, RDt;
+                this->kalmanFilterMatrixAcc(currDetectedBBox, statesDt, ADt, BDt, HDt, PDt, QDt, RDt);
+                filtersTemp.back().setA(ADt);
+                filtersTemp.back().setQ(QDt);
                 filtersTemp.back().estimate(Z, MatrixXd::Zero(6,1));
                 
                 
@@ -1971,6 +2078,9 @@ namespace onboardDetector{
                 newEstimatedBBox.z_width = currDetectedBBox.z_width;
                 newEstimatedBBox.is_dynamic = currDetectedBBox.is_dynamic;
                 newEstimatedBBox.is_human = currDetectedBBox.is_human;
+                newEstimatedBBox.id = this->boxHist_[bestMatch[i]][0].id;
+                newEstimatedBBox.stamp_sec = currDetectedBBox.stamp_sec;
+                newEstimatedBBox.confidence = currDetectedBBox.confidence;
             }
             else{
                 boxHistTemp.push_back(newSingleBoxHist);
@@ -1985,6 +2095,7 @@ namespace onboardDetector{
                 newFilter.setup(states, A, B, H, P, Q, R);
                 filtersTemp.push_back(newFilter);
                 newEstimatedBBox = currDetectedBBox;
+                newEstimatedBBox.id = this->nextTrackId_++;
                 
             }
 
@@ -2047,7 +2158,7 @@ namespace onboardDetector{
                   0, 0, 0, 1,
                   0, 0, 0, 0,
                   0 ,0, 0, 0;
-        A = MatrixXd::Identity(4,4) + this->dt_*ATemp;
+        A = MatrixXd::Identity(4,4) + this->currentDt_*ATemp;
         B = MatrixXd::Zero(4, 4);
         H = MatrixXd::Identity(4, 4);
         P = MatrixXd::Identity(4, 4) * this->eP_;
@@ -2071,10 +2182,10 @@ namespace onboardDetector{
         MatrixXd ATemp;
         ATemp.resize(6, 6);
 
-        ATemp <<  1, 0, this->dt_, 0, 0.5*pow(this->dt_, 2), 0,
-                  0, 1, 0, this->dt_, 0, 0.5*pow(this->dt_, 2),
-                  0, 0, 1, 0, this->dt_, 0,
-                  0 ,0, 0, 1, 0, this->dt_,
+        ATemp <<  1, 0, this->currentDt_, 0, 0.5*pow(this->currentDt_, 2), 0,
+                  0, 1, 0, this->currentDt_, 0, 0.5*pow(this->currentDt_, 2),
+                  0, 0, 1, 0, this->currentDt_, 0,
+                  0 ,0, 0, 1, 0, this->currentDt_,
                   0, 0, 0, 0, 1, 0,
                   0, 0, 0, 0, 0, 1;
         A = ATemp;
@@ -2082,7 +2193,10 @@ namespace onboardDetector{
         H = MatrixXd::Identity(6, 6);
         P = MatrixXd::Identity(6, 6) * this->eP_;
         Q = MatrixXd::Identity(6, 6);
-        Q(0,0) *= this->eQPos_; Q(1,1) *= this->eQPos_; Q(2,2) *= this->eQVel_; Q(3,3) *= this->eQVel_; Q(4,4) *= this->eQAcc_; Q(5,5) *= this->eQAcc_;
+        const double qdt = std::max(0.01, this->currentDt_);
+        Q(0,0) *= this->eQPos_ * qdt*qdt; Q(1,1) *= this->eQPos_ * qdt*qdt;
+        Q(2,2) *= this->eQVel_ * qdt; Q(3,3) *= this->eQVel_ * qdt;
+        Q(4,4) *= this->eQAcc_; Q(5,5) *= this->eQAcc_;
         R = MatrixXd::Identity(6, 6);
         R(0,0) *= this->eRPos_; R(1,1) *= this->eRPos_; R(2,2) *= this->eRVel_; R(3,3) *= this->eRVel_; R(4,4) *= this->eRAcc_; R(5,5) *= this->eRAcc_;
     }
@@ -2100,8 +2214,9 @@ namespace onboardDetector{
         }
         onboardDetector::box3D prevMatchBBox = this->boxHist_[bestMatchIdx][k-1];
 
-        Z(2) = (currDetectedBBox.x-prevMatchBBox.x)/(this->dt_*k);
-        Z(3) = (currDetectedBBox.y-prevMatchBBox.y)/(this->dt_*k);
+        const double obsDt = std::max(1e-3, currDetectedBBox.stamp_sec - prevMatchBBox.stamp_sec);
+        Z(2) = (currDetectedBBox.x-prevMatchBBox.x)/obsDt;
+        Z(3) = (currDetectedBBox.y-prevMatchBBox.y)/obsDt;
     }
 
     void dynamicDetector::getKalmanObservationAcc(const onboardDetector::box3D& currDetectedBBox, int bestMatchIdx, MatrixXd& Z){
@@ -2117,10 +2232,11 @@ namespace onboardDetector{
         }
         onboardDetector::box3D prevMatchBBox = this->boxHist_[bestMatchIdx][k-1];
 
-        Z(2) = (currDetectedBBox.x - prevMatchBBox.x)/(this->dt_*k);
-        Z(3) = (currDetectedBBox.y - prevMatchBBox.y)/(this->dt_*k);
-        Z(4) = (Z(2) - prevMatchBBox.Vx)/(this->dt_*k);
-        Z(5) = (Z(3) - prevMatchBBox.Vy)/(this->dt_*k);
+        const double obsDt = std::max(1e-3, currDetectedBBox.stamp_sec - prevMatchBBox.stamp_sec);
+        Z(2) = (currDetectedBBox.x - prevMatchBBox.x)/obsDt;
+        Z(3) = (currDetectedBBox.y - prevMatchBBox.y)/obsDt;
+        Z(4) = (Z(2) - prevMatchBBox.Vx)/obsDt;
+        Z(5) = (Z(3) - prevMatchBBox.Vy)/obsDt;
     }
  
     void dynamicDetector::getDynamicPc(std::vector<Eigen::Vector3d>& dynamicPc){
@@ -2316,6 +2432,46 @@ namespace onboardDetector{
             ++countMarker;
         }
         this->velVisPub_->publish(velVisMsg);
+    }
+
+    void dynamicDetector::publishDynamicObstacles(){
+        onboard_detector::msg::DynamicObstacleArray out;
+        out.header.frame_id = this->visFrame_;
+        const double sourceAge = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - this->lastSyncTime_).count();
+        out.source_valid = sourceAge <= this->staleTimeout_;
+        if (this->detectionStamp_.nanoseconds() > 0){
+            const int64_t stampNs = this->detectionStamp_.nanoseconds();
+            out.header.stamp.sec = static_cast<int32_t>(stampNs / 1000000000LL);
+            out.header.stamp.nanosec = static_cast<uint32_t>(stampNs % 1000000000LL);
+        }
+
+        for (const auto &box : this->dynamicBBoxes_){
+            onboard_detector::msg::DynamicObstacle ob;
+            ob.id = box.id;
+            ob.position.x = box.x; ob.position.y = box.y; ob.position.z = box.z;
+            ob.velocity.x = box.Vx; ob.velocity.y = box.Vy; ob.velocity.z = box.Vz;
+            ob.acceleration.x = box.Ax; ob.acceleration.y = box.Ay; ob.acceleration.z = box.Az;
+            ob.size.x = box.x_width; ob.size.y = box.y_width; ob.size.z = box.z_width;
+            ob.classification = box.is_human ? "person" : "unknown";
+            ob.source = box.is_human ? "yolo_lidar" : "lidar";
+            ob.confidence = std::max(0.0, std::min(1.0, box.confidence));
+            ob.is_moving = std::hypot(box.Vx, box.Vy) >= this->dynaVelThresh_;
+
+            for (size_t i = 0; i < this->boxHist_.size() && i < this->filters_.size(); ++i){
+                if (!this->boxHist_[i].empty() && this->boxHist_[i][0].id == box.id){
+                    ob.position_covariance = {
+                        this->filters_[i].covariance(0, 0), this->filters_[i].covariance(0, 1),
+                        this->filters_[i].covariance(1, 0), this->filters_[i].covariance(1, 1)};
+                    ob.velocity_covariance = {
+                        this->filters_[i].covariance(2, 2), this->filters_[i].covariance(2, 3),
+                        this->filters_[i].covariance(3, 2), this->filters_[i].covariance(3, 3)};
+                    break;
+                }
+            }
+            out.obstacles.push_back(ob);
+        }
+        this->dynamicObstaclesPub_->publish(out);
     }
 
     void dynamicDetector::publishLidarClusters(){

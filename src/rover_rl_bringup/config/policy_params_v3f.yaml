@@ -118,7 +118,7 @@ rover_rl_policy:
     # --- cmd_delay 補償 (gap #5) ---
     # v3e 已做延遲感知重訓（obs_delay_steps DR），理論上可不補；先沿用 v3c 設定，
     # 若實測過度領先可 ros2 param set /rover_rl_policy cmd_delay_comp_enable false
-    cmd_delay_comp_s: 0.2
+    cmd_delay_comp_s: 0.0   # 2026-07-14 關閉：記憶記載 @0.2 讓蛇行變嚴重(頻率上移);A/B 測試中。原值 0.2
     cmd_delay_comp_enable: true
     cmd_delay_comp_src: "commanded"
 

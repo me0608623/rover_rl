@@ -18,9 +18,11 @@ namespace onboardDetector{
     struct box3D
     {
         /* data */
-        double x, y, z;
-        double x_width, y_width, z_width;
-        double id;
+        double x=0, y=0, z=0;
+        double x_width=0, y_width=0, z_width=0;
+        uint32_t id=0;
+        double stamp_sec=0;
+        double confidence=0;
         double Vx=0, Vy=0, Vz=0;
         double Ax=0, Ay=0, Az=0;
         bool is_human=false; // false: not detected by yolo as dynamic, true: detected by yolo

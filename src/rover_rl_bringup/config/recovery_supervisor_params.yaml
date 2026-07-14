@@ -77,12 +77,13 @@ recovery_supervisor_node:
     front_blocked_m: 0.60
 
     # 前方 LiDAR bins 填滿率門檻。1.0 表示前方扇區幾乎整片都是近物；
-    # 0.65 表示約 65% 前方 bins 被近物佔住才觸發。這比 0.9 容易抓到真人站在正前方，
+    # 0.50 表示約 50% 前方 bins 被近物佔住才觸發。這比 0.65 更容易抓到真人站在正前方，
     # 但仍比單點 front_m 更不容易被柱子/單側障礙誤觸發。
     # ★07-09：0.70→0.65。實測人正對站前方時填滿率落 65~69%（TUI「前方bins」觀測），
     #   0.70 把這些情況擋住不觸發倒退；降到 0.65 讓該區間能觸發（搭配 近≤0.6m 連續2s）。
-    #   若「可繞障礙」也誤觸發，調回 0.70~0.75。
-    front_block_ratio_thresh: 0.65
+    # ★07-10：0.65→0.50。只要前方 50% bins 近障且連續 2s，即走先倒退的 front_block_backup。
+    #   若「可繞障礙」也誤觸發，調回 0.65~0.75。
+    front_block_ratio_thresh: 0.50
 
     # 極近硬堵旁路距離，單位 m。現在設 0.0 表示停用此旁路，避免「速度條件」影響倒退判斷。
     # 若之後想恢復極近安全底線，可設回 0.55~0.60；但那會讓 ratio 不達標時也可能觸發。
@@ -117,6 +118,34 @@ recovery_supervisor_node:
     # 選左右 gap 時，單側至少多遠才算有基本空間，單位 m。此值目前只輔助選側。
     # 若走廊很窄，可降到 0.45~0.5；若希望只走更寬空間，可升到 0.7。
     side_clear_min_m: 0.55
+
+    # 斜前方近障但單側明顯有 gap 時，不先倒退，直接選空側 local goal。
+    # 典型情境：人站在斜前方，front_m≈0.5m，但 front_block_ratio 只有 0~0.15；
+    # 若一側只有 ~0.6m、另一側有 ~3.9m，代表不是正前整片堵死，應往空側繞開。
+    side_gap_trigger_enable: true
+
+    # side-gap direct 觸發的前方近距離門檻，單位 m。
+    side_gap_front_m: 0.60
+
+    # side-gap direct 只在前方填滿率低時觸發；高填滿率仍走「先倒退」流程。
+    side_gap_ratio_max: 0.35
+
+    # 空側至少要有多少距離才允許不倒退直接繞，單位 m。
+    side_gap_clear_m: 1.20
+
+    # 左右距離差至少多大才視為「明顯有一側 gap」，單位 m。
+    side_gap_delta_m: 0.80
+
+    # side-gap 條件需連續維持多久才觸發，單位秒。比正前方倒退略快，但避免瞬間誤判。
+    side_gap_dwell_s: 1.2
+
+    # side-gap direct 只在上游已幾乎停住時觸發，避免車還能正常繞時過早接管。
+    side_gap_cmd_v_abs_mps: 0.08
+    side_gap_cmd_w_abs_radps: 0.75
+
+    # side-gap direct 期間若 front_m 仍小於 rear_clear_stop_m，允許小線速慢慢朝空側繞；
+    # 一般 go_local 在此情況會把 v 壓成 0，導致只原地轉。
+    side_gap_v_max: 0.18
 
     # =========================
     # 分析用觸發輔助量

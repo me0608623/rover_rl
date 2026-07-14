@@ -41,12 +41,14 @@ namespace onboardDetector{
 
         // set A (sometimes sampling time will differ)
         void setA(const MatrixXd& A);
+        void setQ(const MatrixXd& Q);
 
         // state estimate
         void estimate(const MatrixXd& z, const MatrixXd& u);
 
         // read output from the state
         double output(int state_index);
+        double covariance(int row, int col) const;
     };
 }
 

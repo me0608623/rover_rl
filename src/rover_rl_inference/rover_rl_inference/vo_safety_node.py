@@ -97,6 +97,19 @@ class VOSafetyNode(Node):
         gp("clearance_fallback", False)  # 無可行候選時改慢爬向縫隙（True）或急停（False, 預設）
         gp("v_creep", 0.3)               # clearance 退化時的線速度上限
         gp("goaround_v_cap", 0.0)        # RL 縮手時 VO 繞行前進速度地板（0=純守 v_des；0.3=能慢繞）
+        # --- 靜態早期避障（opt-in）：吃 policy status 的 LiDAR 前/左/右淨空，3m 內提早往空側偏 ---
+        gp("static_avoid_enable", False)
+        gp("static_avoid_range_m", 3.0)
+        gp("static_avoid_stop_m", 0.8)
+        gp("static_avoid_turn_gain", 0.45)
+        gp("static_avoid_w_max", 0.6)
+        gp("static_avoid_w_min_far", 0.35)      # 2~3m 也要有明確轉向，不只減速
+        gp("static_avoid_w_min_near", 0.55)     # 接近 stop_m 時的最低轉向
+        gp("static_avoid_v_min_scale", 0.25)
+        gp("static_avoid_side_deadband_m", 0.25)
+        gp("static_avoid_side_norm_m", 2.0)
+        gp("static_avoid_side_clear_m", 1.0)    # 選定側至少要有這麼多淨空
+        gp("static_avoid_commit_hold_s", 1.0)   # front 短暫跳掉仍維持同側，避免左右翻轉
         # --- 卡死逃脫（opt-in）：blocked+停住超過 N 秒且後方有空間 → 慢退開出空間再繞 ---
         gp("stuck_escape_enable", False) # True=啟用卡死後退逃脫；False(預設)=堵死就停在原地
         gp("stuck_timeout_s", 3.0)       # blocked+停住連續多久才觸發後退（設長避免有人只是路過就亂退）
@@ -219,6 +232,19 @@ class VOSafetyNode(Node):
         self.escape_aim_timeout = float(g("escape_aim_timeout_s").value)
         self.escape_aim_cone = math.radians(float(g("escape_aim_cone_deg").value))
         self.commit_hold_s = float(g("commit_hold_s").value)
+        # 靜態早期避障：部署端 deterministic bias，不改 RL policy 本體
+        self.static_avoid_enable = bool(g("static_avoid_enable").value)
+        self.static_avoid_range_m = float(g("static_avoid_range_m").value)
+        self.static_avoid_stop_m = float(g("static_avoid_stop_m").value)
+        self.static_avoid_turn_gain = float(g("static_avoid_turn_gain").value)
+        self.static_avoid_w_max = float(g("static_avoid_w_max").value)
+        self.static_avoid_w_min_far = float(g("static_avoid_w_min_far").value)
+        self.static_avoid_w_min_near = float(g("static_avoid_w_min_near").value)
+        self.static_avoid_v_min_scale = float(g("static_avoid_v_min_scale").value)
+        self.static_avoid_side_deadband = float(g("static_avoid_side_deadband_m").value)
+        self.static_avoid_side_norm = float(g("static_avoid_side_norm_m").value)
+        self.static_avoid_side_clear = float(g("static_avoid_side_clear_m").value)
+        self.static_avoid_commit_hold = float(g("static_avoid_commit_hold_s").value)
         # 前方 LiDAR 安全煞
         self.front_brake_enable = bool(g("front_brake_enable").value)
         self.front_slow_m = float(g("front_brake_slow_m").value)
@@ -286,6 +312,10 @@ class VOSafetyNode(Node):
         self._human_obs: list[Obstacle] = []  # 本拍補的人源障礙（供 status/cone 檢查）
         self._front_brake = ""               # 前方安全煞狀態："stop"/"slow"/"reverse"/""（供 status）
         self._front_brake_prev = ""          # 前一拍前方煞狀態（狀態變化 log 用）
+        self._static_avoid = ""              # 靜態早期避障狀態：""/"bias"（供 status）
+        self._static_avoid_prev = ""
+        self._static_avoid_side = 0           # +1=左繞/-1=右繞；進入 3m 時預選並短暫鎖側
+        self._static_avoid_side_until = 0.0
         self._front_reversing = False        # 前方煞直退避讓遲滯狀態
         self._front_freeze_since = None      # 定時凍結起算 monotonic（None=未凍結）
         self._front_freeze_armed = True      # 是否允許觸發凍結（False=待退到 rearm 外重置）
@@ -668,6 +698,108 @@ class VOSafetyNode(Node):
             return v * frac, w, "slow"
         return v, w, ""
 
+    def _update_static_avoid_side(self, now: float) -> None:
+        """障礙進入 3m 時預選繞行側，並鎖住直到障礙短暫離開後。
+
+        此側同時送入 VO rollout 的 commit cost，讓候選軌跡只在同一側持續最佳化；
+        不再因正中央障礙左右近似對稱而每拍翻向或選到 w≈0。
+        """
+        sweep_ok = (
+            self._front_m is not None
+            and self._left_m is not None
+            and self._right_m is not None
+            and (now - self._sweep_t) <= self.timeout_goal
+        )
+        if not self.static_avoid_enable or not sweep_ok:
+            if now >= self._static_avoid_side_until:
+                self._static_avoid_side = 0
+            return
+        if self._front_m >= self.static_avoid_range_m:
+            if now >= self._static_avoid_side_until:
+                self._static_avoid_side = 0
+            return
+
+        self._static_avoid_side_until = now + self.static_avoid_commit_hold
+        if self._static_avoid_side != 0:
+            return
+
+        lm, rm = self._left_m, self._right_m
+        left_ok = lm >= self.static_avoid_side_clear
+        right_ok = rm >= self.static_avoid_side_clear
+        if left_ok and not right_ok:
+            side = 1
+        elif right_ok and not left_ok:
+            side = -1
+        elif lm > rm + self.static_avoid_side_deadband:
+            side = 1
+        elif rm > lm + self.static_avoid_side_deadband:
+            side = -1
+        elif self._goal_bearing is not None and abs(self._goal_bearing) >= math.radians(5.0):
+            side = 1 if self._goal_bearing > 0.0 else -1
+        elif abs(self._des_w) >= 0.1:
+            side = 1 if self._des_w > 0.0 else -1
+        else:
+            side = -1  # 正中央完全對稱時固定右繞，避免左右候選等價而直走
+
+        # 最後安全閘：偏好側太窄而另一側可走時，翻到可走側。
+        if side > 0 and not left_ok and right_ok:
+            side = -1
+        elif side < 0 and not right_ok and left_ok:
+            side = 1
+        self._static_avoid_side = side
+        self.get_logger().info(
+            f"早期軌跡預選 → {'左' if side > 0 else '右'}繞"
+            f"（front={self._front_m:.2f}m left={lm:.2f}m right={rm:.2f}m）")
+
+    def _apply_static_avoid(self, v: float, w: float) -> tuple[float, float, str]:
+        """3m 早期軌跡避障：鎖側後給明確角速度，2m 外就開始畫繞行弧.
+
+        這不是完整 DWA，只是部署端保守 steering bias：RL 仍決定導航意圖，這層只在
+        front_m 進入 static_avoid_range_m 時，把正向速度降下來，並依左右淨空差往空側偏。
+        front_brake/recovery 仍是最後安全網。
+        """
+        now = time.monotonic()
+        sweep_ok = (
+            self._front_m is not None
+            and self._left_m is not None
+            and self._right_m is not None
+            and (now - self._sweep_t) <= self.timeout_goal
+        )
+        if not self.static_avoid_enable or not sweep_ok:
+            return v, w, ""
+        f = self._front_m
+        if f >= self.static_avoid_range_m:
+            return v, w, ""
+
+        span = max(1e-3, self.static_avoid_range_m - self.static_avoid_stop_m)
+        strength = _clamp((self.static_avoid_range_m - f) / span, 0.0, 1.0)
+        # front_m 越接近 stop，正向速度越低；不強制倒退。
+        if v > 0.0:
+            scale = _clamp((f - self.static_avoid_stop_m) / span,
+                           self.static_avoid_v_min_scale, 1.0)
+            v *= scale
+
+        side = self._static_avoid_side
+        if side == 0:
+            return v, w, "slow"
+        side_delta = self._left_m - self._right_m
+        side_norm = _clamp(
+            max(0.0, abs(side_delta) - self.static_avoid_side_deadband)
+            / max(1e-3, self.static_avoid_side_norm),
+            0.0, 1.0,
+        )
+        w_floor = (self.static_avoid_w_min_far
+                   + (self.static_avoid_w_min_near - self.static_avoid_w_min_far) * strength)
+        w_required = min(
+            self.static_avoid_w_max,
+            w_floor + self.static_avoid_turn_gain * strength * side_norm,
+        )
+        # rollout 若已選同側較大角速度就保留；選到直行或反側則拉回預選軌跡。
+        if side * w < w_required:
+            w = side * w_required
+        w = _clamp(w, -self.static_avoid_w_max, self.static_avoid_w_max)
+        return v, w, "traj_left" if side > 0 else "traj_right"
+
     # ── 20Hz 控制迴圈 ──
     def _tick_ctrl(self) -> None:
         now = time.monotonic()
@@ -700,8 +832,10 @@ class VOSafetyNode(Node):
         # commit 過期清零（過障礙後 engaged 不再續命 → 自然解鎖；見下方 escape 段續命）
         if self._commit_side != 0 and now > self._commit_until:
             self._commit_side = 0
+        self._update_static_avoid_side(now)
+        rollout_side = self._commit_side or self._static_avoid_side
         res = compute_safe_cmd(self._des_v, self._des_w, self._robot, obstacles,
-                               self.vo, goal=goal, commit_side=self._commit_side)
+                               self.vo, goal=goal, commit_side=rollout_side)
 
         # 介入 = 有近障且 VO 解明顯偏離 RL 意圖（與下方 status/log 同一判據）
         intervening = res.engaged and (
@@ -803,6 +937,18 @@ class VOSafetyNode(Node):
             tv, tw = (self.escape_reverse_v if res.blocked else 0.0), ew
         else:
             tv, tw = res.v, res.w
+        # 靜態早期避障：3m 內先減速並往左右較空側偏，避免 RL 貼近靜態障礙才反應。
+        tv, tw, self._static_avoid = self._apply_static_avoid(tv, tw)
+        if self._static_avoid != self._static_avoid_prev:
+            fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
+            lm = "?" if self._left_m is None else f"{self._left_m:.2f}"
+            rm = "?" if self._right_m is None else f"{self._right_m:.2f}"
+            if self._static_avoid:
+                self.get_logger().info(
+                    f"靜態早期避障 → {self._static_avoid}（front={fm}m left={lm}m right={rm}m）")
+            else:
+                self.get_logger().info("靜態早期避障 → 解除")
+            self._static_avoid_prev = self._static_avoid
         # 前方 LiDAR 安全煞（只預設版）：吃 RL front_m，≤stop 禁前進、≤slow 減速（含牆任何物）。
         # 放最後、蓋過 VO/逃脫輸出 → 距離硬底線，不論障礙是人是牆一律生效。
         tv, tw, self._front_brake = self._apply_front_brake(tv, tw)
@@ -956,6 +1102,14 @@ class VOSafetyNode(Node):
         self._status_tick += 1
         if self._status_tick % self._status_every:
             return
+        now = time.monotonic()
+        yolo_age = None if self._yolo_t <= 0.0 else now - self._yolo_t
+        visual_age = None if self._visual_t <= 0.0 else now - self._visual_t
+        static_human_fresh = bool(
+            self.static_human_enable
+            and yolo_age is not None and yolo_age <= self.static_human_timeout
+            and visual_age is not None and visual_age <= self.static_human_timeout
+        )
         d = {
             "fail": fail,                       # ""=正常；"odom"/"desired"=看門狗發 0
             "obs_stale": bool(obs_stale),       # 障礙源逾時 → VO 退化為放行
@@ -979,6 +1133,15 @@ class VOSafetyNode(Node):
             # 前方安全煞（只預設版）+ 靜止人源（只滿血版）
             "front_m": (None if self._front_m is None else round(self._front_m, 2)),
             "front_brake": self._front_brake,   # ""/"slow"/"stop"/"reverse"/"freeze"
+            "static_avoid": self._static_avoid, # ""/"slow"/"bias"
+            "static_avoid_enable": bool(self.static_avoid_enable),
+            "static_avoid_side": int(self._static_avoid_side),
+            "static_human_enable": bool(self.static_human_enable),
+            "static_human_fresh": static_human_fresh,
+            "n_yolo_person": len(self._yolo_betas),
+            "n_visual_boxes": len(self._visual_boxes),
+            "yolo_age_s": (None if yolo_age is None else round(yolo_age, 2)),
+            "visual_age_s": (None if visual_age is None else round(visual_age, 2)),
             "n_human": len(self._human_obs),    # 本拍補的靜止人源障礙數
             "strict_front": bool(self._strict_front),  # 嚴格前方模式（TUI 'f' 切換）
         }

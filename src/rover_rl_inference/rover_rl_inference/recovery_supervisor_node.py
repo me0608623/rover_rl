@@ -85,6 +85,15 @@ class RecoverySupervisorNode(Node):
         gp("rear_clear_start_m", 0.8)
         gp("rear_clear_stop_m", 0.55)
         gp("side_clear_min_m", 0.55)
+        gp("side_gap_trigger_enable", True)
+        gp("side_gap_front_m", 0.60)
+        gp("side_gap_ratio_max", 0.35)
+        gp("side_gap_clear_m", 1.20)
+        gp("side_gap_delta_m", 0.80)
+        gp("side_gap_dwell_s", 1.2)
+        gp("side_gap_cmd_v_abs_mps", 0.08)
+        gp("side_gap_cmd_w_abs_radps", 0.75)
+        gp("side_gap_v_max", 0.18)
 
         gp("no_progress_window_s", 2.5)
         gp("no_progress_min_delta_m", 0.15)
@@ -137,6 +146,15 @@ class RecoverySupervisorNode(Node):
         self.rear_clear_start_m = float(g("rear_clear_start_m").value)
         self.rear_clear_stop_m = float(g("rear_clear_stop_m").value)
         self.side_clear_min_m = float(g("side_clear_min_m").value)
+        self.side_gap_trigger_enable = bool(g("side_gap_trigger_enable").value)
+        self.side_gap_front_m = float(g("side_gap_front_m").value)
+        self.side_gap_ratio_max = float(g("side_gap_ratio_max").value)
+        self.side_gap_clear_m = float(g("side_gap_clear_m").value)
+        self.side_gap_delta_m = float(g("side_gap_delta_m").value)
+        self.side_gap_dwell_s = float(g("side_gap_dwell_s").value)
+        self.side_gap_cmd_v_abs_mps = float(g("side_gap_cmd_v_abs_mps").value)
+        self.side_gap_cmd_w_abs_radps = float(g("side_gap_cmd_w_abs_radps").value)
+        self.side_gap_v_max = float(g("side_gap_v_max").value)
 
         self.no_progress_window_s = float(g("no_progress_window_s").value)
         self.no_progress_min_delta_m = float(g("no_progress_min_delta_m").value)
@@ -184,6 +202,7 @@ class RecoverySupervisorNode(Node):
         self._front_m: float | None = None
         self._front_block_ratio: float | None = None
         self._front_blocked_since: float | None = None
+        self._side_gap_blocked_since: float | None = None
         self._back_m: float | None = None
         self._left_m: float | None = None
         self._right_m: float | None = None
@@ -197,6 +216,7 @@ class RecoverySupervisorNode(Node):
         self._backup_start_xy = (0.0, 0.0)
         self._selected_side = 0  # +1 left, -1 right
         self._local_goal_odom: tuple[float, float] | None = None
+        self._direct_side_gap = False
         self._rot_scan_dir = 1.0
         self._last_out_v = 0.0
         self._last_out_w = 0.0
@@ -250,7 +270,7 @@ class RecoverySupervisorNode(Node):
             "odom_x", "odom_y", "odom_yaw",
             "backup_dist_m", "selected_side",
             "local_goal_x", "local_goal_y", "local_err_x", "local_err_y",
-            "trigger_reason",
+            "direct_side_gap", "side_gap_blocked_age_s", "trigger_reason",
         ]
         event_fields = [
             "t", "event", "from_state", "to_state", "reason",
@@ -260,7 +280,7 @@ class RecoverySupervisorNode(Node):
             "des_v", "des_w", "out_v", "out_w",
             "odom_x", "odom_y", "odom_yaw",
             "backup_dist_m", "selected_side", "fail_count",
-            "trigger_reason",
+            "direct_side_gap", "side_gap_blocked_age_s", "trigger_reason",
         ]
         self._csv_tick = csv.DictWriter(self._csv_tick_fh, fieldnames=tick_fields)
         self._csv_event = csv.DictWriter(self._csv_event_fh, fieldnames=event_fields)
@@ -334,7 +354,10 @@ class RecoverySupervisorNode(Node):
                 self._recovery_t = now
                 self._backup_start_xy = (self._odom_x, self._odom_y)
                 self._local_goal_odom = None
-                self._set_state(RecoveryState.RECOVERY_STOP, self._last_trigger_reason)
+                if self._direct_side_gap:
+                    self._set_state(RecoveryState.RECOVERY_SELECT_GAP, self._last_trigger_reason)
+                else:
+                    self._set_state(RecoveryState.RECOVERY_STOP, self._last_trigger_reason)
                 self._emit(0.0, 0.0)
             else:
                 self._emit(self._des_v, self._des_w)
@@ -394,7 +417,10 @@ class RecoverySupervisorNode(Node):
             else:
                 v, w = self._local_controller()
                 if self._front_m is not None and self._front_m < self.rear_clear_stop_m:
-                    v = min(v, 0.0)
+                    if self._direct_side_gap and self._selected_side_has_clearance():
+                        v = min(v, self.side_gap_v_max)
+                    else:
+                        v = min(v, 0.0)
                 self._emit(v, w)
             return
 
@@ -405,6 +431,7 @@ class RecoverySupervisorNode(Node):
                 if self._return_success or self._front_clear_for_rl():
                     self._fail_count = 0
                 self._return_success = False
+                self._direct_side_gap = False
                 self._set_state(RecoveryState.NORMAL_RL, "return control")
 
     def _is_active_recovery_state(self) -> bool:
@@ -420,20 +447,34 @@ class RecoverySupervisorNode(Node):
             return False
         if now - self._last_recovery_end_t < self.trigger_cooldown_s:
             return False
+        self._direct_side_gap = False
         front_blocked = self._front_blocked_by_lidar_bins(now)
-        if not front_blocked:
+        side_gap_blocked = self._side_gap_blocked(now)
+        if not front_blocked and not side_gap_blocked:
             return False
         no_progress = self._no_progress(now)
         hesitating = self._rl_hesitating(now)
-        age = 0.0 if self._front_blocked_since is None else now - self._front_blocked_since
+        age = (
+            0.0 if self._front_blocked_since is None
+            else now - self._front_blocked_since
+        )
+        side_age = (
+            0.0 if self._side_gap_blocked_since is None
+            else now - self._side_gap_blocked_since
+        )
+        self._direct_side_gap = side_gap_blocked and side_age >= self.side_gap_dwell_s
+        mode = "side_gap_direct" if self._direct_side_gap else "front_block_backup"
         self._last_trigger_reason = (
+            f"mode={mode}, "
             f"front_m={self._front_m:.2f}, "
             f"front_block_ratio={self._front_block_ratio:.2f}, "
             f"hard_close={self._front_hard_close_and_stopped()}, "
             f"blocked_age={age:.1f}s, "
+            f"side_gap_age={side_age:.1f}s, "
+            f"left={self._left_score():.2f}, right={self._right_score():.2f}, "
             f"no_progress={no_progress}, rl_hesitating={hesitating}"
         )
-        return age >= self.front_blocked_dwell_s
+        return self._direct_side_gap or (front_blocked and age >= self.front_blocked_dwell_s)
 
     def _front_blocked_by_lidar_bins(self, now: float) -> bool:
         fill_blocked = (
@@ -448,6 +489,31 @@ class RecoverySupervisorNode(Node):
                 self._front_blocked_since = now
         else:
             self._front_blocked_since = None
+        return blocked
+
+    def _side_gap_blocked(self, now: float) -> bool:
+        if not self.side_gap_trigger_enable:
+            self._side_gap_blocked_since = None
+            return False
+        left = self._left_score()
+        right = self._right_score()
+        best = max(left, right)
+        worst = min(left, right)
+        blocked = (
+            self._front_m is not None
+            and self._front_m <= self.side_gap_front_m
+            and self._front_block_ratio is not None
+            and self._front_block_ratio <= self.side_gap_ratio_max
+            and best >= self.side_gap_clear_m
+            and (best - worst) >= self.side_gap_delta_m
+            and abs(self._des_v) <= self.side_gap_cmd_v_abs_mps
+            and abs(self._des_w) <= self.side_gap_cmd_w_abs_radps
+        )
+        if blocked:
+            if self._side_gap_blocked_since is None:
+                self._side_gap_blocked_since = now
+        else:
+            self._side_gap_blocked_since = None
         return blocked
 
     def _front_hard_close_and_stopped(self) -> bool:
@@ -494,6 +560,13 @@ class RecoverySupervisorNode(Node):
 
     def _right_score(self) -> float:
         return self._right_m if self._right_m is not None else 0.0
+
+    def _selected_side_has_clearance(self) -> bool:
+        if self._selected_side > 0:
+            return self._left_score() >= self.side_gap_clear_m
+        if self._selected_side < 0:
+            return self._right_score() >= self.side_gap_clear_m
+        return False
 
     def _select_local_goal(self) -> None:
         left = self._left_score()
@@ -574,6 +647,11 @@ class RecoverySupervisorNode(Node):
             return None
         return max(0.0, now - self._front_blocked_since)
 
+    def _side_gap_blocked_age(self, now: float) -> float | None:
+        if self._side_gap_blocked_since is None:
+            return None
+        return max(0.0, now - self._side_gap_blocked_since)
+
     def _snapshot_row(self, now: float) -> dict:
         local_x = local_y = ""
         err_x = err_y = ""
@@ -609,6 +687,8 @@ class RecoverySupervisorNode(Node):
             "local_goal_y": self._float_or_empty(local_y),
             "local_err_x": self._float_or_empty(err_x),
             "local_err_y": self._float_or_empty(err_y),
+            "direct_side_gap": int(self._direct_side_gap),
+            "side_gap_blocked_age_s": self._float_or_empty(self._side_gap_blocked_age(now)),
             "trigger_reason": self._last_trigger_reason,
         }
 
@@ -654,6 +734,11 @@ class RecoverySupervisorNode(Node):
             "front_blocked_age_s": (
                 None if self._front_blocked_age(time.monotonic()) is None
                 else round(self._front_blocked_age(time.monotonic()), 2)
+            ),
+            "direct_side_gap": self._direct_side_gap,
+            "side_gap_blocked_age_s": (
+                None if self._side_gap_blocked_age(time.monotonic()) is None
+                else round(self._side_gap_blocked_age(time.monotonic()), 2)
             ),
             "back_m": None if self._back_m is None else round(self._back_m, 2),
             "left_m": None if self._left_m is None else round(self._left_m, 2),

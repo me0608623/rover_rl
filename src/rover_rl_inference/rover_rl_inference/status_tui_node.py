@@ -27,6 +27,7 @@ import unicodedata
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Twist
 from std_msgs.msg import Empty, Float32MultiArray, String
 from visualization_msgs.msg import MarkerArray
 
@@ -65,6 +66,10 @@ class StatusTuiNode(Node):
         self.declare_parameter("topic_route_stations", "/rover_rl/route_stations")
         # VO 安全層狀態（enable_vo:=true 才有此 topic；收不到→自動隱藏 VO 列）
         self.declare_parameter("topic_vo_status", "/vo_safety_node/status")
+        # MPPI 靜態避障層（enable_mppi:=true 才有 cmd_vel_mppi publisher；收不到→自動隱藏 MPPI 列）。
+        # 純解耦訂閱兩個 cmd：RL 意圖 vs MPPI 輸出，比較差異判斷 MPPI 是否在改寫（避靜態），不影響控制。
+        self.declare_parameter("topic_mppi_cmd", "/rover_rl/cmd_vel_mppi")
+        self.declare_parameter("topic_rl_desired", "/rover_rl/cmd_vel_desired")
         # 右側 LiDAR 雷達（重畫 BEV 的極座標散點，不吃 bev_image 影像）
         self.declare_parameter("topic_sweep", "/rover_rl/lidar_sweep_72")
         # 往返測試（enable_pingpong:=true 才有此 topic；收不到→不顯示提示）：
@@ -93,6 +98,8 @@ class StatusTuiNode(Node):
         topic_stations = self.get_parameter(
             "topic_route_stations").get_parameter_value().string_value
         topic_vo = self.get_parameter("topic_vo_status").get_parameter_value().string_value
+        topic_mppi = self.get_parameter("topic_mppi_cmd").get_parameter_value().string_value
+        topic_rl_des = self.get_parameter("topic_rl_desired").get_parameter_value().string_value
         topic_sweep = self.get_parameter("topic_sweep").get_parameter_value().string_value
         topic_pp = self.get_parameter(
             "topic_pingpong_status").get_parameter_value().string_value
@@ -119,6 +126,11 @@ class StatusTuiNode(Node):
         self._stations_t = 0.0
         self._vo: dict | None = None           # VO 安全層狀態；None=VO 未啟動/沒收到
         self._vo_t = 0.0
+        # MPPI 靜態避障層：解耦訂閱 RL 意圖 + MPPI 輸出（enable_mppi 才有 cmd_vel_mppi）
+        self._mppi: tuple[float, float] | None = None  # (v,w) MPPI 輸出；None=從未收到→隱藏 MPPI 列
+        self._mppi_t = 0.0
+        self._rl_des: tuple[float, float] | None = None  # (v,w) RL 意圖（cmd_vel_desired）
+        self._rl_des_t = 0.0
         self._sweep: list | None = None        # 72-bin 正規化 sweep（畫雷達用）
         self._sweep_t = 0.0
         self._pp: dict | None = None            # 往返測試狀態；None=未啟動/沒收到
@@ -128,6 +140,8 @@ class StatusTuiNode(Node):
         self.create_subscription(String, topic_diag, self._cb_diag_event, 10)
         self.create_subscription(String, topic_stations, self._cb_stations, 10)
         self.create_subscription(String, topic_vo, self._cb_vo, 10)
+        self.create_subscription(Twist, topic_mppi, self._cb_mppi, 10)
+        self.create_subscription(Twist, topic_rl_des, self._cb_rl_desired, 10)
         self.create_subscription(Float32MultiArray, topic_sweep, self._cb_sweep, 10)
         self.create_subscription(String, topic_pp, self._cb_pp, 10)
         # 空白鍵 → 發 start 觸發往返測試開始
@@ -185,6 +199,16 @@ class StatusTuiNode(Node):
             self._vo = data
             self._vo_t = time.monotonic()
 
+    def _cb_mppi(self, msg: Twist) -> None:
+        with self._lock:
+            self._mppi = (msg.linear.x, msg.angular.z)
+            self._mppi_t = time.monotonic()
+
+    def _cb_rl_desired(self, msg: Twist) -> None:
+        with self._lock:
+            self._rl_des = (msg.linear.x, msg.angular.z)
+            self._rl_des_t = time.monotonic()
+
     def _cb_sweep(self, msg: Float32MultiArray) -> None:
         with self._lock:
             self._sweep = list(msg.data)
@@ -238,7 +262,8 @@ class StatusTuiNode(Node):
                     self._stations, self._stations_t,
                     self._sweep, self._sweep_t,
                     self._vo, self._vo_t,
-                    self._pp, self._pp_t)
+                    self._pp, self._pp_t,
+                    self._mppi, self._mppi_t, self._rl_des, self._rl_des_t)
 
 
 def _fmt(val, fmt: str, default: str = "—") -> str:
@@ -370,18 +395,20 @@ class Dashboard:
     def _render(self, stdscr) -> None:
         (status, last_t, lvdot_n, lvdot_t, diag_event, diag_event_t,
          stations, stations_t, sweep, sweep_t, vo, vo_t,
-         pp, pp_t) = self.node.snapshot()
+         pp, pp_t, mppi, mppi_t, rl_des, rl_des_t) = self.node.snapshot()
         now = time.monotonic()
         # age = 距上次收到狀態多久。policy_node 以 5 Hz 發，>1.5s 沒更新即視為
         # stale（policy_node 可能掛了），改顯示警告而非沿用過期數值誤導判讀。
         age = now - last_t if last_t else float("inf")
         lvdot_age = now - lvdot_t if lvdot_t else float("inf")
         vo_age = now - vo_t if vo_t else float("inf")
+        mppi_age = now - mppi_t if mppi_t else float("inf")
+        rl_des_age = now - rl_des_t if rl_des_t else float("inf")
         stale = age > 1.5
 
         stdscr.erase()
         h, w = stdscr.getmaxyx()
-        box_w = min(max(52, w - 2), 82)
+        box_w = min(max(48, w - 2), 58)
 
         # 先依狀態決定列數與是否畫地鐵式進度條（路徑導航才畫）→ 才能算框高
         station_info = None
@@ -403,7 +430,8 @@ class Dashboard:
                     and diag_event.get("event") == "goal_reached"
                     and (now - diag_event_t) < 10.0))
             rows = self._build_rows(status, lvdot_n, lvdot_age, station_info,
-                                    goal_reached, vo, vo_age)
+                                    goal_reached, vo, vo_age,
+                                    mppi, mppi_age, rl_des, rl_des_age)
             # 有具名站序 → 畫站名地鐵線；否則退回幾何進度條（起→O→終）
             show_route = station_info is not None
             show_subway = (not show_route and is_path and pn and pn >= 2
@@ -471,7 +499,7 @@ class Dashboard:
         elif show_subway:
             self._draw_subway(win, line_y, box_w, status)
 
-        foot = f" 更新 {age:.1f}s 前 · f=VO嚴格前方 · q=離開 "
+        foot = f" 更新{age:.1f}s · f=VO前 · q=離開 "
         win.addstr(box_h - 1, 2, foot, self._c(5))
         win.refresh()
 
@@ -865,23 +893,48 @@ class Dashboard:
             rows.append(("VO嚴格", "ON：只擋前方±15° 卡≥2s 或直衝車端（'f' 切回）", 2, True))
         return rows
 
-    def _front_bins_txt(self, s: dict, vo: dict | None = None) -> tuple[str, int]:
-        """前方 ±30° 共 13 個 bin 的距離變化。
+    @staticmethod
+    def _mppi_row(mppi, mppi_age, rl_des, rl_des_age
+                  ) -> tuple[str, str, int, bool] | None:
+        """MPPI 靜態避障層一列（解耦：比 RL 意圖 vs MPPI 輸出）。
 
-        字串左=車左(bin42)、右=車右(bin30)。每格用黑框隔開；正中心 lidar[36]
+        enable_mppi 才有 cmd_vel_mppi publisher；從未收到 → None（不畫此列，自動隱藏）。
+        - 收過但 >1.5s 沒更新：MPPI 停發（gate 卡 costmap/RL 逾時）→ 紅字警示。
+        - 差異小：MPPI 貼齊 RL、無靜態繞行 → 綠「放行」。
+        - 差異大：MPPI 正在改寫避靜態 → 黃粗「介入中 RL(v,w)→(v,w)」。
+        """
+        if mppi is None:
+            return None                      # 從未收到 → MPPI 未啟用，整列不畫
+        if mppi_age > 1.5:
+            return ("MPPI", f"⚠ 無輸出 {mppi_age:.1f}s（等 costmap / RL 逾時？）", 3, True)
+        mv, mw = mppi
+        if rl_des is None or rl_des_age > 1.0:
+            # 收得到 MPPI 但沒 RL 意圖可比：只報 MPPI 輸出
+            return ("MPPI", f"輸出({mv:+.2f},{mw:+.2f})（無 RL 意圖可比）", 5, False)
+        dv, dw = rl_des
+        intervening = abs(mv - dv) > 0.08 or abs(mw - dw) > 0.12
+        if intervening:
+            txt = (f"介入中 RL({dv:+.2f},{dw:+.2f})→({mv:+.2f},{mw:+.2f})（避靜態）")
+            return ("MPPI", txt, 2, True)
+        return ("MPPI", f"✓ 放行（貼齊 RL，無靜態繞行）({mv:+.2f},{mw:+.2f})", 1, False)
+
+    def _front_bins_txt(self, s: dict, vo: dict | None = None) -> tuple[str, int]:
+        """前方中心 9 個 bin 的距離變化。
+
+        字串左=車左(bin40)、右=車右(bin32)。每格用黑框隔開；正中心 lidar[36]
         用紅色標出，方便確認車頭正前方是哪一格。
         """
         sweep = self.node._sweep
         ratio = s.get("front_block_ratio")
         strict = bool(vo and vo.get("strict_front"))
-        pre = "⚡嚴格 " if strict else ""
+        pre = "⚡ " if strict else ""
         if not sweep or len(sweep) < 72:
             return (f"{pre}填{int(ratio*100)}%(無sweep)" if ratio is not None else f"{pre}(無sweep)", 5)
         r_max, r_robot = self.node._r_max, self.node._r_robot
         close = self.node._front_block_close
-        bins = list(range(30, 43))
+        bins = list(range(32, 41))
         meters = [(i, sweep[i] * (r_max - r_robot) + r_robot) for i in bins]
-        meters = meters[::-1]   # bin42(車左)在字串左、bin30(車右)在右
+        meters = meters[::-1]   # bin40(車左)在字串左、bin32(車右)在右
 
         def _blk(m: float) -> str:
             if m < 0.5:  return "█"   # 貼身
@@ -906,19 +959,21 @@ class Dashboard:
         rtxt = f" 填{int(ratio*100)}%" if ratio is not None else ""
         cells.append((f"{rtxt} 近{near:.1f}m", 5, False))
         nblk = sum(1 for _, m in meters if m < close)
-        pair = 3 if nblk >= 11 else (2 if nblk >= 7 else 1)   # ≥11紅(近全堵)、≥7黃、其餘綠
+        pair = 3 if nblk >= 8 else (2 if nblk >= 5 else 1)   # 9格中 ≥8紅(近全堵)、≥5黃、其餘綠
         return cells, pair
 
     def _build_rows(self, s: dict, lvdot_n=None, lvdot_age=float("inf"),
                     station_info=None, goal_reached=False,
-                    vo=None, vo_age=float("inf")
+                    vo=None, vo_age=float("inf"),
+                    mppi=None, mppi_age=float("inf"),
+                    rl_des=None, rl_des_age=float("inf")
                     ) -> list[tuple[str, str, int, bool]]:
         # 把 status JSON 整理成儀表板每一列 (標籤, 數值字串, 顏色pair, 粗體)。
         # 渲染層只負責畫，所有「該紅該黃」的健康度判斷都集中在這裡。
         mode = s.get("mode", "?")
         mode_pair = {"nav": 1, "idle": 2, "paused": 2,
                      "manual": 4, "estop": 3}.get(mode, 5)
-        mode_txt = f"{MODE_LABEL.get(mode, mode)}    速率 {_fmt(s.get('speed_rate'), '.2f')}"
+        mode_txt = f"{MODE_LABEL.get(mode, mode)}  速率{_fmt(s.get('speed_rate'), '.2f')}"
 
         # 三層速度：想要(RL) → 送出(濾波後) → 實測(odom)
         # 非 nav 模式不跑推論、cmd 強制 0，三層都會是 0 → 顯示灰字狀態文字避免誤會
@@ -934,9 +989,9 @@ class Dashboard:
             w_over = False
         else:
             v_txt = (f"想{_fmt(s.get('rl_v'), '+.2f')} 送{_fmt(s.get('sent_v'), '+.2f')} "
-                     f"實{_fmt(s.get('act_v'), '+.2f')} m/s")
+                     f"實{_fmt(s.get('act_v'), '+.2f')}")
             w_txt = (f"想{_fmt(s.get('rl_w'), '+.2f')} 送{_fmt(s.get('sent_w'), '+.2f')} "
-                     f"實{_fmt(s.get('act_w'), '+.2f')} rad/s")
+                     f"實{_fmt(s.get('act_w'), '+.2f')}")
             if w_over:
                 w_txt += f" ⚠超{_fmt(s.get('chassis_w_max'), '.1f')}"
             v_pair = self._track_pair(s.get("sent_v"), s.get("act_v"))
@@ -947,7 +1002,7 @@ class Dashboard:
         f, b, l, r = (s.get("front_m"), s.get("back_m"),
                       s.get("left_m"), s.get("right_m"))
         obst_txt = (f"前{self._dist(f)} 後{self._dist(b)} "
-                    f"左{self._dist(l)} 右{self._dist(r)} m")
+                    f"左{self._dist(l)} 右{self._dist(r)}")
         obst_min = min([x for x in (f, b, l, r) if x is not None], default=None)
         obst_pair = self._dist_pair(obst_min)
 
@@ -957,20 +1012,20 @@ class Dashboard:
         src = s.get("lidar_src", "")
         src_short = {"preprocessor_topic": "preproc", "inline": "inline",
                      "inline_fallback": "fallback", "none": "—"}.get(src, src)
-        lidar_txt = (f"{'✓' if lidar_ok else '⚠'} {_fmt(lidar_age, '.2f')}s  "
-                     f"最近 {self._dist(nearest)}m  ({src_short})")
+        lidar_txt = (f"{'✓' if lidar_ok else '⚠'} {_fmt(lidar_age, '.2f')}s "
+                     f"最近{self._dist(nearest)}m ({src_short})")
 
         odom_age = s.get("odom_age")
         odom_ok = odom_age is not None and odom_age < 0.5
         odom_txt = f"{'✓' if odom_ok else '⚠'} {_fmt(odom_age, '.2f')}s"
 
         ndt_ok = bool(s.get("ndt_ok"))
-        ndt_txt = f"{'✓ 穩定' if ndt_ok else '⚠ 未穩'}  {_fmt(s.get('ndt_age'), '.1f')}s"
+        ndt_txt = f"{'✓穩定' if ndt_ok else '⚠未穩'} {_fmt(s.get('ndt_age'), '.1f')}s"
 
         psrc = {"odom+offset": "NDT校正", "ndt_direct": "NDT直接",
                 "odom_only": "純里程計"}.get(s.get("pose_src", ""), s.get("pose_src", ""))
-        pose_txt = (f"({_fmt(s.get('pose_x'), '+.1f')}, {_fmt(s.get('pose_y'), '+.1f')})"
-                    f"  ∠{_fmt(s.get('pose_yaw_deg'), '+.0f')}°  {psrc}")
+        pose_txt = (f"({_fmt(s.get('pose_x'), '+.1f')},{_fmt(s.get('pose_y'), '+.1f')})"
+                    f" ∠{_fmt(s.get('pose_yaw_deg'), '+.0f')}° {psrc}")
         pose_pair = 1 if s.get("pose_src") != "odom_only" else 2
 
         off = (s.get("off_x"), s.get("off_y"), s.get("off_yaw_deg"))
@@ -982,15 +1037,14 @@ class Dashboard:
         if nav_type == "path":
             if station_info is not None:
                 names, cur = station_info
-                nav_txt = (f"路徑導航 (routing) · {names[cur]} "
-                           f"(第 {cur + 1}/{len(names)} 站)")
+                nav_txt = f"路徑 · {names[cur]} ({cur + 1}/{len(names)}站)"
             else:
                 pi, pn = s.get("path_i"), s.get("path_n")
-                nav_txt = ("路徑導航 (routing)" if pi is None or not pn
-                           else f"路徑導航 (routing) · 第 {pi + 1}/{pn} 點")
+                nav_txt = ("路徑 (routing)" if pi is None or not pn
+                           else f"路徑 · {pi + 1}/{pn}點")
             nav_pair = 4
         elif nav_type == "single":
-            nav_txt, nav_pair = "單一 goal 導航", 4
+            nav_txt, nav_pair = "單一 goal", 4
         else:
             nav_txt, nav_pair = "待命（無目標）", 5
 
@@ -1003,8 +1057,8 @@ class Dashboard:
         elif gd is None:
             goal_txt, goal_pair = "尚無 goal/path", 5
         else:
-            tag = f"  ({gsrc.split('/')[0]})" if gsrc else ""
-            goal_txt, goal_pair = f"距 {_fmt(gd, '.1f')}m  方位 {_fmt(ga, '+.0f')}°{tag}", 1
+            tag = f" ({gsrc.split('/')[0]})" if gsrc else ""
+            goal_txt, goal_pair = f"距{_fmt(gd, '.1f')}m 方位{_fmt(ga, '+.0f')}°{tag}", 1
 
         model_txt = s.get("model") or "—"
 
@@ -1017,23 +1071,43 @@ class Dashboard:
         else:
             clr = f - oh
             if clr <= 0.0:
-                front_txt, front_pair = f"⚠ ≤0（已進盲區/可能接觸） 前緣 前{self._dist(f)}−{oh:.2f}", 3
+                front_txt, front_pair = f"⚠≤0 已進盲區/可能接觸 ({self._dist(f)}−{oh:.2f})", 3
             elif clr < 0.3:
-                front_txt, front_pair = f"{clr:.2f}m ⚠近  (前{self._dist(f)}−車頭{oh:.2f})", 3
+                front_txt, front_pair = f"{clr:.2f}m ⚠近 ({self._dist(f)}−{oh:.2f})", 3
             elif clr < 0.6:
-                front_txt, front_pair = f"{clr:.2f}m  (前{self._dist(f)}−車頭{oh:.2f})", 2
+                front_txt, front_pair = f"{clr:.2f}m ({self._dist(f)}−{oh:.2f})", 2
             else:
-                front_txt, front_pair = f"{clr:.2f}m  (前{self._dist(f)}−車頭{oh:.2f})", 1
+                front_txt, front_pair = f"{clr:.2f}m ({self._dist(f)}−{oh:.2f})", 1
 
-        # LV-DOT 動態障礙偵測（獨立節點，policy 不吃，純態勢感知）
+        # LV-DOT 動態框 + VO 追蹤 + YOLO×3D 補出的靜止行人，分開顯示以便確認感知鏈。
         if lvdot_n is None:
-            lvdot_txt, lvdot_pair = "未啟動 / 無資料", 5
+            dynamic_txt, dynamic_pair = "LV框無資料", 5
         elif lvdot_age > 2.0:
-            lvdot_txt, lvdot_pair = f"⚠ 逾時 {lvdot_age:.1f}s（偵測器可能死）", 2
-        elif lvdot_n == 0:
-            lvdot_txt, lvdot_pair = "✓ 無動態障礙", 1
+            dynamic_txt, dynamic_pair = f"LV框逾時{lvdot_age:.1f}s", 2
         else:
-            lvdot_txt, lvdot_pair = f"{lvdot_n} 個動態障礙", 2
+            dynamic_txt = f"LV框{lvdot_n}"
+            dynamic_pair = 2 if lvdot_n else 1
+
+        if vo:
+            dynamic_txt += f" 追蹤{vo.get('n_tracked', 0)}"
+            if not vo.get("static_human_enable"):
+                dynamic_txt += " 靜人源關"
+            elif not vo.get("static_human_fresh"):
+                ya = vo.get("yolo_age_s")
+                va = vo.get("visual_age_s")
+                ages = (f"Y{_fmt(ya, '.1f')}s/3D{_fmt(va, '.1f')}s"
+                        if ya is not None or va is not None else "無資料")
+                dynamic_txt += f" 靜人源逾時({ages})"
+                dynamic_pair = 2
+            else:
+                n_human = int(vo.get("n_human", 0))
+                dynamic_txt += (
+                    f" 靜人{n_human}"
+                    f"(YOLO{vo.get('n_yolo_person', 0)}/3D{vo.get('n_visual_boxes', 0)})")
+                if n_human:
+                    dynamic_pair = 2
+        else:
+            dynamic_txt += " VO無資料"
 
         rows = [
             ("模式", mode_txt, mode_pair, True),
@@ -1043,8 +1117,12 @@ class Dashboard:
             ("障礙", obst_txt, obst_pair, obst_pair == 3),
             ("車頭距障", front_txt, front_pair, front_pair == 3),
             ("前方bins", *self._front_bins_txt(s, vo), False),
-            ("動態", lvdot_txt, lvdot_pair, False),
+            ("動態/行人", dynamic_txt, dynamic_pair, False),
         ]
+        # MPPI 靜態避障層：enable_mppi 才有 cmd_vel_mppi（收不到→_mppi_row 回 None，整列自動隱藏）
+        mppi_row = self._mppi_row(mppi, mppi_age, rl_des, rl_des_age)
+        if mppi_row is not None:
+            rows.append(mppi_row)
         # VO 安全層：不顯示（改顯示前方 bins 變化）。嚴格前方模式只在前方bins列加小標記。
         rows += [
             ("LiDAR", lidar_txt, 3 if not lidar_ok else 1, False),

@@ -37,6 +37,7 @@ Zhefan Xu\*, Haoyu Shen\*, Xinming Han, Hanyu Jin, Kanlong Ye, and Kenji Shimada
 - **2025-02-28:** The GitHub code, video demos, and relavant papers for our LV-DOT framework are released. The authors will actively maintain and update this repo!
 
 ## Table of Contents
+- [ROS 2 rover_rl Integration](#ros-2-rover_rl-integration)
 - [Installation Guide](#I-Installation-Guide)
 - [Run Demo](#II-Run-Demo)
     - [Run on dataset](#a-Run-on-dataset)
@@ -44,6 +45,153 @@ Zhefan Xu\*, Haoyu Shen\*, Xinming Han, Hanyu Jin, Kanlong Ye, and Kenji Shimada
 - [LV-DOT Framework and Results](#III-LV-DOT-Framework-and-Results)
 - [Citation and Reference](#IV-Citation-and-Reference)
 - [Acknowledgement](#V-Acknowledgement)
+
+
+## ROS 2 `rover_rl` Integration
+
+> This section documents the ROS 2 Humble version integrated in this workspace. The
+> original upstream installation and demo instructions below describe ROS 1.
+
+### Input and processing flow
+
+The detector uses the topics configured in
+`onboard_detector/cfg/detector_param.yaml`. The current rover configuration uses:
+
+- LiDAR point cloud: `/velodyne_points`
+- Robot odometry: `/odom`, or `/ndt_pose` when pose mode is selected
+- Color image: `/camera/camera/color/image_raw`
+- Optional depth image: `/camera/camera/depth/image_rect_raw`
+
+LiDAR point clouds are synchronized with pose/odometry. The pose from the current
+synchronized sample is applied before transforming that same cloud; pose matrices,
+vectors, timestamps, sequence counters, and readiness flags are initialized before
+use. Tracking and velocity estimation use the LiDAR measurement timestamp and the
+actual sensor `dt` rather than assuming a fixed timer period.
+
+The near-field LiDAR cutoff is currently:
+
+```yaml
+lidar_min_range: 0.5
+```
+
+Points with XY range below 0.5 m are rejected. Reducing the old 0.9 m cutoff improves
+near-field coverage, but the robot body, wheels, and sensor mount must be checked for
+self-reflections on the real platform.
+
+### Formal detector output API
+
+`MarkerArray` is visualization-only and must not be used as the detector data API.
+Consumers shall subscribe to:
+
+```text
+/onboard_detector/dynamic_obstacles
+```
+
+Message type:
+
+```text
+onboard_detector/msg/DynamicObstacleArray
+```
+
+`DynamicObstacleArray.header.stamp` is the LiDAR measurement timestamp, not the
+publication time. `header.frame_id` identifies the output coordinate frame.
+`source_valid=false` means the synchronized LiDAR/pose source is stale and consumers
+must immediately clear or stop coasting existing obstacles.
+
+Each `DynamicObstacle` contains:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Persistent track ID; it remains stable across matched frames but is reset after a detector restart. |
+| `position` | 3D obstacle center in `header.frame_id`. |
+| `velocity` | Estimated 3D velocity. |
+| `acceleration` | Estimated 3D acceleration. |
+| `size` | Bounding-box X/Y/Z dimensions. |
+| `classification` | Currently `person` or `unknown`. |
+| `source` | Currently `yolo_lidar` or `lidar`. |
+| `confidence` | Detection/classification confidence in the range 0..1. |
+| `is_moving` | Whether planar speed exceeds `dynamic_velocity_threshold`. |
+| `position_covariance` | Flattened row-major 2x2 XY covariance: xx, xy, yx, yy. |
+| `velocity_covariance` | Flattened row-major 2x2 XY velocity covariance. |
+
+RViz/TUI marker topics remain available for debugging, but downstream navigation,
+VO, logging, and safety nodes should use the timestamped message above.
+
+### Stale-source and ghost-obstacle handling
+
+The detector publishes `source_valid=false` when synchronized LiDAR/pose input exceeds
+`detection_stale_timeout` (currently 0.5 s). The `vo_interface` has an independent
+monotonic receive timeout, `source_timeout_s` (currently 0.5 s), covering the case
+where the detector topic disappears completely. Either condition clears all tracks,
+preventing the interface from publishing indefinitely extrapolated ghost obstacles.
+
+### YOLO lifetime and LiDAR association
+
+YOLO detections retain the original image timestamp and confidence. A result is used
+only when all of the following conditions hold:
+
+- receive age is at most `yolo_ttl` (currently 0.25 s);
+- image-to-LiDAR timestamp error is at most `yolo_sync_tolerance` (currently 0.15 s);
+- the projected 3D box and 2D YOLO box satisfy `yolo_bbox_iou_threshold` (currently 0.1).
+
+This prevents a stale image detection from repeatedly labeling later LiDAR boxes.
+YOLO only classifies objects inside the camera field of view; an obstacle outside that
+view may still be detected by LiDAR but is normally reported as `unknown`/`lidar`.
+
+### Tracking behavior
+
+Frame-to-frame association uses global one-to-one Hungarian assignment with position
+and size gates. A previous track can match at most one current detection, and vice
+versa. New detections receive new persistent IDs; matched detections inherit the old
+ID. When no detections remain, bounding boxes, histories, and Kalman filters are
+cleared together. Kalman transition and process-noise matrices use the actual bounded
+sensor `dt`.
+
+This is deterministic hard assignment, not a full probabilistic JPDA implementation.
+Crossing targets, prolonged occlusion, sparse point clouds, or abrupt shape changes
+can still cause an ID switch.
+
+### Can LV-DOT detect dynamic obstacles in every direction?
+
+LiDAR geometric detection operates over every direction present in the received point
+cloud. With a correctly mounted 360-degree LiDAR and valid calibration, it can detect
+and track obstacles around the robot, including outside the camera view. This is not
+an unconditional guarantee of detecting every dynamic object. Coverage is limited by:
+
+- the physical LiDAR field of view, blind zones, minimum/maximum range, and mounting;
+- occlusion and insufficient returns from small, thin, dark, low, or distant objects;
+- ground/roof filtering, voxel downsampling, DBSCAN thresholds, and size constraints;
+- pose/odometry timing and calibration accuracy;
+- the track history required to distinguish genuine motion from point-cloud jitter.
+
+Only the camera-covered region receives YOLO semantic confirmation, and the current
+semantic classes are limited to `person` and `unknown`. The published covariance is
+planar XY rather than a full 3D covariance.
+
+### Build and verification
+
+Build the ROS 2 integration with:
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-up-to vo_interface --symlink-install \
+  --allow-overriding onboard_detector vo_interface
+source install/setup.bash
+```
+
+Inspect the generated API and live output with:
+
+```bash
+ros2 interface show onboard_detector/msg/DynamicObstacleArray
+ros2 topic echo /onboard_detector/dynamic_obstacles
+ros2 topic hz /onboard_detector/dynamic_obstacles
+```
+
+The current implementation has been compile-checked, Python syntax-checked, and
+tested for immediate track clearing on `source_valid=false` and receive timeout. The
+repository currently contains no package unit tests for these paths. Real-hardware
+regression testing is still required, especially for 0.5 m self-reflections, crossing
+targets, occlusion, ID stability, and sensor-drop recovery.
 
 
 ## I. Installation Guide
@@ -140,4 +288,3 @@ If our work is useful to your research, please consider citing our paper.
 ```
 ## V. Acknowledgement
 The authors would like to express their sincere gratitude to Professor Kenji Shimada for his great support and all CERLAB UAV team members who contribute to the development of this research.
-

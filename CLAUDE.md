@@ -7,6 +7,19 @@
 > deploy_full.launch.py 可一次啟動完整棧（NDT + routing + RL policy）。
 > 技術細節參見 `ARCHITECTURE.md`。
 
+## 穩定版本快照（2026-07-14）
+
+- **Git tag：`stable-2026-07-14`**（分支 `rover-7-10-demo01`）。這是 2026-07-14
+  實車測試後確認行為良好的 LV-DOT + MPPI + VO + recovery 導航安全棧版本。
+- 回復時不要移動 tag；使用 `git fetch --tags` 後執行
+  `git switch -c restore-stable-20260714 stable-2026-07-14`，從固定版本另開分支驗證。
+- 此快照保存程式、參數、文件、LV-DOT 正式訊息介面、診斷腳本與 observation spec；
+  不包含本地 `backups/`、相機暫存圖及未追蹤訓練 checkpoint。
+- **已知未解問題**：`/campusrover_driver → /odom` 曾反覆斷流 0.6–2.9 秒，最長監測
+  58.195 秒（LV-DOT 同步中斷累積約 61.8 秒），恢復時會 burst 補送；其後曾連續約
+  2 分鐘穩定在 20 Hz。LV-DOT/vo_interface 的清空 track 是預期保護行為，但此 tag
+  代表「目前測試行為良好」，不代表 odom 上游問題已修復。
+
 ## 語言偏好
 
 - 所有回覆、log、註解一律 **繁體中文**
@@ -967,14 +980,15 @@ lv-dot_stop     # 停掉 detector + yolo + vo + launch（已含全部）
 | Topic | Type | 說明 |
 |---|---|---|
 | `/onboard_detector/dynamic_bboxes` | MarkerArray | 動態障礙框（藍，已分類為 dynamic），frame=**odom**（vis_frame）|
+| `/onboard_detector/dynamic_obstacles` | `onboard_detector/DynamicObstacleArray` | **正式資料介面**：量測 stamp、持久 ID、位置/速度/加速度、尺寸、類別/來源、confidence、協方差 |
 | `/onboard_detector/dynamic_point_cloud` | PointCloud2 | 動態點雲 |
 | `/vo_interface/tracked_obstacles` | `vo_interface/TrackedObstacleArray` | **給 VO 規劃器**：持久 ID/平滑速度/協方差/age |
 | `/vo_interface/markers` | MarkerArray | RViz 視覺化（粉紅速度箭頭 + ID/age 文字）|
 
 `TrackedObstacle.msg` 欄位：`id`(持久) `age`(秒) `position` `velocity`(平滑絕對速度,odom frame)
 `size` `radius`(=0.5·hypot(x,y),Minkowski 用) `vel_confidence`(0~1) `position/velocity_covariance[4]`(PVO 用)。
-vo_interface 純訂閱 dynamic_bboxes、自做 CV-Kalman 重追蹤（LV-DOT 原生 box.id 是每幀索引非持久，
-且 LiDAR-only 速度偏跳）；KF coasting 還會補平 dynamic_bboxes 的斷續發布 → VO 拿到連續障礙物流。
+vo_interface 訂閱正式的 `dynamic_obstacles`，以 LV-DOT 持久 ID 做 CV-Kalman 平滑；輸入 topic
+中斷超過 0.5s 會清空 track，避免永久定速鬼影。`dynamic_bboxes` 僅保留給 RViz/TUI。
 
 ### RViz
 

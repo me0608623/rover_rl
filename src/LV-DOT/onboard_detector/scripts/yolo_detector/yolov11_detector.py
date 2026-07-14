@@ -10,6 +10,7 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import Float64
 from vision_msgs.msg import Detection2DArray
 from vision_msgs.msg import Detection2D
+from vision_msgs.msg import ObjectHypothesisWithPose
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
@@ -50,6 +51,7 @@ class yolo_detector(Node):
 
     def image_callback(self, msg):
         self.img = self.br.imgmsg_to_cv2(msg, "bgr8")
+        self.img_header = msg.header
         self.img_received = True
 
     def detect_callback(self):
@@ -77,8 +79,13 @@ class yolo_detector(Node):
                     bbox_msg.bbox.center.position.y = float(detected_box[1])
                     bbox_msg.bbox.size_x = float(abs(detected_box[2] - detected_box[0]))
                     bbox_msg.bbox.size_y = float(abs(detected_box[3] - detected_box[1]))
+                    hyp = ObjectHypothesisWithPose()
+                    hyp.hypothesis.class_id = "person"
+                    hyp.hypothesis.score = float(detected_box[5])
+                    bbox_msg.results.append(hyp)
                     bboxes_msg.detections.append(bbox_msg)
-            bboxes_msg.header.stamp = self.get_clock().now().to_msg()
+            # 保留來源影像的量測時間，供 2D↔3D 時間同步；不能用推論完成時間取代。
+            bboxes_msg.header = self.img_header
             self.bbox_pub.publish(bboxes_msg)
 
     def inference(self, ori_img):
@@ -108,7 +115,7 @@ class yolo_detector(Node):
             category = LABEL_NAMES[int(output[2][i])]
             x1, y1 = int(box[0] * W), int(box[1] * H)
             x2, y2 = int(box[2] * W), int(box[3] * H)
-            detected_box = [x1, y1, x2, y2, category]
+            detected_box = [x1, y1, x2, y2, category, float(obj_score)]
             detected_boxes.append(detected_box)
 
             cv2.rectangle(ori_img, (x1, y1), (x2, y2), (255, 255, 0), 2)

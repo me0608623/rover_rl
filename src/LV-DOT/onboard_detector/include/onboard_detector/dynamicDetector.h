@@ -38,6 +38,7 @@
 #include <onboard_detector/kalmanFilter.h>
 #include <onboard_detector/utils.h>
 #include <onboard_detector/srv/get_dynamic_obstacles.hpp>
+#include <onboard_detector/msg/dynamic_obstacle_array.hpp>
 
 namespace onboardDetector{
     typedef sensor_msgs::msg::Image ImageMsg;
@@ -84,6 +85,7 @@ namespace onboardDetector{
         rclcpp::Publisher<MarkerArrayMsg>::SharedPtr filteredBBoxesPub_;
         rclcpp::Publisher<MarkerArrayMsg>::SharedPtr trackedBBoxesPub_;
         rclcpp::Publisher<MarkerArrayMsg>::SharedPtr dynamicBBoxesPub_;
+        rclcpp::Publisher<onboard_detector::msg::DynamicObstacleArray>::SharedPtr dynamicObstaclesPub_;
         rclcpp::Publisher<PointCloud2Msg>::SharedPtr filteredDepthPointsPub_;
         rclcpp::Publisher<PointCloud2Msg>::SharedPtr lidarClustersPub_;
         rclcpp::Publisher<PointCloud2Msg>::SharedPtr filteredPointsPub_;
@@ -178,15 +180,15 @@ namespace onboardDetector{
 
         // SENSOR DATA
         cv::Mat depthImage_;
-        Eigen::Vector3d position_; // robot position
-        Eigen::Matrix3d orientation_; // robot orientation
-        Eigen::Vector3d positionDepth_; // depth camera position
-        Eigen::Matrix3d orientationDepth_; // depth camera orientation
-        Eigen::Vector3d positionColor_; // color camera position
-        Eigen::Matrix3d orientationColor_; // color camera orientation
-        Eigen::Vector3d positionLidar_; // color camera position
-        Eigen::Matrix3d orientationLidar_; // color camera orientation
-        bool hasSensorPose_ = true;
+        Eigen::Vector3d position_ = Eigen::Vector3d::Zero(); // robot position
+        Eigen::Matrix3d orientation_ = Eigen::Matrix3d::Identity(); // robot orientation
+        Eigen::Vector3d positionDepth_ = Eigen::Vector3d::Zero(); // depth camera position
+        Eigen::Matrix3d orientationDepth_ = Eigen::Matrix3d::Identity(); // depth camera orientation
+        Eigen::Vector3d positionColor_ = Eigen::Vector3d::Zero(); // color camera position
+        Eigen::Matrix3d orientationColor_ = Eigen::Matrix3d::Identity(); // color camera orientation
+        Eigen::Vector3d positionLidar_ = Eigen::Vector3d::Zero(); // lidar position
+        Eigen::Matrix3d orientationLidar_ = Eigen::Matrix3d::Identity(); // lidar orientation
+        bool hasSensorPose_ = false;
         Eigen::Vector3d localSensorRange_ {5.0, 5.0, 5.0};
         Eigen::Vector3d localLidarRange_ {10.0, 10.0, 5.0};
         double lidarMinRange_ = 0.0;
@@ -195,6 +197,13 @@ namespace onboardDetector{
         int dynamicMinDispFrames_ = 6;
         double staleTimeout_ = 0.5;
         std::chrono::steady_clock::time_point lastSyncTime_ = std::chrono::steady_clock::now();
+        rclcpp::Time detectionStamp_ {0, 0, RCL_ROS_TIME};
+        rclcpp::Time previousDetectionStamp_ {0, 0, RCL_ROS_TIME};
+        double currentDt_ = 0.05;
+        uint64_t lidarSequence_ = 0;
+        uint64_t processedLidarSequence_ = 0;
+        uint64_t publishedDynamicSequence_ = 0;
+        bool publishedStaleEmpty_ = false;
 
         //LIDAR DATA
         PointCloud2Msg::ConstSharedPtr latestCloud_;
@@ -222,7 +231,8 @@ namespace onboardDetector{
         std::vector<onboardDetector::box3D> dynamicBBoxes_; // boxes classified as dynamic
 
         // TRACKING AND ASSOCIATION DATA
-        bool newDetectFlag_;
+        bool newDetectFlag_ = false;
+        uint32_t nextTrackId_ = 1;
         std::vector<std::deque<onboardDetector::box3D>> boxHist_; // data association result: history of filtered bounding boxes for each box in current frame
         std::vector<std::deque<std::vector<Eigen::Vector3d>>> pcHist_; // data association result: history of filtered pc clusteres for each pc cluster in current frame
         std::vector<std::deque<Eigen::Vector3d>> pcCenterHist_; 
@@ -230,6 +240,11 @@ namespace onboardDetector{
 
         // YOLO RESULTS
         vision_msgs::msg::Detection2DArray yoloDetectionResults_; // yolo detected 2D results
+        rclcpp::Time yoloDetectionStamp_ {0, 0, RCL_ROS_TIME};
+        std::chrono::steady_clock::time_point lastYoloReceiveTime_ = std::chrono::steady_clock::time_point::min();
+        double yoloTtl_ = 0.25;
+        double yoloSyncTolerance_ = 0.15;
+        double yoloBBoxIouThreshold_ = 0.1;
         cv::Mat detectedColorImage_;
 
     public:
@@ -305,6 +320,7 @@ namespace onboardDetector{
         void publish3dBox(const std::vector<onboardDetector::box3D>& bboxes, const rclcpp::Publisher<MarkerArrayMsg>::SharedPtr& publisher, double r, double g, double b);
         void publishHistoryTraj();
         void publishVelVis();
+        void publishDynamicObstacles();
         void publishLidarClusters();
         void publishFilteredPoints();
         void publishRawDynamicPoints();

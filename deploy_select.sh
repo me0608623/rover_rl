@@ -116,31 +116,5 @@ deploy_rl_select() {
         esac
     fi
 
-    # ── 滿血版追問（僅在「VO 確實啟用」、且命令列未自帶 VO 相關參數時）──────
-    # 滿血版 = 獨立的 vo_params_full.yaml（engage_range=4m 內由 VO 全權避障/停讓、側向切入
-    # 提早繞行；導航主要交 RL）。與預設 vo_params.yaml 完全獨立，換 yaml 就換行為。
-    # ⚠ guard 三條缺一不可：
-    #   1. VO_ARG 互動選成 enable_vo:=true（選 N 關 VO 就不該問滿血版）
-    #   2. 命令列沒帶 enable_vo:=（帶了代表使用者在腳本化控制 VO，VO 詢問已跳過，此處也應跳過，
-    #      否則使用者明明 enable_vo:=false 卻仍被追問滿血版 → 邏輯/UX 錯，Codex 抓到）
-    #   3. 命令列沒帶 vo_params_file:=（尊重覆寫）
-    if [ "$VO_ARG" = "enable_vo:=true" ] \
-       && ! printf '%s\n' "$@" | grep -qE '^enable_vo:=' \
-       && ! printf '%s\n' "$@" | grep -qE '^vo_params_file:='; then
-        local FULL_YAML="$CFG_DIR/vo_params_full.yaml"
-        if [ -f "$FULL_YAML" ]; then
-            echo "┌─ VO 滿血版（4m 全權避障 + 側向提早繞行）──────────────────────"
-            echo "│ engage_range 1m→4m、預測更久、遇堵改積極鑽縫繞行（非硬停）。"
-            echo "│ 導航仍交 RL；靜態牆仍由 RL sweep。與預設 VO 設定完全獨立、原檔不動。"
-            echo "└──────────────────────────────────────────────────────────────"
-            local FULL_SEL
-            read -rp "是否使用 VO 滿血版？[y/N]（Enter=用預設保守版） " FULL_SEL
-            case "$FULL_SEL" in
-                [Yy]*) EXTRA_ARGS+=("vo_params_file:=$FULL_YAML")
-                       echo "[$TAG] VO：滿血版（vo_params_full.yaml，engage_range=4m）" ;;
-                *)     echo "[$TAG] VO：預設保守版（vo_params.yaml，engage_range=1m）" ;;
-            esac
-        fi
-    fi
     return 0
 }
