@@ -178,6 +178,110 @@ class Bundle(nn.Module):
         return logits, new_hidden
 
 
+class E2EBundle(nn.Module):
+    """Clean end-to-end frame-stack policy bundle（stateless RNN bypass）。
+
+    這是 clean_progress e2e PPO（SA4 c89600 等）的部署封裝：RNN 被繞過，時序資訊
+    改由「4 幀 LiDAR 疊幀」在 CNN 底層處理。recurrent state = lidar_hist
+    [B, (K-1)*72]，每步 prepend 當前 normed LiDAR、丟最舊一幀；episode reset 時
+    車端歸零。
+
+    forward 介面刻意與 Bundle 相同 (obs_raw, state) → (logits, new_state)，讓車端
+    PolicyRunner 用同一條 step 路徑，只有 state 形狀與重置維度不同。
+
+    meta 佈局（7 entries，前 5 與 RNN Bundle 對齊，末 2 為 e2e 專用）：
+        [raw_obs_dim, used_obs_dim, lidar_hist_dim, 0, total_logits, 1(e2e flag), frame_stack]
+    車端讀 meta[5]==1 判定 e2e、meta[2] 取得 lidar_hist 維度、meta[6] 取得 frame_stack。
+    """
+
+    def __init__(self, preprocess, extractor, policy, raw_obs_dim, used_obs_dim,
+                 frame_stack, total_logits):
+        super().__init__()
+        self.preprocess = preprocess
+        self.extractor = extractor
+        self.policy = policy
+        lidar_hist_dim = (int(frame_stack) - 1) * 72
+        self.register_buffer(
+            "_meta_dims",
+            torch.tensor([raw_obs_dim, used_obs_dim, lidar_hist_dim, 0,
+                          total_logits, 1, int(frame_stack)], dtype=torch.int64),
+        )
+
+    def forward(self, obs_raw: torch.Tensor, lidar_hist: torch.Tensor):
+        obs79 = self.preprocess(obs_raw)                        # [B, 79] normalize+slice
+        ext_in = torch.cat([obs79, lidar_hist], dim=-1)         # [B, 79+(K-1)*72]
+        feat = self.extractor(ext_in)                           # [B, 96]
+        cur_lidar = obs79[:, 6:78]                              # [B, 72] 當前 normed LiDAR
+        new_hist = torch.cat([cur_lidar, lidar_hist[:, :-72]], dim=-1)  # prepend,丟最舊
+        rl_in = torch.cat([obs79, feat], dim=-1)                # [B, 175]
+        logits = self.policy(rl_in)                             # [B, 38]
+        return logits, new_hist
+
+
+def _export_e2e(args, ckpt, cfg, mm, mean, std, frame_stack):
+    """匯出 clean e2e frame-stack policy → E2EBundle TorchScript。"""
+    K = int(frame_stack)
+    if K < 2:
+        raise ValueError(f"e2e 需 lidar_frame_stack>=2，得到 {K}")
+    if "feat_normalizer" in ckpt:
+        raise ValueError("e2e 契約假設 feat_norm=false（無 feat_normalizer）")
+
+    include_act = cfg["raw_obs_dim"] == 83
+    extractor = mm.LidarStateExtractor(include_act_hist=include_act, frame_stack=K)
+    head_input_dim = cfg["used_obs_dim"] + extractor.output_dim   # 79 + 96 = 175
+    policy_head = mm.PolicyHead(input_dim=head_input_dim)
+    extractor.load_state_dict(ckpt["extractor"])
+    policy_head.load_state_dict(ckpt["policy_head"])
+
+    pre = PreprocessNormalizer(mean, std, cfg["policy_indices"]).train(False)
+    ext = extractor.train(False)
+    pol = PolicyOnly(policy_head.train(False)).train(False)
+
+    lidar_hist_dim = (K - 1) * 72
+    ext_in_dim = cfg["used_obs_dim"] + lidar_hist_dim
+    sample_raw = torch.zeros(1, cfg["raw_obs_dim"])
+    sample_hist = torch.zeros(1, lidar_hist_dim)
+    with torch.no_grad():
+        traced_pre = torch.jit.trace(pre, sample_raw)
+        traced_ext = torch.jit.trace(ext, torch.zeros(1, ext_in_dim))
+        traced_pol = torch.jit.trace(pol, torch.zeros(1, head_input_dim))
+
+    bundle = E2EBundle(
+        preprocess=traced_pre, extractor=traced_ext, policy=traced_pol,
+        raw_obs_dim=cfg["raw_obs_dim"], used_obs_dim=cfg["used_obs_dim"],
+        frame_stack=K, total_logits=2 * 19,
+    )
+    scripted = torch.jit.script(bundle)
+    out_path = Path(args.output).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    scripted.save(str(out_path))
+
+    reloaded = torch.jit.load(str(out_path))
+    with torch.no_grad():
+        logits, new_hist = reloaded(sample_raw, sample_hist)
+    assert logits.shape == (1, 38), f"logits {logits.shape}"
+    assert new_hist.shape == (1, lidar_hist_dim), f"hist {new_hist.shape}"
+    print(f"[OK] exported E2E bundle: {out_path}")
+    print(f"     raw_obs={cfg['raw_obs_dim']} → used={cfg['used_obs_dim']}, "
+          f"frame_stack={K}, lidar_hist={lidar_hist_dim}, rl_in={head_input_dim}, "
+          f"logits=38 (RNN bypassed)")
+
+    act_hist_mode = _infer_act_hist_mode(ckpt, args.act_hist_mode)
+    spec = _build_obs_spec(cfg, act_hist_mode)
+    spec["model_file"] = out_path.name
+    spec["end_to_end_frame_stack"] = True
+    spec["frame_stack"] = K
+    spec["lidar_hist_dim"] = lidar_hist_dim
+    spec["rl_input_dim"] = head_input_dim
+    spec["experiment_config"] = str((ckpt.get("args", {}) or {}).get("experiment_config", ""))
+    stem = out_path.with_suffix("")
+    json_path = stem.with_name(stem.name + ".obs_spec.json")
+    md_path = stem.with_name(stem.name + ".obs_spec.md")
+    json_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
+    md_path.write_text(_spec_to_markdown(spec, out_path.name), encoding="utf-8")
+    print(f"     act_hist_mode={act_hist_mode}  spec→ {json_path.name} / {md_path.name}")
+
+
 def _autodetect(ckpt: dict, overrides: dict) -> dict:
     """從 checkpoint 的 args 與 obs_normalizer 形狀自動推斷網路架構參數.
 
@@ -346,6 +450,25 @@ def export(args):
             print(f"      {k}: {v}")
 
     mm = _load_training_models()
+
+    # ── clean e2e frame-stack policy（clean_progress PPO）：RNN bypass，走專用匯出路徑 ──
+    _ck_args = ckpt.get("args", {}) or {}
+    if bool(_ck_args.get("end_to_end_frame_stack", False)):
+        _K = int(_ck_args.get("lidar_frame_stack", 1))
+        _norm = ckpt.get("obs_normalizer", {})
+        if _norm and "mean" in _norm:
+            _mean = _norm["mean"].float().cpu()
+            _std = _norm["var"].float().cpu().sqrt()
+        else:
+            print("[WARN] no obs_normalizer; identity (mean=0, std=1)")
+            _mean = torch.zeros(cfg["raw_obs_dim"])
+            _std = torch.ones(cfg["raw_obs_dim"])
+        if _mean.numel() != cfg["raw_obs_dim"]:
+            raise ValueError(f"normalizer dim {_mean.numel()} != raw_obs_dim {cfg['raw_obs_dim']}")
+        print(f"[CFG] end_to_end_frame_stack detected (K={_K}) → E2EBundle export path")
+        _export_e2e(args, ckpt, cfg, mm, _mean, _std, _K)
+        return
+
     # v3c (raw=83) 用 11D state_mlp（含 4D action history）；79/139 舊架構用 7D state。
     # include_act_hist 必須與 checkpoint 的 state_mlp 輸入維度一致，否則 load_state_dict 形狀不符。
     extractor = mm.LidarStateExtractor(include_act_hist=(cfg["raw_obs_dim"] == 83))

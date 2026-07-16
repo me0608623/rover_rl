@@ -37,6 +37,11 @@ class PolicyBundle:
     preprocess_dim: int
     total_logits: int
     device: torch.device
+    # E2E frame-stack 專用（RNN bundle 用預設）：
+    end_to_end: bool = False
+    lidar_hist_dim: int = 0
+    frame_stack: int = 1
+    blob: object = None
 
 
 def load_bundle(path: str | Path, device: str = "cpu") -> PolicyBundle:
@@ -46,44 +51,63 @@ def load_bundle(path: str | Path, device: str = "cpu") -> PolicyBundle:
 
     dev = torch.device(device)
     blob = torch.jit.load(str(p), map_location=dev)
+    blob.train(False)
 
     meta = blob._meta_dims.cpu().tolist()
+    # meta 佈局：RNN bundle = 5 entries；E2E bundle = 7 entries，末 2 = [e2e_flag, frame_stack]。
+    end_to_end = len(meta) >= 7 and int(meta[5]) == 1
+    # E2E bundle 無 rnn 子模組（RNN 被繞過），且 meta[2]=lidar_hist_dim(216) 而非 hidden_dim。
+    rnn_mod = None if end_to_end else blob.rnn.train(False)
     return PolicyBundle(
-        preprocess=blob.preprocess.eval(),
-        extractor=blob.extractor.eval(),
-        rnn=blob.rnn.eval(),
-        policy=blob.policy.eval(),
+        preprocess=blob.preprocess.train(False),
+        extractor=blob.extractor.train(False),
+        rnn=rnn_mod,
+        policy=blob.policy.train(False),
         raw_obs_dim=int(meta[0]),
         used_obs_dim=int(meta[1]),
-        hidden_dim=int(meta[2]),
+        hidden_dim=int(meta[2]),            # e2e：= lidar_hist_dim (216)
         preprocess_dim=int(meta[3]),
         total_logits=int(meta[4]),
         device=dev,
+        end_to_end=end_to_end,
+        lidar_hist_dim=(int(meta[2]) if end_to_end else 0),
+        frame_stack=(int(meta[6]) if end_to_end else 1),
+        blob=blob,
     )
 
 
 class PolicyRunner:
-    """單 env 推論 wrapper，含 hidden state 維護."""
+    """單 env 推論 wrapper，維護 recurrent state（RNN=hidden；E2E=LiDAR 疊幀 buffer）."""
 
     def __init__(self, bundle: PolicyBundle):
         self.bundle = bundle
-        self.hidden = torch.zeros(
-            1, 1, bundle.hidden_dim, device=bundle.device, dtype=torch.float32
-        )
+        if bundle.end_to_end:
+            # E2E：state = lidar_hist [1, (K-1)*72]，2D；取代 RNN hidden。
+            self.state = torch.zeros(
+                1, bundle.lidar_hist_dim, device=bundle.device, dtype=torch.float32
+            )
+        else:
+            # RNN：hidden [1, 1, H]，3D。
+            self.state = torch.zeros(
+                1, 1, bundle.hidden_dim, device=bundle.device, dtype=torch.float32
+            )
         # 診斷用 telemetry（不影響推論）
         self.reset_count = 0
         self.step_count = 0
 
     def reset(self) -> None:
-        # 收到新 goal/path、切 mode、換模型時呼叫：清掉 RNN 對「上一段 episode」的
-        # 記憶，否則殘留 hidden 會讓 policy 帶著舊情境的動量做新任務（行為錯亂）。
-        self.hidden.zero_()
+        # 收到新 goal/path、切 mode、換模型時呼叫：清掉 recurrent state（RNN 記憶 或
+        # LiDAR 疊幀歷史），否則殘留 state 會讓 policy 帶著上一段情境做新任務（行為錯亂）。
+        self.state.zero_()
         self.reset_count += 1
         self.step_count = 0
 
     def hidden_norm(self) -> float:
-        """hidden state L2 norm；0=剛重置/待命，>0=episode 內累積記憶中。"""
-        return float(self.hidden.norm().item())
+        """recurrent state L2 norm；0=剛重置/待命，>0=episode 內累積中。
+
+        RNN：hidden 記憶量；E2E：LiDAR 疊幀 buffer 填充量（reset 後幾步內從 0 爬升）。
+        """
+        return float(self.state.norm().item())
 
     @torch.no_grad()
     def step(self, obs_raw_np: np.ndarray) -> np.ndarray:
@@ -95,13 +119,18 @@ class PolicyRunner:
                 f"— bundle expects raw_obs_dim={b.raw_obs_dim}"
             )
         raw = torch.from_numpy(obs_raw_np.astype(np.float32)).unsqueeze(0).to(b.device)
-        obs79 = b.preprocess(raw)                              # [1, 79]（含 normalize + 139→79 slice）
-        feat = b.extractor(obs79)                              # [1, 96]
-        # RNN 吃上一步的 hidden 並回傳新的；逐步覆寫以在整段 episode 內延續時序記憶
-        preprocess, new_hidden = b.rnn(feat, self.hidden)      # [1, P], [1, 1, H]
-        self.hidden = new_hidden
-        # policy head 同時看「當下 obs79」與「RNN 摘要 preprocess」，故 cat 後再餵
-        rl_input = torch.cat([obs79, preprocess], dim=-1)      # [1, 79+P]
-        logits = b.policy(rl_input)                            # [1, 38]
+        if b.end_to_end:
+            # E2E bundle.forward(obs_raw, lidar_hist) → (logits, new_hist)。
+            # 內含 normalize+slice → 4 幀 LiDAR CNN → cat(obs79, feat96) → policy（RNN 繞過）。
+            logits, self.state = b.blob(raw, self.state)          # [1, 38], [1, 216]
+        else:
+            obs79 = b.preprocess(raw)                             # [1, 79]（normalize + 139→79 slice）
+            feat = b.extractor(obs79)                             # [1, 96]
+            # RNN 吃上一步的 hidden 並回傳新的；逐步覆寫以在整段 episode 內延續時序記憶。
+            preprocess, new_hidden = b.rnn(feat, self.state)      # [1, P], [1, 1, H]
+            self.state = new_hidden
+            # policy head 同時看「當下 obs79」與「RNN 摘要 preprocess」，故 cat 後再餵。
+            rl_input = torch.cat([obs79, preprocess], dim=-1)     # [1, 79+P]
+            logits = b.policy(rl_input)                           # [1, 38]
         self.step_count += 1
         return logits.squeeze(0).cpu().numpy()
