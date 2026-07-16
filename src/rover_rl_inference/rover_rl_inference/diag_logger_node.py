@@ -101,6 +101,10 @@ CSV_FIELDS = [
     # 三層速度 + 延遲（來自 /rover_rl_policy/status）：rl=RL意圖, sent=濾波後送出, act=odom實測
     "rl_v", "rl_w", "sent_v", "sent_w", "act_v", "act_w",
     "v_over", "w_over", "lag_ms", "lag_corr", "lag_ch",      # 飽和旗標 / 延遲估計值
+    # ★e2e CNN/RNN state 健康（來自 policy status，判 CNN 有否吃到新鮮連續幀）：
+    #   rnn_norm=疊幀buffer/hidden L2(reset~0填滿穩定)、buf_fill=非零比例(暖機/掉幀)、
+    #   frame_motion=||幀t−幀t-1||(車動卻恆0→幀卡,CNN退化單幀)、cnn_e2e=1為e2e、rnn_steps/resets=計數。
+    "rnn_norm", "buf_fill", "frame_motion", "cnn_e2e", "rnn_steps", "rnn_resets",
     # VO 安全層（來自 /vo_safety_node/status）：本次有沒有走 VO + 本拍 VO 有沒有在動手。
     # vo_active=0 整段 → 這次 policy 沒接 VO（enable_vo:=false），cmd 即 RL 直出；
     # vo_active=1 但 vo_intervening=0 → VO 在線但只放行+slew（前方無障礙時的起步 sin 波屬此類）。
@@ -892,6 +896,12 @@ class DiagLoggerNode(Node):
                     row[k] = v
             row["v_over"] = int(bool(st.get("v_over")))
             row["w_over"] = int(bool(st.get("w_over")))
+            # e2e CNN/RNN buffer 健康欄
+            for _k in ("rnn_norm", "rnn_steps", "rnn_resets", "buf_fill", "frame_motion"):
+                _v = st.get(_k)
+                if _v is not None:
+                    row[_k] = _v
+            row["cnn_e2e"] = int(bool(st.get("cnn_e2e")))
 
         # VO 安全層：node 在線(<1s 內有 status)=active；用其 status 旗標標記本拍有沒有動手
         vo_active = self._vo is not None and (now - self._vo_t) < 1.0

@@ -109,6 +109,32 @@ class PolicyRunner:
         """
         return float(self.state.norm().item())
 
+    def cnn_diag(self) -> dict:
+        """E2E CNN 4 幀 LiDAR buffer 健康指標（RNN 模式回空 dict）。
+
+        供 deploy log 記錄，判 CNN 有沒有在正常吃到新鮮的連續幀：
+          cnn_e2e      = True（e2e 模式旗標）
+          buf_fill     = buffer 非零比例（0=剛 reset，→1=K-1 幀填滿；卡在低值=掉幀/暖機未完）
+          frame_motion = ||frame_t − frame_{t-1}||（buffer 前兩幀差 = CNN 實際看到的運動量；
+                         車在動卻恆 0 → 幀卡住/重複，4 幀 CNN 退化成單幀、失去運動編碼）
+        buf_norm 已由 hidden_norm() 提供（status 的 rnn_norm 欄）。
+        """
+        b = self.bundle
+        if not b.end_to_end:
+            return {}
+        st = self.state.reshape(-1)
+        lidar_len = 72
+        buf_fill = float((st.abs() > 1e-9).float().mean().item())
+        if st.numel() >= 2 * lidar_len:
+            frame_motion = float((st[:lidar_len] - st[lidar_len:2 * lidar_len]).norm().item())
+        else:
+            frame_motion = float(st[:lidar_len].norm().item())
+        return {
+            "cnn_e2e": True,
+            "buf_fill": round(buf_fill, 3),
+            "frame_motion": round(frame_motion, 3),
+        }
+
     @torch.no_grad()
     def step(self, obs_raw_np: np.ndarray) -> np.ndarray:
         """obs_raw[raw_obs_dim] → logits[38]."""

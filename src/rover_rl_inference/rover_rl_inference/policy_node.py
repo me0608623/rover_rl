@@ -176,6 +176,7 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_linear_velocity", 1.0)
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
+        self.declare_parameter("allow_reverse", False)
         # v3c 角速度 α slew 上限 (rad/s²)：0.0=不做 slew（79/139 舊模型）；v3c=3.0。
         # 對齊訓練端 discrete_differential_drive；用 v3c 時須同時把 act_max_angular_velocity 設 0.25π。
         self.declare_parameter("act_max_angular_accel", 0.0)
@@ -292,6 +293,7 @@ class PolicyNode(Node):
             dt=self.control_dt,
             max_angular_accel=float(gp("act_max_angular_accel").value),
         )
+        self.allow_reverse = bool(gp("allow_reverse").value)
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
         # action stacking 常數（是否啟用由 bundle.raw_obs_dim 決定，於 bundle 載入後設定）
         self.act_stack_size = max(1, int(gp("act_stack_size").value))
@@ -322,6 +324,7 @@ class PolicyNode(Node):
             alpha_angular=float(gp("cmd_alpha_angular").value),
             max_accel_linear=float(gp("cmd_max_accel_linear").value),
             max_accel_angular=float(gp("cmd_max_accel_angular").value),
+            min_linear_velocity=(-float("inf") if self.allow_reverse else 0.0),
         )
         self._initial_mode = gp("initial_mode").get_parameter_value().string_value or "nav"
 
@@ -1097,6 +1100,17 @@ class PolicyNode(Node):
             current_angular_vel=self._target_w,
         )
 
+        # RL policy 不直接負責安全倒車；倒車若要保留，應由明確 safety/recovery
+        # 狀態機在有 rear 感測與距離／時間上限時才下發。
+        if not self.allow_reverse and cmd_v < 0.0:
+            raw_cmd_v = cmd_v
+            cmd_v = 0.0
+            accel = (cmd_v - v) / max(act_eff.dt, 1e-6)
+            self.get_logger().warn(
+                f"RL negative vx clamped: {raw_cmd_v:.3f} -> 0.0",
+                throttle_duration_sec=2.0,
+            )
+
         with self._lock:
             self._last_accel = accel
             self._target_v = cmd_v
@@ -1312,6 +1326,8 @@ class PolicyNode(Node):
             "rnn_norm": round(self.runner.hidden_norm(), 2),
             "rnn_steps": self.runner.step_count,
             "rnn_resets": self.runner.reset_count,
+            # e2e CNN 4幀buffer健康：cnn_e2e/buf_fill/frame_motion（RNN模式為空dict不加欄）
+            **self.runner.cnn_diag(),
             "lidar_age": round(sweep_age, 3) if sweep_age != float("inf") else None,
             "lidar_src": sweep_src,
             "nearest_m": nearest_m,
