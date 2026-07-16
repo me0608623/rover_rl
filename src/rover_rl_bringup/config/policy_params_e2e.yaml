@@ -5,7 +5,7 @@ rover_rl_policy:
     #   模型 = sa4_e2e_fs4_cleanppo_89600.ts（RNN 繞過, stateless；4 幀 LiDAR 疊幀
     #   由 bundle/PolicyRunner 內部維護, policy_node 每 tick 只丟當前 79D obs, 透明）。
     #   obs 佈局/校準與 v3f 完全相同: 79D ego(4)+goal(2)+lidar(72)+time(1),
-    #   r_min=0.25 / r_max=20 / ω decode=1.2 / v_max=1.0 / a_max=0.5 / dt=0.2。
+    #   r_min=0.5 / r_max=20 / ω decode=1.2 / v_max=1.0 / a_max=0.5 / dt=0.2。
     #   raw_obs_dim==79 → policy_node 自動關 act_stack/act_hist（下方相關參數無作用）。
     #   ⚠ 上車前確認: (1) 每 tick 連續 79D obs 以 dt=0.2 進來(疊幀運動線索才對),
     #     (2) 首次架空 estop, deterministic=argmax, speed_rate 保守。
@@ -19,9 +19,9 @@ rover_rl_policy:
     # 與 v3e 的唯一差別: obs = 79D (act_hist 整段移除, CHARGE_USE_ACT_HIST=0 訓練)。
     #   → policy_node 偵測 bundle.raw_obs_dim==79 會自動關閉 action stacking / act_hist,
     #     故下方 act_stack_* / act_hist_* 參數對 v3f 不作用 (保留以共用 v3e 範本, 無害)。
-    # 校準與 v3e 相同: r_min=0.25, 動作 omega_max=1.2, obs omega 正規化=1.5。
+    # 校準與 v3e 相同: r_min=0.5, 動作 omega_max=1.2, obs omega 正規化=1.5。
     #   ⚠ tcadapt 部署卡片寫「normalize /10」是【文件筆誤】：已於 PC 端 charge_env_cfg_vlp16.py
-    #     實查 ObsTerm wd_like_sweep_72 → r_max=20.0 / r_robot=0.35 / r_min=0.25（無 /10、無 scale）。
+    #     實查 ObsTerm wd_like_sweep_72 → r_max=20.0 / r_robot=0.35 / r_min=0.5（無 /10、無 scale）。
     #     故 lidar 正規化沿用家族值 r_max=20（見 lidar_preprocessor_params_v3f.yaml），勿改成 10。
     # 79D obs 佈局: ego(4)+goal(2)+lidar(72)+time(1); 見 models/sa5_v3f_tcadapt_60000.obs_spec.md。
     # ════════════════════════════════════════════════════════════════
@@ -76,7 +76,7 @@ rover_rl_policy:
     # --- LiDAR 校準 ---
     lidar_yaw_offset_deg: 0.0         # velodyne_link 相對 base_link 無 yaw → 0
     lidar_z_filter_m: 0.5             # 訓練值；在 sensor frame |z|>0.5 過濾地板/天花板
-    lidar_r_min_m: 0.25               # ★ v3e 訓練值（=v3c，表面→人物中心 0.2 + 半徑 0.0515）
+    lidar_r_min_m: 0.5                # ★ e2e/LV-DOT 訓練值 wd_like_sweep_72 r_min=0.5(中心→障礙表面<0.5m判盲,對齊碰撞邊界)
     lidar_r_max_m: 20.0               # 最遠有效距離；>= 此值正規化為 1.0
 
     # --- Obs normalizer（必須與訓練一致；勿改） ---
