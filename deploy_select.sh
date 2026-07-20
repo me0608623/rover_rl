@@ -35,6 +35,7 @@ deploy_rl_select() {
                 base=$(basename "$f"); tag=""
                 [ "$f" = "$DEFAULT_TS" ] && tag=" ←預設"
                 case "$base" in
+                    *sa8_e2e*) tag="$tag  [★e2e clean-PPO｜SA8 k8 c89600（warp 14靜+6動,K8+future0.10+anti-spin0.15）⚠未畢業:crash-run iter700候選,四閘/情境待驗｜79D stateless｜8幀LiDAR CNN,RNN繞過｜r_min=0.5/ω_max=1.2｜自動帶 policy_params_e2e + lidar_preprocessor_params_e2e]";;
                     *e2e*) tag="$tag  [★e2e clean-PPO｜SA4 c89600 四閘全過(det SR97.6%)｜79D stateless｜4幀LiDAR CNN,RNN繞過｜r_min=0.5/ω_max=1.2｜自動帶 policy_params_e2e + lidar_preprocessor_params_e2e]";;
                     *tcadapt*) tag="$tag  [v3f 定版：79D TC1 走廊特化，帶 r_min=0.25 / ω_max=1.2 config]";;
                     *v3c*) tag="$tag  [v3c：自動帶 r_min=0.25 / ω_max=1.2 config]";;
