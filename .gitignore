@@ -23,7 +23,11 @@ __pycache__/
 # Models（不 commit 大檔，由 Release 或 LFS 管理；可單獨開白名單）
 models/*.ts
 models/*.pt
+models/**/*.pt          # PC 端 scp 過來的 checkpoint 資料夾（*.pt 只 match 第一層）
 !models/.gitkeep
+
+# 改動前的整棵手動備份快照（CLAUDE.md 安全條款 #5）；git 歷史已有原版，不入庫
+backups/
 
 # 診斷記錄（diag_logger 產出，實驗資料不入庫）
 logs/
