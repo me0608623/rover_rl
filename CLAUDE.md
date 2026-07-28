@@ -854,6 +854,9 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
 5. **cmd_delay 補償（2026-06-08 已實作）** — 實車實測：goal-following 時車頭 0.42Hz「舞龍舞獅」振盪。
    根因 = 底盤 cmd→實測死時間（diag 互相關，**ω 通道 ~0.2s = 1 控制步**；註：v 通道因等速直行訊號太平、互相關全平坦，所報 600ms 是假象，勿信）+ 5Hz 控制步 → policy 對 1 步前的舊車姿過度修正 → 延遲驅動極限環。
    實驗證明 `speed_rate` 降速**只治標**（0.3→0.2 擺幅僅 −20%、頻率不變）。
+   **端到端延遲預算分解見 `docs/延遲預算_端到端分解.md`**（2026-07-23）：S5 致動死時間 200±6ms
+   （三 bag 交叉驗證 r=0.99）、policy→輪子 ω 通道累計 ~336ms；工具 `scripts/latency_budget.py`
+   （離線 bag + 推論台架）與 `scripts/latency_probe.py`（線上 S1/S2/S3，需 LiDAR 在線，尚待量）。
    **解法（已加）**：`policy_node` 新增 `cmd_delay_comp_s` 參數（預設 0.0=關）。>0 時推論前用 odom 測得速度把車姿往前積分這麼多秒、重算 goal_body，讓 obs 對齊「動作生效時」的車姿（仿 spot_rl `fast_info_calculate`，但只動 goal_body 視角、不動 velocity obs/網路/動作上限；用測得速度非命令速度，因 ω 跟隨率僅 ~12%、用命令會過補）。
    可熱調：`ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2`；status JSON 有 `cmd_delay_comp_s` 可驗證。建議從 0.2 起、過大會領先過頭。
 6. **底盤 deadband 未知** — spot_rl 強制最小移動速度 `minimum_will_move_speed=0.14 m/s`（避免 policy 輸出微小速度但馬達不動）。rover_rl deadband 僅 0.02 m/s。若實車觀察到 policy 有輸出但輪子靜止，需量測實際底盤死區並調高 `cmd_alpha_linear` 或在 action_decoder 加 floor。

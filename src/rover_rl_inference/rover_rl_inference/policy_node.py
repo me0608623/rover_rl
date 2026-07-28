@@ -453,6 +453,10 @@ class PolicyNode(Node):
         _cmd_dt = 1.0 / max(self.cmd_rate_hz, 1.0)
         self.lag_v = LagEstimator(_cmd_dt)
         self.lag_w = LagEstimator(_cmd_dt)
+        # 端到端延遲預算用（S3 段）：每拍推論的純計算耗時、以及當拍所用 sweep 的新鮮度。
+        # 純觀測欄位，只寫進 status（→ TUI/bag/diag），不參與控制。
+        self._infer_ms: float | None = None
+        self._sweep_age_ms: float | None = None
         self.chassis_v_max = float(self.get_parameter("chassis_v_max").value)
         self.chassis_omega_max = float(self.get_parameter("chassis_omega_max").value)
         try:
@@ -918,6 +922,7 @@ class PolicyNode(Node):
             return
 
         now = time.monotonic()
+        t_perf0 = time.perf_counter()      # S3 純計算計時起點（obs build + forward + decode）
         # 先在鎖內快照所有共享狀態，後續重運算（推論）都在鎖外做，縮短臨界區
         with self._lock:
             sweep_pre = self._latest_sweep
@@ -1153,6 +1158,9 @@ class PolicyNode(Node):
             self._target_v = cmd_v
             self._target_w = cmd_w
             self._target_set_t = now
+            # 延遲預算 S3：這一拍的純計算耗時 + 用到的 sweep 已放多久（5Hz 取樣造成的老化）
+            self._infer_ms = (time.perf_counter() - t_perf0) * 1e3
+            self._sweep_age_ms = (sweep_age * 1e3) if math.isfinite(sweep_age) else None
 
         # action stacking（v3c）：把這一拍動作存進 history 供下一拍 obs。
         # 用 ×inv 把 act_eff 的 ×rate 縮放還原回 policy-frame（rate=1.0 時為 no-op），
@@ -1393,6 +1401,10 @@ class PolicyNode(Node):
             "chassis_w_max": self.chassis_omega_max,
             # 延遲（送出 cmd ↔ 實測）
             "lag_ms": lag_ms, "lag_corr": lag_corr, "lag_ch": lag_ch,
+            # 端到端延遲預算 S3：推論純計算 ms、當拍 sweep 新鮮度 ms（scripts/latency_budget.py 用）
+            "infer_ms": (round(self._infer_ms, 2) if self._infer_ms is not None else None),
+            "sweep_age_ms": (round(self._sweep_age_ms, 1)
+                             if self._sweep_age_ms is not None else None),
             # RNN hidden state（episode 內記憶）
             "rnn_norm": round(self.runner.hidden_norm(), 2),
             "rnn_steps": self.runner.step_count,
