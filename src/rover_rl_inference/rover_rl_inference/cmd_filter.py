@@ -24,6 +24,8 @@ class CmdFilterParams:
     # 真正停車的 deadband：|v| < deadband 直接設 0（避免 jitter）
     deadband_linear: float = 0.02
     deadband_angular: float = 0.02
+    # 倒車是否允許；static_guard/RL policy 測試可設為 0。
+    min_linear_velocity: float = -float("inf")
 
 
 class CmdFilter:
@@ -52,6 +54,15 @@ class CmdFilter:
         if dt <= 0:
             return self._last_v, self._last_w
 
+        # 先夾 target 與 filter 內部狀態，避免關閉倒車後仍因低通慣性
+        # 在數個 cmd tick 內繼續輸出負速度。
+        if target_v < p.min_linear_velocity:
+            target_v = p.min_linear_velocity
+        if self._smooth_v < p.min_linear_velocity:
+            self._smooth_v = p.min_linear_velocity
+        if self._last_v < p.min_linear_velocity:
+            self._last_v = p.min_linear_velocity
+
         # 1) Low-pass
         self._smooth_v = (1.0 - p.alpha_linear) * self._smooth_v + p.alpha_linear * target_v
         self._smooth_w = (1.0 - p.alpha_angular) * self._smooth_w + p.alpha_angular * target_w
@@ -63,6 +74,9 @@ class CmdFilter:
         dw = _clamp(self._smooth_w - self._last_w, -max_dw, max_dw)
         out_v = self._last_v + dv
         out_w = self._last_w + dw
+
+        if out_v < p.min_linear_velocity:
+            out_v = p.min_linear_velocity
 
         # 3) Deadband
         if abs(out_v) < p.deadband_linear:

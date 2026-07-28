@@ -80,6 +80,7 @@ rover_rl_policy:
     act_max_linear_accel: 0.5         # v3e a_max = 0.5 m/s²
     act_max_angular_velocity: 1.2     # ★ v3e ω_max = 1.2 rad/s（修正 v3c 0.785 bug；底盤上限 1.2）
     act_max_angular_accel: 3.0        # ★ 角速度 α slew（每步 Δω≤3.0×dt=0.6；0=不 slew）
+    allow_reverse: false              # 安全測試：RL 不直接下發負速度
 
     # --- 全域速度縮放 ---
     # v3e 延遲感知重訓已取代時間膨脹；首次上電靠架空+estop+保守 goal 確保安全，
