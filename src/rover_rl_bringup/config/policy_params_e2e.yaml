@@ -96,7 +96,7 @@ rover_rl_policy:
     # --- 全域速度縮放 ---
     # v3e 延遲感知重訓已取代時間膨脹；首次上電靠架空+estop+保守 goal 確保安全，
     # 不靠降 speed_rate。穩定後可調回 1.0 精確對齊 slew/action_stack。
-    speed_rate: 0.55
+    speed_rate: 0.7
 
     # --- Action stacking（v3e=v3c）：raw_obs_dim==83 自動啟用 ---
     # 正規化分母 = 訓練 action history 尺度（obs_spec [79:83]：a÷0.2、ω÷π/15）
