@@ -24,26 +24,74 @@ deploy_rl_select() {
     # 列出 ~/rover_rl/models/*.ts；Enter = 沿用 policy_params.yaml 預設。
     # 選到 *v3c/v3e/v3f* 自動帶對應 *_<variant>.yaml（r_min=0.25 / ω_max=1.2 等）。
     if ! printf '%s\n' "$@" | grep -qE '^(model_path|params_file|preprocessor_params_file):='; then
-        local TS_FILES
-        mapfile -t TS_FILES < <(ls -1 "$MODELS_DIR"/*.ts 2>/dev/null | sort)
+        # ── 選單隱藏清單（2026-07-28）──
+        # 這些 .ts 仍在磁碟上、仍可用 model_path:=<絕對路徑> 明確載入，只是不列進互動選單，
+        # 讓選單只留目前在用的模型。要恢復顯示就把該檔名從 HIDE_TS 拿掉即可。
+        local HIDE_TS=(
+            sa1_v3e_60000.ts
+            sa2_v3c_90000.ts
+            sa2_v3e_240000.ts
+            sa3_v3c_240000.ts
+            sa4_dense_v3f_30000.ts
+            sa5_tc_g1_p30_270000.ts
+            sa6_tc_dense_420k.ts
+        )
+        local TS_FILES ALL_TS tf tb th hidden
+        mapfile -t ALL_TS < <(ls -1 "$MODELS_DIR"/*.ts 2>/dev/null | sort)
+        TS_FILES=()
+        for tf in "${ALL_TS[@]}"; do
+            tb=$(basename "$tf"); hidden=0
+            for th in "${HIDE_TS[@]}"; do [ "$tb" = "$th" ] && { hidden=1; break; }; done
+            [ "$hidden" = "0" ] && TS_FILES+=("$tf")
+        done
         if [ "${#TS_FILES[@]}" -gt 0 ]; then
             local DEFAULT_TS
             DEFAULT_TS=$(grep -oP 'model_path:\s*"\K[^"]+' "$CFG_DIR/policy_params.yaml" 2>/dev/null)
             echo "┌─ 選擇 RL checkpoint ─────────────────────────────────────────"
-            local i=1 f base tag
+            # 每個項目分兩層呈現：主行（編號＋檔名＋短標籤/←預設）＋ 縮排詳述數行，
+            # 避免長 tag 擠成一整行難讀。short=同行短標籤，desc=縮排詳述（以換行分行）。
+            local i=1 f base short desc dline
             for f in "${TS_FILES[@]}"; do
-                base=$(basename "$f"); tag=""
-                [ "$f" = "$DEFAULT_TS" ] && tag=" ←預設"
+                base=$(basename "$f"); short=""; desc=""
                 case "$base" in
-                    *sa8_e2e*) tag="$tag  [★e2e clean-PPO｜SA8 k8 c89600（warp 14靜+6動,K8+future0.10+anti-spin0.15）⚠未畢業:crash-run iter700候選,四閘/情境待驗｜79D stateless｜8幀LiDAR CNN,RNN繞過｜r_min=0.5/ω_max=1.2｜自動帶 policy_params_e2e + lidar_preprocessor_params_e2e]";;
-                    *e2e*) tag="$tag  [★e2e clean-PPO｜SA4 c89600 四閘全過(det SR97.6%)｜79D stateless｜4幀LiDAR CNN,RNN繞過｜r_min=0.5/ω_max=1.2｜自動帶 policy_params_e2e + lidar_preprocessor_params_e2e]";;
-                    *tcadapt*) tag="$tag  [v3f 定版：79D TC1 走廊特化，帶 r_min=0.25 / ω_max=1.2 config]";;
-                    *v3c*) tag="$tag  [v3c：自動帶 r_min=0.25 / ω_max=1.2 config]";;
-                    *v3e*) tag="$tag  [v3e：自動帶 r_min=0.25 / ω_max=1.2 config]";;
-                    *v3f*) tag="$tag  [v3f：79D／無 act_hist，自動帶 r_min=0.25 / ω_max=1.2 config]";;
-                    *v3h*) tag="$tag  [v3h：SA6 clean baseline 對照臂 79D／無 act_hist，帶 r_min=0.25 / ω_max=1.2 config]";;
+                    *sa8_e2e*)
+                        short="★e2e SA8 k8   ⚠ 未畢業"
+                        desc="clean-PPO ｜ 79D stateless ｜ 8 幀 LiDAR CNN（RNN 繞過）
+warp 14靜+6動 · K8 · future 0.10 · anti-spin 0.15
+crash-run iter700 候選，四閘/情境待驗
+r_min=0.5  ω_max=1.2  → policy_params_e2e + lidar_preprocessor_params_e2e" ;;
+                    *e2e*)
+                        short="★e2e SA4   ✓ 四閘全過"
+                        desc="clean-PPO ｜ 79D stateless ｜ 4 幀 LiDAR CNN（RNN 繞過）
+det SR 97.6%
+r_min=0.5  ω_max=1.2  → policy_params_e2e + lidar_preprocessor_params_e2e" ;;
+                    *tcadapt*)
+                        short="v3f 定版"
+                        desc="79D TC1 走廊特化
+r_min=0.25  ω_max=1.2" ;;
+                    *v3c*)
+                        short="v3c"
+                        desc="r_min=0.25  ω_max=1.2" ;;
+                    *v3e*)
+                        short="v3e"
+                        desc="r_min=0.25  ω_max=1.2" ;;
+                    *v3f*)
+                        short="v3f"
+                        desc="79D ／ 無 act_hist
+r_min=0.25  ω_max=1.2" ;;
+                    *v3h*)
+                        short="v3h"
+                        desc="SA6 clean baseline 對照臂 · 79D ／ 無 act_hist
+r_min=0.25  ω_max=1.2" ;;
                 esac
-                printf "│ %d) %s%s\n" "$i" "$base" "$tag"
+                [ "$f" = "$DEFAULT_TS" ] && short="${short:+$short   }←預設"
+                printf "│ %d) %-33s %s\n" "$i" "$base" "$short"
+                if [ -n "$desc" ]; then
+                    while IFS= read -r dline; do
+                        printf "│      %s\n" "$dline"
+                    done <<< "$desc"
+                fi
+                printf "│\n"
                 i=$((i+1))
             done
             echo "└──────────────────────────────────────────────────────────────"

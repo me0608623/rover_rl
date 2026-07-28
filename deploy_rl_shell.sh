@@ -23,6 +23,72 @@ if [ ! -t 0 ] || [ ! -t 1 ]; then
     exit 2
 fi
 
+# ── 啟動前檢查：清掉前一次沒收乾淨的殘留節點（孤兒）──
+# 為何要這道：stop 腳本靠「節點名清單」逐一 pkill，新增節點時忘了同步加清單就會留孤兒
+# （vo_safety / pingpong_test / orca_safety / recovery_supervisor 已各犯過一次）。
+# 孤兒不會自己死：PPID 變 1 後繼續搶發 /input/nav_cmd_vel —— 2026-07-23 實測兩隻 recovery_supervisor
+# 卡在 stuck 態 10Hz 各灌 (0,0)，把 policy 指令沖成「有值,0,0,0,有值…」→ 車動動停停，查了整輪才抓到。
+# 這裡刻意用「安裝路徑」而非節點名清單偵測：以後新增任何節點都自動涵蓋，不必再維護第三份清單。
+# ⚠ 只掃 rover_rl 棧自己的東西。NDT / LV-DOT / rosbridge / velodyne / 底盤 driver 是分開啟的，不碰。
+PREFLIGHT_PATHS=(
+    "rover_rl_inference/lib/rover_rl_inference/"
+    "orca_filter/lib/orca_filter/"
+    "campusrover_routing/lib/"
+    "campusrover_costmap_ros2/lib/"
+    "campusrover_mot/lib/"
+    "campusrover_demo/lib/campusrover_demo/simple_map_publisher"
+    "ros2 launch rover_rl_bringup"
+)
+STALE_PIDS=""
+for pat in "${PREFLIGHT_PATHS[@]}"; do
+    for pid in $(pgrep -f "$pat" 2>/dev/null); do
+        [ "$pid" = "$$" ] && continue
+        case " $STALE_PIDS " in *" $pid "*) continue ;; esac   # 一個進程可能命中多個 pattern，去重
+        STALE_PIDS="$STALE_PIDS $pid"
+    done
+done
+STALE_PIDS="${STALE_PIDS# }"
+
+if [ -n "$STALE_PIDS" ]; then
+    echo "┌─ ⚠️  啟動前檢查：偵測到 $(echo "$STALE_PIDS" | wc -w) 個殘留 rover_rl 節點 ──────────"
+    for pid in $STALE_PIDS; do
+        pargs=$(ps -o args= -p "$pid" 2>/dev/null)
+        [ -z "$pargs" ] && continue
+        pname=$(echo "$pargs" | grep -oE "__node:=[^ ]+" | head -1 | cut -d= -f2)
+        [ -z "$pname" ] && pname=$(echo "$pargs" | grep -oE "lib/[a-z0-9_]+/[a-zA-Z0-9_]+" | tail -1 | xargs basename 2>/dev/null)
+        case "$pargs" in *"ros2 launch rover_rl_bringup"*) pname="ros2 launch（父進程）" ;; esac
+        [ -z "$pname" ] && pname="(未知)"
+        psec=$(ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' ')
+        pppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        orphan=""; [ "$pppid" = "1" ] && orphan="  ← 孤兒(父進程已死)"
+        printf "│ PID %-7s 已跑 %-9s %s%s\n" "$pid" "$([ -n "$psec" ] && printf '%dh%02dm' $((psec/3600)) $(((psec%3600)/60)))" "$pname" "$orphan"
+    done
+    echo "│ 這些是前一次沒收乾淨的殘留。不清會與新棧並存搶發 cmd_vel → 車走走停停。"
+    echo "└──────────────────────────────────────────────────────────────"
+    read -rp "是否清除這些殘留？[Y/n]（Enter=清除，強烈建議） " STALE_SEL
+    case "$STALE_SEL" in
+        [Nn]*)
+            echo "[deploy_rl_shell] ⚠️  保留殘留繼續啟動——會雙開搶發，行為異常請先想到這裡"
+            ;;
+        *)
+            kill -SIGTERM $STALE_PIDS 2>/dev/null
+            sleep 2
+            LEFT=""
+            for pid in $STALE_PIDS; do kill -0 "$pid" 2>/dev/null && LEFT="$LEFT $pid"; done
+            [ -n "$LEFT" ] && { kill -SIGKILL $LEFT 2>/dev/null; sleep 1; }
+            LEFT2=""
+            for pid in $STALE_PIDS; do kill -0 "$pid" 2>/dev/null && LEFT2="$LEFT2 $pid"; done
+            if [ -n "$LEFT2" ]; then
+                echo "[deploy_rl_shell] ⚠️  仍有殺不掉的殘留:$LEFT2（權限？）請手動處理再啟動"
+            else
+                echo "[deploy_rl_shell] ✅ 殘留已清除，環境乾淨"
+            fi
+            ;;
+    esac
+else
+    echo "[deploy_rl_shell] ✅ 啟動前檢查：無殘留節點"
+fi
+
 # ── Checkpoint 選單 + VO 詢問（抽到共用 deploy_select.sh，與 deploy_rl 同一套）──
 # 設定 EXTRA_ARGS（model/config）與 VO_ARG（enable_vo:=…）。已在 TTY（本腳本上面已守門）。
 # 命令列已帶 model_path:= / params_file:= / enable_vo:= 時各自跳過、尊重覆寫。
@@ -93,7 +159,11 @@ if ! printf '%s\n' "$@" | grep -qE '^enable_pingpong:='; then
             read -rp "  A 點節點名 [c24]： " PP_A; PP_A="${PP_A:-c24}"
             read -rp "  B 點節點名 [c27]： " PP_B; PP_B="${PP_B:-c27}"
             PINGPONG_ARGS=("enable_pingpong:=true" "pingpong_a:=$PP_A" "pingpong_b:=$PP_B")
-            echo "[deploy_rl_shell] 往返測試：啟用（$PP_A ↔ $PP_B，到點後按空白鍵開始）"
+            # 預設全自動來回（停穩免按空白鍵自動出發下一段）；命令列已帶 pingpong_auto_continue:= 則尊重覆寫
+            if ! printf '%s\n' "$@" | grep -qE '^pingpong_auto_continue:='; then
+                PINGPONG_ARGS+=("pingpong_auto_continue:=true")
+            fi
+            echo "[deploy_rl_shell] 往返測試：啟用（$PP_A ↔ $PP_B，全自動來回，TUI 按 a 可切回按鍵模式）"
             ;;
     esac
 fi
@@ -181,6 +251,7 @@ if [ "$RECORD_BAG" = "1" ]; then
         /input/nav_cmd_vel /rover_rl/cmd_vel_desired /rover_rl/cmd_vel_mppi \
         /rover_rl/cmd_vel_recovery_in /output/cmd_vel /cmd_vel \
         /rover_rl_policy/status /vo_safety_node/status /recovery_supervisor_node/status \
+        /joy /input/joy_cmd_vel \
         /odom /rover_rl/lidar_sweep_72 /campusrover_local_costmap \
         /goal_pose /global_path /tf /tf_static \
         >"$LOG.bag.log" 2>&1 &
