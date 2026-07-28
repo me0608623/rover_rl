@@ -162,6 +162,17 @@ class VOSafetyNode(Node):
         # ★前方「全身堵滿」才停：front_m 近 + ±30°扇區填滿率 ≥ 此值才算「人正對堵死」→ 停。
         # 填滿率低（人偏一側/有縫）→ 不停，讓 RL/VO 繞。取代舊「單點近就停」。
         gp("front_block_ratio_thresh", 0.8)     # ±30° 前方近物覆蓋率門檻(0~1)；0.8=80%bin是近物才停
+        # ★僵局解除：VO 輸出 0 且車真的沒動、又沒人接手後退，連續 release_s 秒 → 把控制權
+        #   「整個」交還 RL（繞過 VO rollout / 靜態繞行 / 前方煞），交還 hold_s 秒後 VO 重新接管。
+        #   解 2026-07-22 實測死結：人站左前 0.5m（填滿率 0.38 落在 recovery 死區不武裝），
+        #   VO hardstop 把 v 和 ω 一起歸零 → RL 滿舵右轉的解被丟掉、車凍 6.6s 直到人走開。
+        #   ⚠ 車真的在動（含 recovery 後退中）計時就歸零 → 「有觸發後退就不會走這條」。
+        gp("deadlock_release_s", 3.5)        # VO 給 0 且車不動連續此秒數 → 交還 RL（0=停用）
+        gp("deadlock_release_hold_s", 3.0)   # 交還持續秒數，到點 VO 重新接管（重新累積才會再交還）
+        gp("deadlock_out_zero_v", 0.02)      # |out_v| ≤ 此值算「VO 給 0」
+        gp("deadlock_out_zero_w", 0.05)      # |out_w| ≤ 此值算「VO 給 0」
+        gp("deadlock_move_v", 0.05)          # |odom v| ≤ 此值算「車沒動」
+        gp("deadlock_move_w", 0.10)          # |odom ω| ≤ 此值算「車沒動」
         # ★「嚴格前方」模式（TUI 'f' 鍵熱切換）：ON 時 VO 只處理「前方±cone° 且(卡住≥stuck_s 或
         #   直衝車端)」的障礙；側邊/路過的人忽略。用途：讓 VO 不再對側向路人減速，只擋真正威脅。
         gp("vo_strict_front", False)            # True=啟用嚴格前方過濾（運行時由 topic toggle）
@@ -263,6 +274,13 @@ class VOSafetyNode(Node):
         self.front_hardstop_m = float(g("front_hardstop_m").value)
         self.front_hardstop_dwell_s = float(g("front_hardstop_dwell_s").value)
         self.front_block_ratio_thresh = float(g("front_block_ratio_thresh").value)
+        # 僵局解除（VO 給 0 但車不動 → 交還 RL）
+        self.deadlock_release_s = float(g("deadlock_release_s").value)
+        self.deadlock_release_hold_s = float(g("deadlock_release_hold_s").value)
+        self.deadlock_out_zero_v = float(g("deadlock_out_zero_v").value)
+        self.deadlock_out_zero_w = float(g("deadlock_out_zero_w").value)
+        self.deadlock_move_v = float(g("deadlock_move_v").value)
+        self.deadlock_move_w = float(g("deadlock_move_w").value)
         # 嚴格前方模式
         self._strict_front = bool(g("vo_strict_front").value)
         topic_strict = g("topic_strict_front_toggle").get_parameter_value().string_value
@@ -321,6 +339,10 @@ class VOSafetyNode(Node):
         self._front_freeze_armed = True      # 是否允許觸發凍結（False=待退到 rearm 外重置）
         self._front_hardstop_since = None    # 前方硬停(≤hardstop_m)持續起算 monotonic（dwell 計時）
         self._front_hardstop_reversing = False  # 硬停後退相位是否進行中
+        self._deadlock_since: float | None = None   # 僵局（VO 給 0 + 車不動）起算 monotonic
+        self._deadlock_release_until = 0.0          # 交還 RL 的截止 monotonic（<=now 即未交還）
+        self._deadlock_releasing_prev = False       # 前一拍是否在交還（狀態變化 log 用）
+        self._deadlock_releasing = False            # 本拍是否在交還（供 status/TUI）
         # 嚴格前方模式：錐內障礙年齡追蹤 {pos_grid: [first_seen, last_seen]}
         self._cone_age: dict[tuple, list[float]] = {}
         self._front_stop_since = None        # 進入前方 stop 區的 monotonic 時間（2s 才退用）
@@ -619,6 +641,53 @@ class VOSafetyNode(Node):
             self._front_freeze_since = now       # 觸發 freeze
             return 0.0, 0.0, "freeze"
         return None
+
+    def _deadlock_step(self, now: float) -> bool:
+        """僵局解除：VO 給 0 但車真的沒動 → 連續 release_s 秒後把控制權整個交還 RL.
+
+        回傳 True = 本拍處於「交還 RL」期間（呼叫端直接送 RL 原始意圖，跳過 VO 解／靜態繞行／
+        前方煞），交還 hold_s 秒後 VO 重新接管、計時從頭累積（不會永久放行）。
+
+        累積計時要四條全中，任一條破 → 歸零：
+          ① VO 上一拍輸出 ≈ 0（|out_v|/|out_w| ≤ deadlock_out_zero_*）
+          ② RL 其實想動（同門檻）— RL 自己要停不算僵局
+          ③ 車真的沒動（odom |v|/|ω| ≤ deadlock_move_*）
+          ④ 沒有任何後退相位在跑（VO 逃脫／前方煞倒退／硬停倒退）
+        ②+③ 合起來就是「RL 有解但送不出去、車也沒被別人推動」；recovery 一旦接手後退，
+        odom 就有速度 → ③ 破 → 計時歸零，這正是「若再沒有觸發後退」那一條，
+        不必跨節點去查 recovery 狀態（recovery 在下游，VO 看不到它的輸出）。
+        """
+        if self.deadlock_release_s <= 0.0:
+            self._deadlock_since = None
+            self._deadlock_release_until = 0.0
+            return False
+        if now < self._deadlock_release_until:
+            return True                      # 交還期間內
+        vo_zero = (abs(self._out_v) <= self.deadlock_out_zero_v
+                   and abs(self._out_w) <= self.deadlock_out_zero_w)
+        rl_wants = (abs(self._des_v) > self.deadlock_out_zero_v
+                    or abs(self._des_w) > self.deadlock_out_zero_w)
+        not_moving = (self._robot is not None
+                      and abs(self._robot.v) <= self.deadlock_move_v
+                      and abs(self._robot.w) <= self.deadlock_move_w)
+        reversing = (self._escaping or self._front_reversing
+                     or self._front_hardstop_reversing)
+        if reversing or not (vo_zero and rl_wants and not_moving):
+            self._deadlock_since = None
+            return False
+        if self._deadlock_since is None:
+            self._deadlock_since = now
+            return False
+        if (now - self._deadlock_since) < self.deadlock_release_s:
+            return False
+        self._deadlock_since = None
+        self._deadlock_release_until = now + self.deadlock_release_hold_s
+        return True
+
+    def _deadlock_age(self, now: float) -> float | None:
+        if self._deadlock_since is None:
+            return None
+        return max(0.0, now - self._deadlock_since)
 
     def _apply_front_brake(self, v: float, w: float) -> tuple[float, float, str]:
         """前方 LiDAR 安全煞：吃 RL front_m（含牆任何物）. 回傳 (v', w', 狀態字).
@@ -937,29 +1006,51 @@ class VOSafetyNode(Node):
             tv, tw = (self.escape_reverse_v if res.blocked else 0.0), ew
         else:
             tv, tw = res.v, res.w
-        # 靜態早期避障：3m 內先減速並往左右較空側偏，避免 RL 貼近靜態障礙才反應。
-        tv, tw, self._static_avoid = self._apply_static_avoid(tv, tw)
-        if self._static_avoid != self._static_avoid_prev:
+        # ★僵局解除：VO 給 0、車真的沒動、也沒有任何後退相位在跑 → 連續 deadlock_release_s
+        #   秒後把控制權整個交還 RL（跳過靜態繞行與前方煞），hold_s 秒後 VO 重新接管。
+        releasing = self._deadlock_releasing = self._deadlock_step(now)
+        if releasing:
+            tv, tw = self._des_v, self._des_w   # 原封不動送 RL 意圖（下方仍走 slew 平滑）
+            self._static_avoid = self._static_avoid_prev = ""
+            self._front_brake = self._front_brake_prev = ""
+            # 交還期間不跑 _apply_front_brake → 清掉它的 dwell 計時，避免收回時拿舊時間戳
+            # 直接判定「已停滿 dwell」而瞬間觸發後退（dwell 設小值時才會踩到）。
+            self._front_hardstop_since = None
+            self._front_stop_since = None
+        else:
+            # 靜態早期避障：3m 內先減速並往左右較空側偏，避免 RL 貼近靜態障礙才反應。
+            tv, tw, self._static_avoid = self._apply_static_avoid(tv, tw)
+            if self._static_avoid != self._static_avoid_prev:
+                fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
+                lm = "?" if self._left_m is None else f"{self._left_m:.2f}"
+                rm = "?" if self._right_m is None else f"{self._right_m:.2f}"
+                if self._static_avoid:
+                    self.get_logger().info(
+                        f"靜態早期避障 → {self._static_avoid}（front={fm}m left={lm}m right={rm}m）")
+                else:
+                    self.get_logger().info("靜態早期避障 → 解除")
+                self._static_avoid_prev = self._static_avoid
+            # 前方 LiDAR 安全煞（只預設版）：吃 RL front_m，≤stop 禁前進、≤slow 減速（含牆任何物）。
+            # 放最後、蓋過 VO/逃脫輸出 → 距離硬底線，不論障礙是人是牆一律生效。
+            tv, tw, self._front_brake = self._apply_front_brake(tv, tw)
+            # 前方煞狀態變化 → log（供盯 log 觀察；純觀察不影響控制）
+            if self._front_brake != self._front_brake_prev:
+                fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
+                if self._front_brake:
+                    self.get_logger().warn(f"前方煞 → {self._front_brake}（front_m={fm}m）")
+                else:
+                    self.get_logger().info(f"前方煞 → 解除/讓VO繞（front_m={fm}m）")
+                self._front_brake_prev = self._front_brake
+        if releasing != self._deadlock_releasing_prev:
             fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
-            lm = "?" if self._left_m is None else f"{self._left_m:.2f}"
-            rm = "?" if self._right_m is None else f"{self._right_m:.2f}"
-            if self._static_avoid:
-                self.get_logger().info(
-                    f"靜態早期避障 → {self._static_avoid}（front={fm}m left={lm}m right={rm}m）")
+            if releasing:
+                self.get_logger().warn(
+                    f"僵局解除：VO 給 0 且車不動 ≥{self.deadlock_release_s:.1f}s、無人後退 → "
+                    f"交還 RL {self.deadlock_release_hold_s:.1f}s"
+                    f"（front_m={fm}m RL({self._des_v:+.2f},{self._des_w:+.2f})）")
             else:
-                self.get_logger().info("靜態早期避障 → 解除")
-            self._static_avoid_prev = self._static_avoid
-        # 前方 LiDAR 安全煞（只預設版）：吃 RL front_m，≤stop 禁前進、≤slow 減速（含牆任何物）。
-        # 放最後、蓋過 VO/逃脫輸出 → 距離硬底線，不論障礙是人是牆一律生效。
-        tv, tw, self._front_brake = self._apply_front_brake(tv, tw)
-        # 前方煞狀態變化 → log（供盯 log 觀察；純觀察不影響控制）
-        if self._front_brake != self._front_brake_prev:
-            fm = "?" if self._front_m is None else f"{self._front_m:.2f}"
-            if self._front_brake:
-                self.get_logger().warn(f"前方煞 → {self._front_brake}（front_m={fm}m）")
-            else:
-                self.get_logger().info(f"前方煞 → 解除/讓VO繞（front_m={fm}m）")
-            self._front_brake_prev = self._front_brake
+                self.get_logger().info(f"僵局解除：交還期滿 → VO 重新接管（front_m={fm}m）")
+            self._deadlock_releasing_prev = releasing
         if self._front_brake in ("stop", "reverse", "freeze"):
             self._publish_brake(tv, tw)   # 安全煞：前進速度瞬間歸零（不 slew 慢收→不多衝 ~0.1m）
         else:
@@ -1133,6 +1224,11 @@ class VOSafetyNode(Node):
             # 前方安全煞（只預設版）+ 靜止人源（只滿血版）
             "front_m": (None if self._front_m is None else round(self._front_m, 2)),
             "front_brake": self._front_brake,   # ""/"slow"/"stop"/"reverse"/"freeze"
+            # 僵局解除：VO 給 0 且車不動 → 交還 RL（純觀察欄，供 TUI/diag）
+            "deadlock_release": bool(self._deadlock_releasing),
+            "deadlock_s": (None if self._deadlock_age(now) is None
+                           else round(self._deadlock_age(now), 1)),
+            "deadlock_release_s": self.deadlock_release_s,
             "static_avoid": self._static_avoid, # ""/"slow"/"bias"
             "static_avoid_enable": bool(self.static_avoid_enable),
             "static_avoid_side": int(self._static_avoid_side),

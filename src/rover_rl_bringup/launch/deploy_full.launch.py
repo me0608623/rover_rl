@@ -505,9 +505,17 @@ def generate_launch_description():
         if mppi_on:
             # 三層協作：RL→MPPI(靜態)→VO(動態)。VO 改吃 MPPI 靜態濾波後的輸出。
             extra["topic_cmd_in"] = "/rover_rl/cmd_vel_mppi"
+            # MPPI gap guard 會在 costmap 上提供偏好 gap，最後由 MPPI rollout 選命令；
+            # VO 的舊式 front_freeze 會在 0.7m 內把 (vx,wz) 一起歸零，導致車頭明明有
+            # 側向 gap 卻只會停住。
+            # 保留 front_brake 的 0.55m 絕對底線，取消會抹掉轉向的 freeze。
+            extra["front_freeze_enable"] = False
         if recovery_on:
             # Keep VO's ordinary dynamic-obstacle filtering, but replace VO's own
             # backing-up escape with recovery_supervisor downstream.
+            # ⚠ 此組合下 VO 自己絕不後退，若下游 recovery 也沒武裝（例：人偏一側、±30° 填滿率
+            #   0.38 落在 recovery 的 ratio 死區），VO 的 0.6m 硬停會把 v/ω 一起歸零而無人接手
+            #   → 靠 vo_params.yaml 的 deadlock_release_s（VO 給 0 且車不動 3.5s → 交還 RL）兜底。
             extra.update({
                 "topic_cmd_out": "/rover_rl/cmd_vel_recovery_in",
                 "stuck_escape_enable": False,

@@ -864,6 +864,11 @@ class Dashboard:
         if fail:
             reason = {"odom": "odom 逾時", "desired": "RL 逾時"}.get(fail, fail)
             vo_txt, vo_pair, vo_bold = f"⚠ 看門狗發 0（{reason}）", 3, True
+        elif vo.get("deadlock_release"):
+            vo_txt = (
+                f"🔓 僵局解除 → 交還 RL "
+                f"({_fmt(vo.get('des_v'), '+.2f')},{_fmt(vo.get('des_w'), '+.2f')})")
+            vo_pair, vo_bold = 2, True
         elif vo.get("blocked"):
             vo_txt = f"⛔ 全堵死 → 停車（近障 {vo.get('n_obs', 0)}）"
             vo_pair, vo_bold = 3, True
@@ -884,6 +889,12 @@ class Dashboard:
             f"ω≤{_fmt(vo.get('w_max'), '.1f')} 預測{_fmt(vo.get('horizon'), '.1f')}s "
             f"觸發{_fmt(vo.get('engage_range'), '.0f')}m 餘裕{_fmt(vo.get('margin'), '.2f')}m "
             f"追蹤{vo.get('n_tracked', 0)}")
+        # 僵局計時中（VO 給 0 且車不動，尚未達交還門檻）→ 在狀態字尾加倒數，一眼看出快要交還
+        dl_s, dl_thr = vo.get("deadlock_s"), vo.get("deadlock_release_s")
+        if (not vo.get("deadlock_release") and isinstance(dl_s, (int, float))
+                and isinstance(dl_thr, (int, float)) and dl_thr > 0.0):
+            vo_txt += f"  ⏳僵局{dl_s:.1f}/{dl_thr:.1f}s"
+            vo_pair, vo_bold = 2, True
         rows = [
             ("VO", vo_txt, vo_pair, vo_bold),
             ("VO參數", params_txt, 5, False),

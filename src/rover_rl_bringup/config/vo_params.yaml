@@ -105,6 +105,25 @@ vo_safety_node:
     front_hardstop_m: 0.6          # front_m ≤ 0.5 → 強制硬停（前向硬地板，禁前進）
     front_hardstop_dwell_s: 9999.0 # ★07-09 停用 freeze 自帶後退（9999=永不自己退）：0.6m 只持續停車，倒退交下游 recovery_supervisor（0.6m+填滿≥65%連續2s）
 
+    # ── ★僵局解除（07-22 加）：VO 給 0 但沒人接手後退 → 交還 RL ──
+    # 07-22 實測死結：人站左前 0.5m，±30° 填滿率只有 0.38（人偏一側、只吃 5/13 bin），
+    #   落在 recovery 的死區（fill_blocked 要 ratio≥0.5、side_gap 直繞要 ratio≤0.35）→ recovery
+    #   全程 normal_rl 不武裝；同時 front_m=0.50 ≤ hardstop_m=0.6 → 上面那條硬停把 v 和 ω
+    #   一起歸零。RL 其實一直在要求 (0, -0.66)「原地右轉離開」（右側 3.5m 全空），解被丟掉，
+    #   車整整凍結 6.6 秒直到人自己走開。
+    # 對策：VO 輸出 0、odom 也證實車沒動、且沒有任何後退相位在跑，連續 release_s 秒
+    #   → 把控制權「整個」交還 RL（跳過 VO 解／靜態繞行／前方煞）hold_s 秒，之後 VO 重新接管。
+    # ⚠「有觸發後退就不走這條」是靠 odom 判的：recovery（下游、VO 看不到它的輸出）一旦開始倒車，
+    #   車有速度 → 計時歸零。所以這條只在「真的沒人救」時才會啟動。
+    # ⚠ 交還期間前方硬地板同時失效：RL 若要求前進就會往障礙走（實測本例 RL 要的是原地轉，
+    #   但別的情境不保證）。要保留絕對底線就把 release_s 設 0 停用，或縮短 hold_s。
+    deadlock_release_s: 3.5        # VO 給 0 且車不動連續此秒數 → 交還 RL（0=停用整個機制）
+    deadlock_release_hold_s: 3.0   # 交還持續秒數；到點 VO 重新接管、計時歸零重新累積
+    deadlock_out_zero_v: 0.02      # |out_v| ≤ 此值算「VO 給 0」
+    deadlock_out_zero_w: 0.05      # |out_w| ≤ 此值算「VO 給 0」（要比 RL 滿舵 0.66 小很多）
+    deadlock_move_v: 0.05          # |odom v| ≤ 此值算「車沒動」
+    deadlock_move_w: 0.10          # |odom ω| ≤ 此值算「車沒動」
+
     # ── ★嚴格前方模式（07-07 開啟）：解「側邊路過的人也被煞停」──
     # VO 對「速度未收斂的年輕 track」會把速度歸零當靜態避（安全），副作用＝橫越/路過的人被當
     #   「站著擋路」→ 對每個路過前方的人都煞一下。開此模式後 VO 只保留「正前±cone° 且(卡住≥stuck_s
