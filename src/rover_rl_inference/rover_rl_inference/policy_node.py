@@ -149,6 +149,9 @@ class PolicyNode(Node):
         self.declare_parameter("trail_rate_hz", 5.0)
         self.declare_parameter("trail_min_distance_m", 0.05)
         self.declare_parameter("trail_max_points", 2000)
+        # 每段導航一條獨立軌跡：到達終點 + 收到新目標時清空 trail（A/B 實驗每趟軌跡不互相疊加）。
+        # false = 舊行為（一路累積到 trail_max_points / frame 改變才清）。
+        self.declare_parameter("trail_clear_on_goal", True)
         # 把「policy 推論時實際餵進網路的 72D sweep」印進 deploy log（節流）。
         # 這是 _tick_inference 真正傳給 build_obs_raw 的那條（正規化 [0,1]，1=無回波/>=r_max），
         # 與 preprocessor 發出的 topic、status 給 TUI 的可能因 inline_fallback / 過期而不同。
@@ -270,6 +273,7 @@ class PolicyNode(Node):
         self.trail_rate_hz = float(gp("trail_rate_hz").value)
         self.trail_min_distance_m = max(0.0, float(gp("trail_min_distance_m").value))
         self.trail_max_points = max(2, int(gp("trail_max_points").value))
+        self.trail_clear_on_goal = bool(gp("trail_clear_on_goal").value)
         self.log_sweep72 = bool(gp("log_sweep72").value)
         self.log_sweep72_period_s = float(gp("log_sweep72_period_s").value)
         self.front_block_close_m = float(gp("front_block_close_m").value)
@@ -414,6 +418,15 @@ class PolicyNode(Node):
         # RViz trail：累積 /odom pose 成 nav_msgs/Path。frame 固定為 odom 訊息 frame。
         self._trail = NavPath()
         self._trail_last_xy: tuple[float, float] | None = None
+        # 清空後要「主動發空 Path」RViz 才會真的消線（Path display 會保留最後一則訊息，
+        # 而 _tick_trail 在 trail 空時本來直接 return → 不發就永遠停在舊軌跡）。
+        # 用計數器而非單次旗標：連發數拍，避開「新 publisher 與既存 RViz 尚未完成 discovery
+        # 就發完了」的競態（只發一次會被錯過 → 舊線還在）。
+        # 啟動時預先排 ~5 秒：deploy 重啟後 RViz 常還開著，殘留的是「上一次 deploy 的軌跡」，
+        # 新節點在車開動前不會發任何 Path，不主動清就會一直掛著。
+        self._trail_clear_ticks = max(3, int(5.0 * self.trail_rate_hz))
+        # 到達終點只清一次（到達分支每個 inference tick 都會執行，否則會 5Hz 一直重發空 Path）
+        self._trail_goal_cleared = False
         # 上次 subgoal（給 marker 用）
         self._last_subgoal_body: tuple[float, float] | None = None
         self._last_subgoal_source: str | None = None
@@ -654,6 +667,20 @@ class PolicyNode(Node):
         if len(self._trail.poses) > self.trail_max_points:
             del self._trail.poses[:len(self._trail.poses) - self.trail_max_points]
 
+    def _clear_trail(self, reason: str) -> None:
+        """清空已走軌跡並排程發一次空 Path（RViz 才會消線）。thread-safe。"""
+        if not self.publish_trail or not self.trail_clear_on_goal:
+            return
+        with self._lock:
+            had = bool(self._trail.poses)
+            frame = self._trail.header.frame_id or self.odom_frame or "odom"
+            self._trail = NavPath()
+            self._trail.header.frame_id = frame   # 留 frame_id，空 Path 才不會被 RViz 判為無效
+            self._trail_last_xy = None
+            self._trail_clear_ticks = 3           # 連發 3 拍，確保 RViz 收得到
+        if had:
+            self.get_logger().info(f"清空軌跡 /rover_rl/trail（{reason}）")
+
     def _cb_goal(self, msg: PoseStamped) -> None:
         # 新目標 = 新 episode：reset RNN hidden（清掉上一段的記憶）與 cmd filter，
         # 並重置 elapsed 計時（episode_horizon 從 0 起算），對齊訓練時每 episode 的初始狀態
@@ -675,6 +702,9 @@ class PolicyNode(Node):
         self.runner.reset()
         self.cmd_filter.reset()
         self._reset_act_hist()
+        # 新目標 = 新一段軌跡：清掉上一段（含上段中途 estop/manual 中斷未到達的殘留）
+        self._trail_goal_cleared = False
+        self._clear_trail("新 goal_pose")
         with self._lock:
             self._start_t = time.monotonic()
         self.get_logger().info(
@@ -710,6 +740,9 @@ class PolicyNode(Node):
         self.runner.reset()
         self.cmd_filter.reset()
         self._reset_act_hist()
+        # 新 path = 新一段軌跡（sig 相同的 2Hz 重發已在上面 return，不會誤清）
+        self._trail_goal_cleared = False
+        self._clear_trail("新 path")
         with self._lock:
             self._start_t = time.monotonic()
         self.get_logger().info(
@@ -994,6 +1027,10 @@ class PolicyNode(Node):
                 # 已在容差內 → 鎖定完成，之後即使越界小抖動也不再轉（防 bang-bang）
                 self._aligning = False
                 self._align_done = True
+            # 到達終點 → 清掉本段軌跡（只清一次；下一個 goal 進來會把旗標放回）
+            if not self._trail_goal_cleared:
+                self._trail_goal_cleared = True
+                self._clear_trail(f"到達 {choice.source}")
             return self._set_target_stop(
                 f"到達 {choice.source} (dist={dist:.2f})", warn=False,
             )
@@ -1220,15 +1257,49 @@ class PolicyNode(Node):
 
     # ──────────────────────────── Timer: vehicle trail (Path) ────────────────────────────
 
+    def publish_trail_clear_now(self, repeat: int = 3, gap_s: float = 0.05) -> None:
+        """關機時同步發空 Path，清掉 RViz 殘留的軌跡（不靠 timer / executor）。
+
+        best-effort：走 SIGINT 優雅關閉（deploy_rl Ctrl+C、deploy_rl_stop 的 Step 1）時會執行；
+        被 SIGKILL 硬殺則不會。連發數次 + 短暫 sleep 讓 middleware 有時間送出。
+        """
+        if self.pub_trail is None:
+            return
+        with self._lock:
+            frame = self._trail.header.frame_id or self.odom_frame or "odom"
+            self._trail = NavPath()
+            self._trail.header.frame_id = frame
+            self._trail_last_xy = None
+            self._trail_clear_ticks = 0
+        for i in range(max(1, repeat)):
+            msg = NavPath()
+            msg.header.frame_id = frame
+            msg.header.stamp = self.get_clock().now().to_msg()
+            try:
+                self.pub_trail.publish(msg)
+            except Exception:
+                return          # context 已關 → 放棄，不要在關機路徑上炸出例外
+            if i < repeat - 1:
+                time.sleep(gap_s)
+
     def _tick_trail(self) -> None:
         if self.pub_trail is None:
             return
         with self._lock:
             if not self._trail.poses:
-                return
-            msg = NavPath()
-            msg.header = self._trail.header
-            msg.poses = list(self._trail.poses)
+                # 空 trail 平常不發；但剛被清空（或節點剛啟動）時要連發幾拍空 Path，
+                # RViz Path display 才會把上一段/上一次 deploy 的線消掉。
+                if self._trail_clear_ticks <= 0:
+                    return
+                self._trail_clear_ticks -= 1
+                msg = NavPath()
+                msg.header.frame_id = (self._trail.header.frame_id
+                                       or self.odom_frame or "odom")
+            else:
+                self._trail_clear_ticks = 0
+                msg = NavPath()
+                msg.header = self._trail.header
+                msg.poses = list(self._trail.poses)
         msg.header.stamp = self.get_clock().now().to_msg()
         self.pub_trail.publish(msg)
 
@@ -1402,7 +1473,12 @@ def main(args=None):
     finally:
         # 關閉時不主動補發 0 cmd：mode 切離 nav 與 cmd timer 停轉後底盤端 watchdog
         # 會在收不到 cmd 時自行停車；這裡只負責乾淨釋放 node 資源
-        node.get_logger().info("⏹ policy_node 已停止（cmd_vel 已歸 0，安全關閉）")
+        # 但軌跡要清：RViz Path display 會保留最後一則訊息，node 死掉線也不會消失。
+        try:
+            node.publish_trail_clear_now()
+        except Exception:
+            pass                # 清理失敗不得影響關機流程
+        node.get_logger().info("⏹ policy_node 已停止（cmd_vel 已歸 0，軌跡已清，安全關閉）")
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

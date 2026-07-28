@@ -32,6 +32,18 @@ for pat in \
 done
 sleep 3
 
+# 本腳本有殺掉 NDT（ndt_localizer_node）→ 它發的 /traj 會變成 RViz 上的殘留黃線，
+# publisher 死了 Path display 仍保留最後一則。rover_rl_stop 只清自家的 trail/global_path，
+# /traj 歸這裡清（只有真的停掉 NDT 才清，否則會被 NDT 下一則蓋回去）。
+(
+  source /opt/ros/humble/setup.bash 2>/dev/null
+  source "$HOME/rover_rl/install/setup.bash" 2>/dev/null
+  source "$HOME/rover_rl/setup_env.sh" >/dev/null 2>&1
+  timeout 3 ros2 topic pub -r 2 /traj nav_msgs/msg/Path \
+      "{header: {frame_id: 'map'}, poses: []}" >/dev/null 2>&1
+)
+echo "[deploy_full_stop] 已補發空 Path 清除 NDT 殘留軌跡 (/traj)"
+
 echo "[deploy_full_stop] 3) 檢查殘留..."
 n=$(ps -eo cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|pingpong_test|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|mppi_planner|routing_engine|routing_to_path|routing_click|local_costmap|global_costmap|mot_node|mot_marker|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | wc -l)
 if [ "$n" -eq 0 ]; then

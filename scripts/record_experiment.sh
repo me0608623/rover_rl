@@ -43,6 +43,7 @@ TOPICS=(
   /rover_rl_policy/status       # 三層速度/延遲/model 等 JSON
   /tf /tf_static               # 車姿合成
   /odom                        # 里程計
+  /rover_rl/trail              # 已走軌跡(nav_msgs/Path, odom frame)：bag replay 可直接在 RViz 重播
   /goal_pose /global_path      # 導航目標
   /input/nav_cmd_vel           # 實際送底盤指令
 )
