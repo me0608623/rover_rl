@@ -1,0 +1,208 @@
+# ============================================================================
+# SA4-R3 it50 專屬 config（2026-08-17）— 🔴 SA4 全線 on HOLD，部署 = 診斷跑
+#
+# 模型：models/sa4_r3_it50_83d_k8.ts
+#   來源 checkpoint：sa4_r3_checkpoint_6400.pt（iteration 49 / total_steps 6400）
+#   run：sa4_r3_validreturn_from_sa3r1_c100_ne1024_s42_p50_r1
+#   experiment_config：e2e_sa4_r3_valid_return_noise_from_sa3_r1_c100
+#   ckpt sha256：fa51b5a312d38b7aa1ee93c3464b087b9b9cb985a7137eefdc8fecf40fed166d
+#   架構：83D obs（79 + 2×2 action stacking）+ K=8 幀 LiDAR CNN（RNN 繞過，stateless）
+#         lidar_hist=504=(8-1)×72   rl_in=179=83+96   logits=38=2×19
+#   ⚠ 只訓練了 6400 steps（sa1r1 是 217600，約 34 倍）。極早期 checkpoint。
+#
+# 契約與 sa1r1 **逐字相同**（addendum 明載）：此檔除了 model_path / sha256 / 本段能力描述，
+#   其餘每一行與 policy_params_sa1r1.yaml 相同（用 diff 可驗）。切換模型不需改任何契約值。
+#
+# 訓練條件（實查 checkpoint args，與 sa1r1 同）：
+#   ✓ 實測 VLP-16 full 噪聲（lidar_no_noise=False, vlp16_noise_mode=full）
+#   ✓ 致動延遲 U{0,1,2} 步 = 0/200/400ms（actuator_delay_range=(0,2)）
+#   ✓ 車端 parity（2026-08-17）：bundle 5.722e-06 / runtime 5.722e-06，action mismatch 0
+#
+# 實測能力（PC 端 addendum：models/car_side_handoff_sa4_addendum_20260817.md；
+#   fixed screens / stage-4 geometry / seed818 / d1=200ms；門檻 SR≥90%, CR≤10%, TO≤5%）：
+#   nav_native            94.06% / CR 5.94%   ✅ PASS
+#   corridor lateral      81.13% / CR 18.87%  ❌ FAIL（行人橫穿）
+#   corridor longitudinal 78.21% / CR 21.73%  ❌ FAIL（行人正面對衝）
+#
+# 🔴 能力邊界：**沒有任何 SA4 checkpoint 通過聯合閘門**（`accepted_parent = null`，SA4 on HOLD）。
+#   把它放上車是**診斷跑，不是已驗證能力**。相較之下 sa1r1 c1700 是唯一在
+#   三個延遲（0/200/400ms）× 三個 seed 都正式通過的 checkpoint，驗延遲契約請用它。
+#   走廊有行人時：依上表橫向約**每 5 個 episode 撞 1 次** → 只能當資料收集，
+#   人手不離 estop，不得視為能力驗收。
+#
+# ✅ episode_horizon_s 已按 stage 表確認：SA4 = 60s（與 SA1~SA3 相同），見檔頭 ego ObsTerm 段。
+#
+# ego ObsTerm 分母（2026-08-17 PC 端查證定案）：
+#   obs_max_acceleration=1.0      charge_env_cfg_vlp16.py L389 / L484  ✅
+#   obs_max_linear_velocity=1.0   L394 / L488  ✅
+#   obs_max_angular_velocity=1.5  L399 / L492  ✅
+#   episode_horizon_s=60.0        ★權威 = wd_single_agent_v3.py:108 的 stage 表
+#     stage:      SA1 SA2 SA3 SA4 | SA5 SA6 SA7  SA8
+#     episode_s:   60  60  60  60 |  75  90 120  180
+#     此血緣跑的 task 是 Isaac-Navigation-Charge-VLP16-Curriculum-WD（curriculum 配置），
+#     episode_length_s = float(scene["episode_s"]) → SA1~SA4 皆 60s。
+#     ⚠ charge_env_cfg_vlp16_curriculum.py:612 的 45.0 只是 **Phase 1 初始值**（註解已寫
+#       「課程動態調整 45→90s」），會被 stage 表覆寫。2026-08-17 曾據該 45.0 誤改成 45.0，
+#       同日以 stage 表更正回 60.0 —— 只查基礎/初始 cfg 不足以定案，要查 task 實際用的那份。
+#     實測吻合：R3 lateral 最長回合 239 步 = 47.8s，超過 45s(225 步) 但遠低於 60s(300 步)。
+#
+# 上路序列（handoff §5，不得跳）：
+#   ① 架空（輪子離地）+ estop 在手，全速率記 rl_w
+#   ② 看 W1-c10 失效指紋：|rl_w|>=0.83 佔比、左右翻轉次數、map_yaw 0.05s 跳 ~97°
+#      → 出現即停，那是延遲驅動極限環（delay/dt≈1.0），調車上參數治不好
+#   ③ 只有架空乾淨才進地面：空曠、無行人、estop 在手、每次 10~15s 短脈衝（不連續跑）
+#   ⚠ 架空乾淨 ≠ 綠燈。輪子離地沒有負載，傳動的動態響應與地面不同；延遲極限環的成因是
+#     delay/dt≈1.0 疊上實際機電響應，架空跑不出來只代表「沒有明顯 showstopper」，
+#     不代表延遲問題已排除。架空乾淨 = 可以進下一關，不是結案。
+# ============================================================================
+rover_rl_policy:
+  ros__parameters:
+    # --- Model ---
+    model_path: "/home/aa/rover_rl/models/sa4_r3_it50_83d_k8.ts"
+    device: "cpu"                     # 車上 torch 是 CPU 版；裝 CUDA torch 後可改 cuda:0
+
+    # --- Topics（CampusRover 實車配置） ---
+    topic_lidar_sweep: "/rover_rl/lidar_sweep_72"   # 訂閱 preprocessor 發的 72-bin sweep
+    topic_lidar_raw: "/velodyne_points"             # 只在 use_inline_preprocess=true 時用
+    use_inline_preprocess: false                     # false=要先啟 lidar_preprocessor 節點
+    topic_odom: "/odom"
+    topic_goal_pose: "/goal_pose"
+    topic_global_path: "/global_path"
+    topic_cmd_vel: "/input/nav_cmd_vel"
+    topic_markers: "~/markers"
+    topic_trail: "/rover_rl/trail"
+    topic_obs_debug: "~/obs_debug"
+    publish_obs_debug: true
+    publish_markers: true
+    publish_trail: true
+    trail_rate_hz: 5.0
+    trail_min_distance_m: 0.05
+    trail_max_points: 2000
+    trail_clear_on_goal: true         # 每段一條軌跡（回放/比對用）
+
+    # --- QoS ---
+    lidar_qos_best_effort: true       # velodyne 驅動為 SensorDataQoS
+
+    # --- LiDAR 校準（權威：charge_env_cfg_vlp16.py:423-426）---
+    lidar_yaw_offset_deg: 0.0         # velodyne_link 相對 base_link 無 yaw → 0
+    lidar_z_filter_m: 0.5             # sensor frame |z|>0.5 過濾地板/天花板
+    lidar_r_min_m: 0.5                # ★ 不是 0.25。近於此距離視為盲區（設成 r_max）
+    lidar_r_max_m: 20.0               # >= 此值正規化為 1.0
+    #   ⚠ 必與 lidar_preprocessor_params_sa1r1.yaml 同步；parity 抓不到這一項
+
+    # --- Obs normalizer（勿改；權威見檔頭 ego ObsTerm 段）---
+    obs_max_acceleration: 1.0         # obs[0] 分母
+    obs_max_linear_velocity: 1.0      # obs[1] 分母
+    obs_max_angular_velocity: 1.5     # obs[2] 分母（≠ 動作 ω_max=1.2，勿混用）
+    robot_radius_m: 0.35              # obs[3] 常數欄 + sweep 正規化基準（ROBOT_BODY_RADIUS）
+    episode_horizon_s: 60.0           # ★ SA1~SA4 stage 值（wd_single_agent_v3.py:108）。不是 45.0
+    # obs[78] = max(0, 1 − elapsed/60)，elapsed 由 policy_node 定義為
+    #   **「從收到這個 goal_pose / 新 path 起算」**（_cb_goal:809 / _cb_path:847 重置 _start_t），
+    #   等同訓練的「一個 episode = 一次導航任務」。0~60s 走完 1.0→0.0，值域與訓練相同。
+    # policy 實際走過的區間偏高位（PC 端 R3 統計）：到達 p50 67 步→0.78、全部 p99 142 步→0.53、
+    #   最長 239 步→0.20。低 ratio 區在訓練裡本來就少見，實車若長時間停在低位就是離分布。
+    # ⚠ 超過 60s 後夾在 0.0 不動（是訓練 episode 末端那個值，但「持續停在 0」不在訓練分布內）。
+    #   obs[78] 實際餵入值已寫進 chain_trace 的 obs_time_rem 與 status 的
+    #   obs_time_rem/ep_overrun，跑完可直接查有沒有進這區。單段導航若常超 60s（長 routing path），
+    #   要回報 PC 端決定這一維怎麼定義，不要車端自行發明。
+
+    # --- Action limits（權威：docs/freeze/sa1_action_contract_v1.json，manifest 逐項比對）---
+    act_max_linear_velocity: 1.0      # v_max
+    act_max_linear_accel: 0.5         # a_max
+    act_max_angular_velocity: 1.2     # 動作 ω_max（底盤 profile_omega_max 也是 1.2）
+    act_max_angular_accel: 3.0        # ω 命令 slew：每步 Δω ≤ 3.0×0.2 = 0.6
+    allow_reverse: false              # 首次驗證禁止倒車。開啟後倒車界 = -0.2 m/s（下一行）
+    reverse_velocity_scale: 0.2       # ★倒車界在 decoder 內（不是輸出層再 clamp）。
+                                      #   W1-c10 曾 decode 出 rl_v=-0.557、輸出層才夾成 -0.2，
+                                      #   於是 83D history 記到的與實際送出的是兩層不同東西。
+
+    # --- 全域速度縮放 ---
+    speed_rate: 0.6                   # ← 2026-08-17 車端指定降為 0.6（與 sa4r2 同值，兩顆模型才可公平對照）
+                                      # ★架空與地面首跑都用 1.0（2026-08-17 與 PC 端定案，勿降）。
+                                      #   1) act_hist / α slew 只在 rate=1 精確對齊，而 act_hist 正是
+                                      #      此 checkpoint 用來推延遲的唯一線索 → 降 rate 是確定的代價。
+                                      #   2) W1-c10 的失效是**角向**的（|rl_w|≥0.83、左右翻轉、map_yaw 跳），
+                                      #      speed_rate 縮的是線速度，damp 不到那個模態；甚至可能更糟
+                                      #      —— 原本邊走邊甩頭（畫弧），降速後接近原地打轉，ω 振幅一樣。
+                                      #   → 降 rate = 付確定代價買不確定保護。安全改用場地與時長買：
+                                      #      開放場地留足半徑、每次只跑 10~15s 短脈衝、estop 手指不離、
+                                      #      架空乾淨才進地面。
+
+    # --- Action stacking（raw_obs_dim==83 自動啟用）---
+    # ★正規化分母取自 checkpoint args（action_history_accel_normalizer=0.5 /
+    #   action_history_omega_normalizer=1.2），不是舊模型的 0.2 / π/15。
+    #   同一個 ω=0.6 rad/s：除 1.2 → 0.5；除 π/15 → 2.87 clip 成 2.0。
+    #   manifest 會拿這兩個值比對 <model>.obs_spec.json，不符直接拒絕啟動。
+    act_stack_size: 2                 # 83 = 79 + 2×2
+    act_stack_a_max: 0.5              # 線加速度分母
+    act_stack_omega_max: 1.2          # 角速度分母
+    act_hist_mode: "auto"             # auto=讀 sidecar（此模型 → raw）
+    act_hist_err_source: "measured"   # 僅 action_error 模式用；raw 模式不生效
+    act_err_v_max: 1.0
+    act_err_w_max: 1.2
+
+    # --- 控制週期 ---
+    control_dt: 0.2                   # 5 Hz 推論；= 訓練 decimation×sim.dt，勿改
+    cmd_rate_hz: 20.0                 # 20 Hz republish（避開底盤/mux watchdog）
+    marker_rate_hz: 10.0
+    deterministic: true               # argmax（訓練 gate 也是 deterministic）
+    timeout_lidar_s: 0.5
+    timeout_odom_s: 0.3
+    lidar_motion_compensation: false  # inline fallback 用；與 preprocessor yaml 同步關閉
+
+    # --- 發布層：不得改動 issued command ---
+    # 單一 issued-command 層：decoder(+slew) 的輸出 = 進入致動延遲佇列的命令 =
+    # act_hist 記的值 = 送出的值。passthrough 讓 20Hz republish 退化成 zero-order hold。
+    # 訓練端沒有低通層；線加速度界與 α slew 已在 decoder 內完成，再疊一層只會製造相位落後。
+    cmd_passthrough: true
+    issued_vs_published_tol: 1.0e-6   # 超過即告警並印出兩層的值
+    # 以下四項在 passthrough=true 時不生效（保留以便切回舊行為對照）
+    cmd_alpha_linear: 0.3
+    cmd_alpha_angular: 0.5
+    cmd_max_accel_linear: 1.0
+    cmd_max_accel_angular: 3.0
+
+    # --- 開機規格檢查（任一項不符即拒絕啟動，不是警告）---
+    manifest_strict: true
+    manifest_fixture_path: "/home/aa/rover_rl/docs/freeze/sa1_action_contract_v1.json"
+    manifest_expected_sha256: "efe5cd1c17651cd86df98dce244fd0bb629fba997d087365e2118b149652fb69"
+
+    # --- 位姿跳變 guard（物理極速反推）---
+    pose_jump_guard_enabled: true
+    pose_jump_margin: 1.5
+    pose_jump_recover_samples: 3
+
+    # --- 逐拍命令鏈追蹤（架空測試靠這條看 rl_w 波形）---
+    chain_trace_enabled: true
+    chain_trace_path: "/home/aa/rover_rl/logs/chain_trace.jsonl"
+
+    # --- cmd_delay 補償：★關閉 ---
+    # 此 checkpoint 訓練時就吃 U{0,1,2} 步致動延遲（0/200/400ms），延遲已在 policy 內建模。
+    # 再開補償 = 重複補一次 → 過度領先。要驗證延遲行為請看架空的 rl_w 波形，不要先開補償。
+    cmd_delay_comp_s: 0.0
+    cmd_delay_comp_enable: false
+    cmd_delay_comp_src: "measured"
+
+    # --- mode ---
+    initial_mode: "idle"              # ★首次上電待命；確認後才切 nav（launch 可覆寫）
+    base_frame: "base_footprint"      # 查 map→此 frame TF 取車姿
+
+    # --- Goal / 定位 ---
+    goal_frame: "map"
+    goal_tolerance_m: 0.6
+    path_lookahead_m: 2.0
+    topic_ndt_pose: "/ndt_pose"       # 僅用於 NDT 活性判定（內容是 map→odom，非車姿）
+    require_ndt: false                # false=fallback 純 odom
+    # 終點朝向對齊（policy 外補；只對單一 goal_pose，routing path 不對齊）
+    goal_align_yaw_enable: true
+    goal_align_yaw_tol_deg: 8.0
+    goal_align_kp: 1.2
+    goal_align_w_max: 0.6
+    goal_align_w_min: 0.15            # 過底盤死區
+
+    # --- 底盤上限（僅供 TUI 標示超限，不改變輸出）---
+    chassis_v_max: 1.5
+    chassis_omega_max: 1.2
+
+    # --- Safety ---
+    safety_lidar_emergency_stop_m: 0.40   # 首次部署保守值
