@@ -53,6 +53,11 @@ from visualization_msgs.msg import MarkerArray
 
 from .action_decoder import ActionParams, decode_logits_to_cmd
 from .cmd_filter import CmdFilter, CmdFilterParams
+from .chain_trace import ChainTracer, logit_stats
+from .pose_jump_guard import PoseJumpGuard, STATE_OK
+from .model_manifest import (
+    verify_bundle, load_json_if_exists, sha256_file, ManifestMismatch,
+)
 from .latency import LagEstimator
 from .lidar_preprocess import lidar_sweep_72_real, pointcloud2_to_xyz
 from .localization import MapOdomOffsetTracker, RobotPose, world_to_body
@@ -180,6 +185,23 @@ class PolicyNode(Node):
         self.declare_parameter("act_max_linear_accel", 0.5)
         self.declare_parameter("act_max_angular_velocity", 2.0)
         self.declare_parameter("allow_reverse", False)
+        # 倒車上限縮放（對齊訓練端 reverse_velocity_scale）。
+        # 1.0 = 對稱 ±v_max（舊行為，既有 config 語意不變）；0.2 = 訓練值 -0.2 m/s。
+        self.declare_parameter("reverse_velocity_scale", 1.0)
+        # 見 CmdFilterParams.passthrough：True = 發布層不再改動 issued command。
+        self.declare_parameter("cmd_passthrough", False)
+        # 逐拍命令鏈追蹤（handoff #8）。關閉時完全零成本。
+        self.declare_parameter("manifest_strict", True)
+        self.declare_parameter("manifest_fixture_path",
+                               "/home/aa/rover_rl/docs/freeze/sa1_action_contract_v1.json")
+        self.declare_parameter("manifest_expected_sha256", "")
+        self.declare_parameter("pose_jump_guard_enabled", True)
+        self.declare_parameter("pose_jump_margin", 1.5)
+        self.declare_parameter("pose_jump_recover_samples", 3)
+        self.declare_parameter("chain_trace_enabled", False)
+        self.declare_parameter("chain_trace_path", "/home/aa/rover_rl/logs/chain_trace.jsonl")
+        # issued(L2) 與 published(L3) 容許的最大分歧（m/s、rad/s）。
+        self.declare_parameter("issued_vs_published_tol", 1e-6)
         # v3c 角速度 α slew 上限 (rad/s²)：0.0=不做 slew（79/139 舊模型）；v3c=3.0。
         # 對齊訓練端 discrete_differential_drive；用 v3c 時須同時把 act_max_angular_velocity 設 0.25π。
         self.declare_parameter("act_max_angular_accel", 0.0)
@@ -296,8 +318,13 @@ class PolicyNode(Node):
             max_angular_velocity_action=float(gp("act_max_angular_velocity").value),
             dt=self.control_dt,
             max_angular_accel=float(gp("act_max_angular_accel").value),
+            # 倒車界在 decoder 內生效（非輸出層 clamp），對齊訓練端
+            reverse_velocity_scale=max(
+                0.0, min(1.0, float(gp("reverse_velocity_scale").value))
+            ),
         )
         self.allow_reverse = bool(gp("allow_reverse").value)
+        self.reverse_velocity_scale = max(0.0, min(1.0, float(gp("reverse_velocity_scale").value)))
         self.speed_rate = self._clamp_rate(float(gp("speed_rate").value))
         # action stacking 常數（是否啟用由 bundle.raw_obs_dim 決定，於 bundle 載入後設定）
         self.act_stack_size = max(1, int(gp("act_stack_size").value))
@@ -328,8 +355,16 @@ class PolicyNode(Node):
             alpha_angular=float(gp("cmd_alpha_angular").value),
             max_accel_linear=float(gp("cmd_max_accel_linear").value),
             max_accel_angular=float(gp("cmd_max_accel_angular").value),
-            min_linear_velocity=(-float("inf") if self.allow_reverse else 0.0),
+            # 倒車下界對齊訓練：訓練端 v_next clamp 到 [-v_max*reverse_scale, +v_max]。
+            # 放 -inf 會讓車子倒到 -v_max（訓練從未見過的 5 倍速度）。
+            min_linear_velocity=(
+                -float(gp("act_max_linear_velocity").value)
+                * self.reverse_velocity_scale
+                if self.allow_reverse else 0.0
+            ),
+            passthrough=bool(gp("cmd_passthrough").value),
         )
+        self.issued_vs_published_tol = float(gp("issued_vs_published_tol").value)
         self._initial_mode = gp("initial_mode").get_parameter_value().string_value or "nav"
 
     # ──────────────────────────── 模型載入 ────────────────────────────
@@ -345,6 +380,46 @@ class PolicyNode(Node):
         self.runner = PolicyRunner(self.bundle)
         # 83D bundle → 啟用 action stacking（mirror 訓練端 action history）
         self.use_act_stack = (self.bundle.raw_obs_dim == 83)
+
+        # ── 規格 manifest：不符即拒絕啟動（handoff #5）──────────────
+        # 只檢查 raw_obs_dim==83 是不夠的：若 act_max_angular_velocity 被寫成
+        # 0.785（v3c 已知 bug），節點照樣正常啟動，只是每個轉向命令都是錯的。
+        try:
+            gpv = lambda n: self.get_parameter(n).value  # noqa: E731
+            _spec = load_json_if_exists(
+                os.path.splitext(self._model_path)[0] + ".obs_spec.json")
+            _fx = load_json_if_exists(str(gpv("manifest_fixture_path")))
+            _want_sha = str(gpv("manifest_expected_sha256") or "") or None
+            _rep = verify_bundle(
+                model_path=self._model_path,
+                bundle=self.bundle,
+                obs_spec=_spec,
+                fixture=_fx,
+                runtime={
+                    "act_max_linear_velocity": float(gpv("act_max_linear_velocity")),
+                    "act_max_angular_velocity": float(gpv("act_max_angular_velocity")),
+                    "act_max_linear_accel": float(gpv("act_max_linear_accel")),
+                    "act_max_angular_accel": float(gpv("act_max_angular_accel")),
+                    "control_dt": float(gpv("control_dt")),
+                    "reverse_velocity_scale": float(gpv("reverse_velocity_scale")),
+                    "speed_rate": float(gpv("speed_rate")),
+                    "act_stack_size": int(gpv("act_stack_size")),
+                    "act_stack_a_max": float(gpv("act_stack_a_max")),
+                    "act_stack_omega_max": float(gpv("act_stack_omega_max")),
+                    "cmd_passthrough": bool(gpv("cmd_passthrough")),
+                },
+                expected_sha256=_want_sha,
+                strict=bool(gpv("manifest_strict")),
+            )
+            self.get_logger().info(
+                "[MANIFEST] 規格檢查 %s\n%s"
+                % ("PASS" if _rep.ok else "FAIL(非嚴格模式)", _rep.text())
+            )
+        except ManifestMismatch:
+            raise
+        except Exception as exc:   # 檢查本身壞掉不該偽裝成規格不符
+            self.get_logger().error(f"[MANIFEST] 檢查執行失敗：{exc!r}")
+            raise
         self._act_hist_mode = (self._resolve_act_hist_mode(self._model_path)
                                if self.use_act_stack else "raw")
         if self.use_act_stack:
@@ -393,6 +468,16 @@ class PolicyNode(Node):
         self._last_cmd_v_pf = 0.0
         self._last_cmd_w_pf = 0.0
         self._act_hist_err = np.zeros(2, dtype=np.float32)
+        self._obs_time_rem: float | None = None   # 上一拍餵進網路的 obs[78]
+        self._issued_v = 0.0
+        self._issued_w = 0.0
+        self._issued_accel = 0.0
+        # 線速度積分器（對齊訓練端 discrete_differential_drive._current_velocity）：
+        # 基準是「上一拍 issued 速度」而非 odom 量測。sim 無馬達故兩者相同，實車才分岔；
+        # 餵量測會讓命令低於底盤死區時永遠爬不起來（起步死鎖）。存 policy-frame（未 ×rate），
+        # speed_rate 熱調時尺度才不會錯亂。PC 端 2026-08-18 回覆 Q1 指定此語意。
+        self._int_v_pf = 0.0
+        self._safety_override = False
         if not hasattr(self, "_act_hist_mode"):
             self._act_hist_mode = "raw"   # 正常已由 _load_model 設好；防呆
         # action stacking buffer（v3c）：存近 N 步「正規化後動作 [a,ω]」，appendleft 最新。
@@ -449,6 +534,23 @@ class PolicyNode(Node):
         #  - 手動 2D Goal Pose 後設回 None，讓下一條(即使座標相同)的 routing 重新生效
         self._last_path_sig: tuple | None = None
         self.cmd_filter = CmdFilter(self.cmd_filter_params)
+        self.chain_tracer = ChainTracer(
+            self.get_parameter("chain_trace_path").value,
+            enabled=bool(self.get_parameter("chain_trace_enabled").value),
+        )
+        # 位姿跳變 guard：物理極速反推的合理範圍，裝在 policy 消費位姿處。
+        self.pose_guard_enabled = bool(
+            self.get_parameter("pose_jump_guard_enabled").value)
+        self.pose_guard = PoseJumpGuard(
+            v_max=float(self.get_parameter("act_max_linear_velocity").value),
+            w_max=float(self.get_parameter("act_max_angular_velocity").value),
+            margin=float(self.get_parameter("pose_jump_margin").value),
+            recover_samples=int(
+                self.get_parameter("pose_jump_recover_samples").value),
+        )
+        self._chain_pose_snapshot = None
+        self._chain_pending = None      # 本拍推論填好、等發布端補完的 sample
+        self._chain_last_seq = -1
         # 延遲估計（送出 cmd ↔ odom 實測），線速度/角速度各一
         _cmd_dt = 1.0 / max(self.cmd_rate_hz, 1.0)
         self.lag_v = LagEstimator(_cmd_dt)
@@ -831,6 +933,9 @@ class PolicyNode(Node):
                 self._target_v = 0.0
                 self._target_w = 0.0
             self.cmd_filter.reset()
+            # 停止期間位姿可能被外部搬動；恢復時不該拿舊位姿當基準
+            if getattr(self, "pose_guard", None) is not None:
+                self.pose_guard.reset("mode change")
 
     # ──────────────────────────── 定位（TF map→base）────────────────────────────
 
@@ -892,6 +997,7 @@ class PolicyNode(Node):
             self._last_cmd_v_pf = 0.0
             self._last_cmd_w_pf = 0.0
             self._act_hist_err = np.zeros(2, dtype=np.float32)
+            self._int_v_pf = 0.0
 
     def _act_hist_flat(self) -> np.ndarray:
         """攤平成 4D obs[79:83]。
@@ -964,6 +1070,36 @@ class PolicyNode(Node):
 
         # 機器人在 map frame 的位姿：走 TF map→base（map→odom 由 NDT 發、odom→base 由底盤發）
         robot_pose = self._robot_pose_in_map(odom_x, odom_y, odom_yaw)
+
+        # ── 位姿跳變 guard（fail-closed）──────────────────────────────
+        # 判準：兩拍之間的位移/轉角必須能用「經過時間 × 物理極速」解釋。
+        # 實車曾在 0.05 s 內出現 97.4° 的 map_yaw 跳變（物理上限 3.4°），
+        # policy 信了它就拼命打方向盤。這裡攔下並清空被污染的歷史。
+        if self.pose_guard_enabled:
+            _gr = self.pose_guard.check(
+                robot_pose.x, robot_pose.y, robot_pose.yaw, now)
+            self._chain_pose_snapshot = (
+                robot_pose.x, robot_pose.y, robot_pose.yaw,
+                _gr.dt, _gr.dpos, _gr.dyaw, robot_pose.source,
+                _gr.state, _gr.reason,
+            )
+            if not _gr.ok:
+                # 清空 recurrent/幀歷史與動作歷史：錯誤觀測已進 K=8 幀與 4 維
+                # 動作歷史，只停當拍不夠，污染會延續數拍。
+                try:
+                    self.runner.reset()
+                except Exception:
+                    pass
+                self._reset_act_hist()
+                self.cmd_filter.reset()
+                return self._set_target_stop(
+                    f"位姿跳變 guard[{_gr.state}]：{_gr.reason}"
+                )
+        else:
+            self._chain_pose_snapshot = (
+                robot_pose.x, robot_pose.y, robot_pose.yaw,
+                None, None, None, robot_pose.source, "disabled", None,
+            )
         # require_ndt=true：沒有 map→base TF（NDT 未提供 map→odom）或 NDT 不穩定就不動
         if self.require_ndt and (robot_pose.source != "tf"
                                  or not self.localizer.is_ndt_stable()):
@@ -1123,7 +1259,25 @@ class PolicyNode(Node):
             params=self.obs_params,
             action_history=act_hist,
         )
+        # obs[78] 實際餵入值（逐字，供 status/chain_trace 驗證時間特徵有沒有偏移或夾在 0）
+        self._obs_time_rem = float(obs[78])
         logits = self.runner.step(obs)
+
+        # ── 命令鏈追蹤：policy 決策段 ──
+        _chain = None
+        if self.chain_tracer.enabled:
+            _chain = self.chain_tracer.begin()
+            try:
+                (_chain.idx_a, _chain.idx_w, _chain.logit_a_max,
+                 _chain.logit_w_max, _chain.logit_a_margin,
+                 _chain.logit_w_margin) = logit_stats(logits)
+            except Exception:      # 診斷不得影響控制
+                pass
+            # ★逐字複製「真正餵進網路」的那 4 個值，不重算
+            _chain.hist = list(act_hist) if act_hist is not None else []
+            _chain.obs_time_rem = self._obs_time_rem
+            _chain.speed_rate = rate
+            _chain.mode = str(self.mode_mgr.mode)
         # 動作端：上限 ×rate 縮回實體速度；current_vel 用真實 v 做積分
         # （obs 端放大 1/rate、action 端縮小 ×rate 的不對稱，正是時間膨脹的本質：
         #  policy 在「放大的感知世界」決策，輸出再縮回真實世界的慢速指令）
@@ -1133,21 +1287,28 @@ class PolicyNode(Node):
             max_linear_accel=self.act_params.max_linear_accel * rate,
             max_angular_velocity_action=self.act_params.max_angular_velocity_action * rate,
             dt=self.act_params.dt,
+            reverse_velocity_scale=self.act_params.reverse_velocity_scale,
             max_angular_accel=self.act_params.max_angular_accel * rate,
         ))
         # v3c α slew 需「上一步 applied ω」（= 上次 _target_w）；舊模型 max_angular_accel=0 時不使用
+        # 積分基準：上一拍 issued（policy-frame）×rate 換回 act_eff 的實體尺度。
+        # 不用 odom 量測 v——訓練端 _current_velocity 是純積分器、從不回讀物理量。
+        v_base = self._int_v_pf * rate
         cmd_v, cmd_w, accel = decode_logits_to_cmd(
-            logits, current_linear_vel=v,
+            logits, current_linear_vel=v_base,
             params=act_eff, deterministic=self.deterministic,
             current_angular_vel=self._target_w,
         )
+
+        # decode 原值（allow_reverse clamp 之前），供診斷對照 issued
+        _decoded_v, _decoded_w = cmd_v, cmd_w
 
         # RL policy 不直接負責安全倒車；倒車若要保留，應由明確 safety/recovery
         # 狀態機在有 rear 感測與距離／時間上限時才下發。
         if not self.allow_reverse and cmd_v < 0.0:
             raw_cmd_v = cmd_v
             cmd_v = 0.0
-            accel = (cmd_v - v) / max(act_eff.dt, 1e-6)
+            accel = (cmd_v - v_base) / max(act_eff.dt, 1e-6)
             self.get_logger().warn(
                 f"RL negative vx clamped: {raw_cmd_v:.3f} -> 0.0",
                 throttle_duration_sec=2.0,
@@ -1158,6 +1319,22 @@ class PolicyNode(Node):
             self._target_v = cmd_v
             self._target_w = cmd_w
             self._target_set_t = now
+            # ★單一 issued-command 層：decoder(+reverse clamp) 的輸出就是
+            #   「進入致動器傳輸延遲佇列」的命令，83D history 也記這一組。
+            #   發布端必須與它相等（cmd_passthrough=True），否則 _tick_cmd 會告警。
+            self._issued_v = cmd_v
+            self._issued_w = cmd_w
+            self._issued_accel = accel
+            self._int_v_pf = cmd_v * inv    # 存 policy-frame，供下一拍當積分基準
+
+        if _chain is not None:
+            _chain.decoded_v, _chain.decoded_w = _decoded_v, _decoded_w
+            _chain.issued_v, _chain.issued_w = cmd_v, cmd_w
+            _chain.issued_accel = accel
+            _chain.infer_ms = self._infer_ms
+            _chain.sweep_age_ms = self._sweep_age_ms
+            with self._lock:
+                self._chain_pending = _chain
             # 延遲預算 S3：這一拍的純計算耗時 + 用到的 sweep 已放多久（5Hz 取樣造成的老化）
             self._infer_ms = (time.perf_counter() - t_perf0) * 1e3
             self._sweep_age_ms = (sweep_age * 1e3) if math.isfinite(sweep_age) else None
@@ -1181,6 +1358,7 @@ class PolicyNode(Node):
         with self._lock:
             self._target_v = 0.0
             self._target_w = 0.0
+            self._int_v_pf = 0.0    # 強制停車時 issued=0，積分基準跟著歸零
         if warn:
             self.get_logger().warn(reason, throttle_duration_sec=2.0)
 
@@ -1217,10 +1395,55 @@ class PolicyNode(Node):
 
         # low-pass + slew-rate 平滑：把 5Hz 離散動作的跳階磨平再以 20Hz 送出
         out_v, out_w = self.cmd_filter.step(tgt_v, tgt_w, dt)
+
+        # ★issued(L2) vs published(L3) 一致性守門。
+        # 安全覆寫（estop/idle/paused/推論過期）發 0 是合法的，標記為
+        # safety_override 而非分歧；其餘任何差異都代表發布層偷改了命令，
+        # 那會讓 83D history 記到一個從未送出的值（實車已發生過）。
+        with self._lock:
+            iss_v, iss_w = self._issued_v, self._issued_w
+        safety_override = (
+            self.mode_mgr.force_zero_cmd()
+            or (tgt_v == 0.0 and tgt_w == 0.0 and (iss_v, iss_w) != (0.0, 0.0))
+        )
+        self._safety_override = safety_override
+        if not safety_override:
+            dv = abs(out_v - iss_v)
+            dw = abs(out_w - iss_w)
+            if max(dv, dw) > self.issued_vs_published_tol:
+                self.get_logger().warn(
+                    "issued != published："
+                    f"issued=({iss_v:+.4f},{iss_w:+.4f}) "
+                    f"published=({out_v:+.4f},{out_w:+.4f}) "
+                    f"Δ=({dv:.4f},{dw:.4f})；"
+                    "83D history 記的是 issued，兩層不一致會讓 policy 讀到"
+                    "未送出的命令。請確認 cmd_passthrough=true。",
+                    throttle_duration_sec=2.0,
+                )
+
         msg = Twist()
         msg.linear.x = out_v
         msg.angular.z = out_w
         self.pub_cmd.publish(msg)
+
+        # ── 命令鏈追蹤：發布段（只在本拍推論剛更新時寫一次）──
+        if self.chain_tracer.enabled:
+            with self._lock:
+                pend = self._chain_pending
+                od_v, od_w = self._odom_v, self._odom_w
+            if pend is not None and pend.seq != self._chain_last_seq:
+                pend.published_v, pend.published_w = out_v, out_w
+                pend.safety_override = safety_override
+                pend.issued_vs_published_dv = abs(out_v - (pend.issued_v or 0.0))
+                pend.issued_vs_published_dw = abs(out_w - (pend.issued_w or 0.0))
+                pend.odom_v, pend.odom_w = od_v, od_w
+                pose = getattr(self, "_chain_pose_snapshot", None)
+                if pose is not None:
+                    (pend.map_x, pend.map_y, pend.map_yaw, pend.pose_dt,
+                     pend.pose_dpos, pend.pose_dyaw, pend.pose_source,
+                     pend.jump_guard_state, pend.jump_guard_reason) = pose
+                self._chain_last_seq = pend.seq
+                self.chain_tracer.commit(pend)
 
         # 餵延遲估計：拿「送出的 cmd」對「底盤實測 odom twist」做互相關，
         # 估 cmd→實際響應的死時間（rover_rl 無 cmd_delay 補償，靠這診斷振盪風險）
@@ -1405,6 +1628,12 @@ class PolicyNode(Node):
             "infer_ms": (round(self._infer_ms, 2) if self._infer_ms is not None else None),
             "sweep_age_ms": (round(self._sweep_age_ms, 1)
                              if self._sweep_age_ms is not None else None),
+            # obs[78] 時間特徵：實際餵入值 + 是否已夾在 0（超過 episode_horizon）
+            "obs_time_rem": (round(self._obs_time_rem, 3)
+                             if self._obs_time_rem is not None else None),
+            "ep_overrun": (self._obs_time_rem is not None
+                           and self._obs_time_rem <= 1e-9),
+            "episode_horizon_s": self.obs_params.episode_horizon_s,
             # RNN hidden state（episode 內記憶）
             "rnn_norm": round(self.runner.hidden_norm(), 2),
             "rnn_steps": self.runner.step_count,
