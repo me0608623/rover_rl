@@ -56,7 +56,7 @@ from .action_decoder import ActionParams, decode_logits_to_cmd
 from .cmd_filter import CmdFilter, CmdFilterParams
 from .chain_trace import ChainTracer, logit_stats
 from .pose_jump_guard import (
-    OdomDeadReckoner, PoseJumpGuard, STATE_OK, STATE_SOFT,
+    OdomDeadReckoner, PoseJumpGuard, STATE_OK, STATE_REJECTED, STATE_SOFT,
 )
 from .model_manifest import (
     verify_bundle, load_json_if_exists, sha256_file, ManifestMismatch,

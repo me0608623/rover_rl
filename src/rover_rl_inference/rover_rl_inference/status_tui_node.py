@@ -1165,9 +1165,16 @@ def main(args=None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        # 先 shutdown 讓背景 spin_thread 的 rclpy.spin() 自己跳出迴圈、
+        # join 等它真正結束，才能 destroy_node()——否則主執行緒砍節點時
+        # spin_thread 可能還在同一個節點上處理 callback，兩條執行緒同時
+        # 動同一份底層資源，會在 rcl/rmw 那層炸成 SIGABRT
+        # （"terminate called without an active exception"），Python 例外
+        # 處理完全攔不到。
         if rclpy.ok():
             rclpy.shutdown()
+        spin_thread.join(timeout=2.0)
+        node.destroy_node()
         print("⏹ status_tui 已離開")
 
 
