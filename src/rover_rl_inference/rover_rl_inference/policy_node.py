@@ -36,6 +36,7 @@ import math
 import os
 import threading
 import time
+from dataclasses import replace
 
 import numpy as np
 import rclpy
@@ -54,7 +55,9 @@ from visualization_msgs.msg import MarkerArray
 from .action_decoder import ActionParams, decode_logits_to_cmd
 from .cmd_filter import CmdFilter, CmdFilterParams
 from .chain_trace import ChainTracer, logit_stats
-from .pose_jump_guard import PoseJumpGuard, STATE_OK
+from .pose_jump_guard import (
+    OdomDeadReckoner, PoseJumpGuard, STATE_OK, STATE_SOFT,
+)
 from .model_manifest import (
     verify_bundle, load_json_if_exists, sha256_file, ManifestMismatch,
 )
@@ -198,6 +201,10 @@ class PolicyNode(Node):
         self.declare_parameter("pose_jump_guard_enabled", True)
         self.declare_parameter("pose_jump_margin", 1.5)
         self.declare_parameter("pose_jump_recover_samples", 3)
+        # 分級門檻：超標 < hard_ratio 倍 = NDT 常態噪聲 → 用 odom 遞推位姿續跑（不停車）；
+        # ≥ hard_ratio 倍 = 災難跳變 → 維持 fail-closed。設 1.0 等於關掉分級、回到舊行為。
+        self.declare_parameter("pose_jump_hard_ratio", 2.0)
+        self.declare_parameter("pose_jump_soft_max_consecutive", 10)
         self.declare_parameter("chain_trace_enabled", False)
         self.declare_parameter("chain_trace_path", "/home/aa/rover_rl/logs/chain_trace.jsonl")
         # issued(L2) 與 published(L3) 容許的最大分歧（m/s、rad/s）。
@@ -547,7 +554,12 @@ class PolicyNode(Node):
             margin=float(self.get_parameter("pose_jump_margin").value),
             recover_samples=int(
                 self.get_parameter("pose_jump_recover_samples").value),
+            hard_ratio=float(self.get_parameter("pose_jump_hard_ratio").value),
+            soft_max_consecutive=int(
+                self.get_parameter("pose_jump_soft_max_consecutive").value),
         )
+        # soft 時的替代位姿來源：凍結 map→odom offset、只信 odom 遞推
+        self.pose_reckoner = OdomDeadReckoner()
         self._chain_pose_snapshot = None
         self._chain_pending = None      # 本拍推論填好、等發布端補完的 sample
         self._chain_last_seq = -1
@@ -936,6 +948,8 @@ class PolicyNode(Node):
             # 停止期間位姿可能被外部搬動；恢復時不該拿舊位姿當基準
             if getattr(self, "pose_guard", None) is not None:
                 self.pose_guard.reset("mode change")
+            if getattr(self, "pose_reckoner", None) is not None:
+                self.pose_reckoner.reset()
 
     # ──────────────────────────── 定位（TF map→base）────────────────────────────
 
@@ -1078,20 +1092,47 @@ class PolicyNode(Node):
         if self.pose_guard_enabled:
             _gr = self.pose_guard.check(
                 robot_pose.x, robot_pose.y, robot_pose.yaw, now)
+            if _gr.use_extrapolation:
+                # 軟級：只超標一點，是 NDT 常態噪聲不是災難跳變。改用 odom 遞推
+                # 位姿（凍結 map→odom offset）續跑，不停車也不清歷史 —— 硬停一次
+                # 要付 0.6s 急停 + 2s 重新加速的代價，對每 16 秒就來一次的定位
+                # 噪聲不成比例。遞推值同時要寫回 guard 當基準，避免髒值被默默吃下。
+                _ext = self.pose_reckoner.extrapolate(odom_x, odom_y, odom_yaw)
+                if _ext is not None:
+                    robot_pose = RobotPose(_ext[0], _ext[1], _ext[2],
+                                           f"{robot_pose.source}+dr")
+                    self.pose_guard.set_reference(
+                        robot_pose.x, robot_pose.y, robot_pose.yaw, now)
+                    self.get_logger().warn(
+                        f"位姿跳變 guard[soft]：{_gr.reason}",
+                        throttle_duration_sec=2.0)
+                else:
+                    # 還沒有可信基準可推（剛啟動就跳）→ 退回 fail-closed。
+                    # 基準補上當前值，否則 guard 的 _last 會停在舊拍、dt 一直累積。
+                    _gr = replace(_gr, state=STATE_REJECTED,
+                                  reason=f"{_gr.reason}（無遞推基準，改硬停）")
+                    self.pose_guard.set_reference(
+                        robot_pose.x, robot_pose.y, robot_pose.yaw, now)
             self._chain_pose_snapshot = (
                 robot_pose.x, robot_pose.y, robot_pose.yaw,
                 _gr.dt, _gr.dpos, _gr.dyaw, robot_pose.source,
                 _gr.state, _gr.reason,
             )
-            if not _gr.ok:
-                # 清空 recurrent/幀歷史與動作歷史：錯誤觀測已進 K=8 幀與 4 維
-                # 動作歷史，只停當拍不夠，污染會延續數拍。
+            if _gr.ok:
+                # 這一拍位姿可信 → 更新遞推基準，供未來 soft 拍使用
+                self.pose_reckoner.update(robot_pose.x, robot_pose.y,
+                                          robot_pose.yaw,
+                                          odom_x, odom_y, odom_yaw)
+            elif not _gr.use_extrapolation:
+                # 硬級：清空 recurrent/幀歷史與動作歷史，錯誤觀測已進 K=8 幀與
+                # 4 維動作歷史，只停當拍不夠，污染會延續數拍。
                 try:
                     self.runner.reset()
                 except Exception:
                     pass
                 self._reset_act_hist()
                 self.cmd_filter.reset()
+                self.pose_reckoner.reset()
                 return self._set_target_stop(
                     f"位姿跳變 guard[{_gr.state}]：{_gr.reason}"
                 )
@@ -1648,6 +1689,11 @@ class PolicyNode(Node):
             "odom_age": round(odom_age, 3) if odom_age != float("inf") else None,
             "ndt_age": round(self.localizer.ndt_age_s, 2),
             "ndt_ok": bool(self.localizer.is_ndt_stable()),
+            # 位姿跳變 guard：soft=用 odom 遞推續跑的次數（定位噪聲），
+            # hard=fail-closed 硬停次數（災難跳變）。兩者比例可判 NDT 健康度。
+            "pose_guard": self.pose_guard.state if self.pose_guard_enabled else "off",
+            "pose_guard_soft": self.pose_guard.soft_count,
+            "pose_guard_hard": self.pose_guard.reject_count,
             "pose_x": round(rp.x, 2), "pose_y": round(rp.y, 2),
             "pose_yaw_deg": round(math.degrees(rp.yaw), 1), "pose_src": rp.source,
             "off_x": round(mo[0], 2) if mo else None,
