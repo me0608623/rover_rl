@@ -31,7 +31,7 @@ def main() -> None:
 
     mr = _load_mr()
     g = np.load(args.golden)
-    obs_seq = g["obs_seq"]        # [T, N, 79] RAW
+    obs_seq = g["obs_seq"]        # [T, N, raw_obs_dim] RAW（79D/K4 與 83D/K8 皆可）
     gold_logits = g["logits"]     # [T, N, 38]
     gold_actions = g["actions"]   # [T, N, 2]
     T, N, _ = obs_seq.shape

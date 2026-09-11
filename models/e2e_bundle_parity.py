@@ -19,7 +19,8 @@ def main() -> None:
     args = ap.parse_args()
 
     g = np.load(args.golden)
-    obs_seq = torch.from_numpy(g["obs_seq"]).float()   # [T, N, 79] RAW
+    # obs 維度由 golden 決定（79D/K4、83D/K8 皆可；勿寫死）
+    obs_seq = torch.from_numpy(g["obs_seq"]).float()   # [T, N, raw_obs_dim] RAW
     gold_logits = torch.from_numpy(g["logits"]).float()  # [T, N, 38]
     gold_actions = torch.from_numpy(g["actions"]).long()  # [T, N, 2]
     K = int(g["frame_stack"])
