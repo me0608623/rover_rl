@@ -1,0 +1,32 @@
+rover_rl_lidar_preprocessor:
+  ros__parameters:
+    # 83D/K8 家族共用（SA1-R1 c1700 / SA4-R3 it50 / SA4-R2 c6400；三份逐字相同）。
+    #   r_max=20.0  r_robot=0.35  r_min=0.5  z_filter=0.5
+    # ★ r_min=0.5 不是 0.25。這是獨立的校準閘門 —— network parity 驗的是網路圖，
+    #   驗不到觀測是怎麼組出來的，所以這一項只能靠這裡與 policy_params_sa1r1.yaml
+    #   的 lidar_r_min_m 同步來保證（兩邊不一致 → sweep 正規化與訓練錯位、無任何徵兆）。
+
+    # --- 輸入/輸出 ---
+    topic_in: "/velodyne_points"             # 原始 VLP-16 點雲輸入
+    topic_odom: "/odom"                       # motion compensation 用的里程計
+    topic_out_sweep: "/rover_rl/lidar_sweep_72"  # 輸出 72-bin sweep（給 policy）
+    topic_out_scan: "/rover_rl/lidar_scan"   # 輸出 LaserScan（給 RViz/costmap）
+    publish_laserscan: true
+    laserscan_frame: "velodyne_link"
+    lidar_qos_best_effort: true              # velodyne 驅動為 SensorDataQoS
+
+    # --- 處理頻率 ---
+    # ⚠ K=8 疊幀的運動線索完全靠「連續、等間隔」的 obs。掉幀或不等間隔 → 疊幀無意義
+    #   （handoff §4 第 4 項）。上路前用 ros2 topic hz 確認穩定 10 Hz。
+    publish_rate_hz: 10.0                    # VLP-16 同步：10 Hz
+
+    # --- 訓練端對齊參數（勿改）---
+    num_bins: 72                             # 角度 bin 數（atan2 環周 360°/72）
+    r_max: 20.0                              # 最遠有效距離(m)，>= 此值正規化為 1.0
+    r_robot: 0.35                            # 機器人半徑(m)，正規化基準
+    r_min: 0.5                               # ★ 中心→障礙表面 < 0.5m 判盲區（設成 r_max）
+    z_filter: 0.5                            # sensor frame |z|>0.5 過濾地板/天花板
+    yaw_offset_deg: 0.0                      # velodyne_link 相對 base_link 無 yaw → 0
+    motion_compensation: false               # ⚠ 關閉：均勻平移式補償會讓近物點雲重新分 bin，
+                                             # 移動時近距離讀數跳變（0.5m→1.1m）。訓練端 Isaac
+                                             # 為瞬時 ray cast 無畸變，關掉反而更貼近訓練分布
