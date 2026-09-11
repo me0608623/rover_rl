@@ -267,7 +267,9 @@ def _export_e2e(args, ckpt, cfg, mm, mean, std, frame_stack):
           f"logits=38 (RNN bypassed)")
 
     act_hist_mode = _infer_act_hist_mode(ckpt, args.act_hist_mode)
-    spec = _build_obs_spec(cfg, act_hist_mode)
+    a_norm, w_norm, norm_src = _resolve_act_stack_norms(ckpt)
+    spec = _build_obs_spec(cfg, act_hist_mode, a_norm, w_norm)
+    spec["act_stack_norm_source"] = norm_src
     spec["model_file"] = out_path.name
     spec["end_to_end_frame_stack"] = True
     spec["frame_stack"] = K
@@ -280,6 +282,10 @@ def _export_e2e(args, ckpt, cfg, mm, mean, std, frame_stack):
     json_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(_spec_to_markdown(spec, out_path.name), encoding="utf-8")
     print(f"     act_hist_mode={act_hist_mode}  spec→ {json_path.name} / {md_path.name}")
+    if cfg["raw_obs_dim"] == 83:
+        print(f"     act_hist 正規化分母 a={a_norm:g} ω={w_norm:g}  來源={norm_src}")
+        print(f"     → yaml 必須是 act_stack_a_max: {a_norm:g} / "
+              f"act_stack_omega_max: {w_norm:g}（manifest 會比對，不符拒絕啟動）")
 
 
 def _autodetect(ckpt: dict, overrides: dict) -> dict:
@@ -327,11 +333,36 @@ def _autodetect(ckpt: dict, overrides: dict) -> dict:
     return cfg
 
 
-# act_stack 正規化常數（與訓練 obs term + 車端 policy_node 一致；勿改）
-_ACT_STACK_A_MAX = 0.2          # 線加速度正規化分母
-_ACT_STACK_OMEGA_MAX = math.pi / 15.0   # 角速度正規化分母 ≈0.2094
+# act_stack 正規化分母的**舊模型退回值**（v3c/v3e 等 checkpoint 的 args 沒存這兩項）。
+# ⚠️ 不是通用常數：訓練端可改，改了就不同尺度。權威來源是 checkpoint 的 args
+#    （action_history_accel_normalizer / action_history_omega_normalizer），
+#    見 _resolve_act_stack_norms。sa1_sim2real_v1 = 0.5 / 1.2，與這裡的舊值差 5.7 倍。
+_LEGACY_ACT_STACK_A_MAX = 0.2
+_LEGACY_ACT_STACK_OMEGA_MAX = math.pi / 15.0   # ≈0.2094
 _ACT_MAX_LINEAR_VELOCITY = 1.0  # err_v 正規化分母（=訓練 max_linear_velocity）
 _ACT_MAX_ANGULAR_VELOCITY = 1.2  # err_w 正規化分母（=訓練 max_angular_vel）
+
+
+def _resolve_act_stack_norms(ckpt: dict) -> tuple[float, float, str]:
+    """act_hist 正規化分母：以 checkpoint 訓練參數為權威，缺鍵才退回舊值。
+
+    obs[79:83] = [a/a_norm, ω/ω_norm, …] clamp[-2,2]。分母錯 → 同一個物理動作
+    餵給網路的數值完全不同（ω=0.6 rad/s：除 1.2 得 0.5，除 π/15 得 2.87→clip 2.0），
+    而 act_hist 正是延遲感知 policy 用來推「上兩步下了什麼」的唯一線索。
+    parity 測的是網路圖，抓不到這一項，故必須在匯出時就把真值 bake 進 sidecar。
+    """
+    args = ckpt.get("args", {}) or {}
+    a = args.get("action_history_accel_normalizer")
+    w = args.get("action_history_omega_normalizer")
+    if a is not None and w is not None:
+        return float(a), float(w), "checkpoint args"
+    if a is not None or w is not None:
+        raise ValueError(
+            "checkpoint args 只有半組 action_history_*_normalizer "
+            f"(accel={a}, omega={w})；無法判斷 act_hist 尺度，拒絕匯出"
+        )
+    return (_LEGACY_ACT_STACK_A_MAX, _LEGACY_ACT_STACK_OMEGA_MAX,
+            "legacy fallback (args 無 action_history_*_normalizer)")
 
 
 def _infer_act_hist_mode(ckpt: dict, override: str | None) -> str:
@@ -349,7 +380,9 @@ def _infer_act_hist_mode(ckpt: dict, override: str | None) -> str:
     return "raw"
 
 
-def _build_obs_spec(cfg: dict, act_hist_mode: str) -> dict:
+def _build_obs_spec(cfg: dict, act_hist_mode: str,
+                    act_stack_a_max: float = _LEGACY_ACT_STACK_A_MAX,
+                    act_stack_omega_max: float = _LEGACY_ACT_STACK_OMEGA_MAX) -> dict:
     """產生此 checkpoint 的「觀測維度語義」spec（機器可讀）。
 
     描述車端 obs_builder 要餵給 .ts 的 raw obs 每段語義；act_hist 4D 的後 2 維
@@ -369,15 +402,19 @@ def _build_obs_spec(cfg: dict, act_hist_mode: str) -> dict:
     else:
         fields.append({"range": [78, 79], "name": "time", "desc": "episode 時間 ramp [0,1]"})
     if raw == 83:
-        # act_hist 4D：前 2 維恆為上一步指令，後 2 維依 mode
-        ch01 = ("a_{t-1}/0.2, ω_{t-1}/(π/15)  clamp[-2,2]")
+        # act_hist 4D：前 2 維恆為上一步指令，後 2 維依 mode。
+        # 分母逐字取自此 checkpoint（_resolve_act_stack_norms），不是固定常數。
+        an, wn = f"{act_stack_a_max:g}", f"{act_stack_omega_max:g}"
+        ch01 = f"a_{{t-1}}/{an}, ω_{{t-1}}/{wn}  clamp[-2,2]"
         if act_hist_mode == "action_error":
-            ch23 = ("err_v=(cmd_v−v_meas)/1.0, err_w=(cmd_w−ω_meas)/1.2  clamp[-1,1]"
+            ch23 = (f"err_v=(cmd_v−v_meas)/{_ACT_MAX_LINEAR_VELOCITY:g}, "
+                    f"err_w=(cmd_w−ω_meas)/{_ACT_MAX_ANGULAR_VELOCITY:g}  clamp[-1,1]"
                     "（致動追蹤誤差，1 步延遲）")
         elif act_hist_mode == "delta":
-            ch23 = "Δa=(a_{t-1}−a_{t-2})/0.2, Δω=(ω_{t-1}−ω_{t-2})/(π/15)  clamp[-2,2]"
+            ch23 = (f"Δa=(a_{{t-1}}−a_{{t-2}})/{an}, "
+                    f"Δω=(ω_{{t-1}}−ω_{{t-2}})/{wn}  clamp[-2,2]")
         else:  # raw
-            ch23 = "a_{t-2}/0.2, ω_{t-2}/(π/15)  clamp[-2,2]"
+            ch23 = f"a_{{t-2}}/{an}, ω_{{t-2}}/{wn}  clamp[-2,2]"
         fields.append({"range": [79, 83], "name": "act_hist",
                        "desc": f"[{ch01}, {ch23}]  (mode={act_hist_mode})"})
     return {
@@ -386,8 +423,8 @@ def _build_obs_spec(cfg: dict, act_hist_mode: str) -> dict:
         "hidden_dim": cfg["hidden_dim"],
         "preprocess_dim": cfg["preprocess_dim"],
         "act_hist_mode": act_hist_mode,
-        "act_stack_a_max": _ACT_STACK_A_MAX,
-        "act_stack_omega_max": _ACT_STACK_OMEGA_MAX,
+        "act_stack_a_max": act_stack_a_max,
+        "act_stack_omega_max": act_stack_omega_max,
         "act_err_v_max": _ACT_MAX_LINEAR_VELOCITY,
         "act_err_w_max": _ACT_MAX_ANGULAR_VELOCITY,
         "fields": fields,
@@ -401,6 +438,14 @@ def _spec_to_markdown(spec: dict, model_name: str) -> str:
         f"- raw_obs_dim: **{spec['raw_obs_dim']}** → used: {spec['used_obs_dim']}",
         f"- hidden_dim: {spec['hidden_dim']}, preprocess_dim: {spec['preprocess_dim']}",
         f"- **act_hist_mode: `{spec['act_hist_mode']}`**",
+    ]
+    if spec["raw_obs_dim"] == 83:
+        lines.append(
+            f"- act_hist 正規化分母: a÷{spec['act_stack_a_max']:g}、"
+            f"ω÷{spec['act_stack_omega_max']:g}"
+            f"（來源：{spec.get('act_stack_norm_source', 'n/a')}）"
+        )
+    lines += [
         "",
         "| dims | name | 語義 |",
         "|------|------|------|",
@@ -575,7 +620,9 @@ def export(args):
 
     # ── 產生 obs-spec sidecar（self-describing：語義隨模型走，避免車端誤填） ──
     act_hist_mode = _infer_act_hist_mode(ckpt, args.act_hist_mode)
-    spec = _build_obs_spec(cfg, act_hist_mode)
+    a_norm, w_norm, norm_src = _resolve_act_stack_norms(ckpt)
+    spec = _build_obs_spec(cfg, act_hist_mode, a_norm, w_norm)
+    spec["act_stack_norm_source"] = norm_src
     spec["model_file"] = out_path.name
     spec["experiment_config"] = str((ckpt.get("args", {}) or {}).get("experiment_config", ""))
     stem = out_path.with_suffix("")          # 去掉 .ts
@@ -584,6 +631,10 @@ def export(args):
     json_path.write_text(json.dumps(spec, ensure_ascii=False, indent=2), encoding="utf-8")
     md_path.write_text(_spec_to_markdown(spec, out_path.name), encoding="utf-8")
     print(f"     act_hist_mode={act_hist_mode}  spec→ {json_path.name} / {md_path.name}")
+    if cfg["raw_obs_dim"] == 83:
+        print(f"     act_hist 正規化分母 a={a_norm:g} ω={w_norm:g}  來源={norm_src}")
+        print(f"     → yaml 必須是 act_stack_a_max: {a_norm:g} / "
+              f"act_stack_omega_max: {w_norm:g}（manifest 會比對，不符拒絕啟動）")
 
 
 def build_parser():
