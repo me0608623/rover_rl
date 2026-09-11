@@ -8,7 +8,8 @@
         a_hi = min(+a_max, (+v_max - v) / dt)
         a_lo = max(-a_max, (-v_max - v) / dt)
         accel = ratio_lin * a_hi  if ratio_lin >= 0 else -ratio_lin * a_lo
-  - next_v = clamp(v + accel * dt, -v_max, +v_max)
+  - v_max_neg = v_max * reverse_velocity_scale（反向上限，訓練 0.2）
+  - next_v = clamp(v + accel * dt, -v_max_neg, +v_max)
   - actual_ω = ratio_ang * ω_max_action  (≠ obs normalizer)
 
 Deterministic policy: argmax over each 19-way head.
@@ -32,6 +33,13 @@ class ActionParams:
     # 0.0 = 不做 slew（79/139 舊模型行為不變）；v3c 訓練端 = 3.0 rad/s²。
     # ⚠️ v3c 同時把 max_angular_velocity_action 由 2.0 改為 0.25π≈0.7854。
     max_angular_accel: float = 0.0
+    # 倒車上限縮放，逐字對齊訓練端 DiscreteDifferentialDriveActionCfg.reverse_velocity_scale。
+    # v_max_neg = max_linear_velocity * reverse_velocity_scale，同時影響
+    #   (a) 動態加速度下界 a_lo  (b) next_v 的下 clamp。
+    # 1.0 = 對稱 ±v_max（舊行為，既有 config 語意不變）；訓練值 = 0.2。
+    # ⚠️ 不可改用「輸出層再 clamp」實作 —— 那會讓 decoder 內部狀態與實際送出的
+    #    命令不一致，83D history 記到的是未被 clamp 的值（實車已量到 -0.557 vs -0.2）。
+    reverse_velocity_scale: float = 1.0
 
 
 def decode_logits_to_cmd(
@@ -84,8 +92,11 @@ def decode_logits_to_cmd(
 
     # 動態加速邊界：除 ±a_max 外，再夾住「這一步最多能加/減多少才不超過 v_max」，
     # 與訓練端 process_actions 完全一致，避免實車 next_v 飽和點與訓練不同
-    a_hi = min(+a_max, (+v_max - v) / dt)
-    a_lo = max(-a_max, (-v_max - v) / dt)
+    # 反向上限受 reverse_velocity_scale 縮放（訓練端 v_max_neg），正向不受影響
+    v_max_pos = v_max
+    v_max_neg = v_max * params.reverse_velocity_scale
+    a_hi = min(+a_max, (+v_max_pos - v) / dt)
+    a_lo = max(-a_max, (-v_max_neg - v) / dt)
 
     # ratio 正→朝上界加速、負→朝下界減速；兩側各自縮放確保 accel 落在 [a_lo, a_hi]
     if ratio_a >= 0.0:
@@ -94,7 +105,7 @@ def decode_logits_to_cmd(
         accel = -ratio_a * a_lo
 
     accel = float(np.clip(accel, a_lo, a_hi))
-    next_v = float(np.clip(v + accel * dt, -v_max, +v_max))
+    next_v = float(np.clip(v + accel * dt, -v_max_neg, +v_max_pos))
 
     # omega 是直接速度映射（非積分加速），用 action ω_max（≠ obs normalizer 1.5）
     w_max = params.max_angular_velocity_action

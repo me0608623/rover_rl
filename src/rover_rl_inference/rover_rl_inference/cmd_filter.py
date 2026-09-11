@@ -26,6 +26,15 @@ class CmdFilterParams:
     deadband_angular: float = 0.02
     # 倒車是否允許；static_guard/RL policy 測試可設為 0。
     min_linear_velocity: float = -float("inf")
+    # Passthrough：跳過 low-pass / slew / deadband，直接輸出 target
+    # （只保留 min_linear_velocity 這道 fail-safe 下界）。
+    #
+    # 為什麼需要：訓練端一個 0.2 s 週期只有一個命令，且線加速度界與 α slew
+    # 已在 decoder 內完成。這裡再疊一層一階低通會讓「發布的命令」≠
+    # 「history 記錄的命令」，並額外引入相位落後（極限環成因）。
+    # passthrough=True 時 20 Hz republish 退化成 zero-order hold，
+    # 與訓練語義一致。預設 False 以保持既有 79D 部署行為不變。
+    passthrough: bool = False
 
 
 class CmdFilter:
@@ -53,6 +62,14 @@ class CmdFilter:
         p = self.p
         if dt <= 0:
             return self._last_v, self._last_w
+
+        if p.passthrough:
+            # 只保留 fail-safe 下界；其餘一律不動，確保 published == issued。
+            out_v = target_v if target_v >= p.min_linear_velocity else p.min_linear_velocity
+            out_w = target_w
+            self._smooth_v, self._smooth_w = out_v, out_w
+            self._last_v, self._last_w = out_v, out_w
+            return out_v, out_w
 
         # 先夾 target 與 filter 內部狀態，避免關閉倒車後仍因低通慣性
         # 在數個 cmd tick 內繼續輸出負速度。
