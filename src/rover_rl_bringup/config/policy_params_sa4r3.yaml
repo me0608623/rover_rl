@@ -111,7 +111,14 @@ rover_rl_policy:
     act_max_linear_accel: 0.5         # a_max
     act_max_angular_velocity: 1.2     # 動作 ω_max（底盤 profile_omega_max 也是 1.2）
     act_max_angular_accel: 3.0        # ω 命令 slew：每步 Δω ≤ 3.0×0.2 = 0.6
-    allow_reverse: false              # 首次驗證禁止倒車。開啟後倒車界 = -0.2 m/s（下一行）
+    allow_reverse: true               # ★2026-08-19 車端指定改為【允許倒車】（原 false 是首次驗證的保守夾制）。
+                                      #   倒車界 = act_max_linear_velocity × reverse_velocity_scale
+                                      #   = 1.0 × 0.2 = -0.2 m/s（下一行），非 -v_max。
+                                      #   凍結契約 docs/freeze/sa1_action_contract_v1.json 的
+                                      #   reverse_saturation 序列本來就會 decode 出負速度 →
+                                      #   打開是「回到訓練分布」，不是外插；manifest 閘門不檢查此旗標
+                                      #   （它比對的是 reverse_velocity_scale 與 reverse_bound_location）。
+                                      #   ⚠ 車尾無感測器：後方安全仍只靠 VO/recovery 的 back_m 判斷。
     reverse_velocity_scale: 0.2       # ★倒車界在 decoder 內（不是輸出層再 clamp）。
                                       #   W1-c10 曾 decode 出 rl_v=-0.557、輸出層才夾成 -0.2，
                                       #   於是 83D history 記到的與實際送出的是兩層不同東西。
@@ -171,6 +178,10 @@ rover_rl_policy:
     pose_jump_guard_enabled: true
     pose_jump_margin: 1.5
     pose_jump_recover_samples: 3
+    # 分級：超標 <2 倍 = NDT 常態噪聲 → 改用 odom 遞推位姿續跑（不硬停）；
+    # >=2 倍 = 災難跳變 → fail-closed。設 1.0 回到「一律硬停」的舊行為。
+    pose_jump_hard_ratio: 2.0
+    pose_jump_soft_max_consecutive: 10
 
     # --- 逐拍命令鏈追蹤（架空測試靠這條看 rl_w 波形）---
     chain_trace_enabled: true

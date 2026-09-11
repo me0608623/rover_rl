@@ -345,10 +345,13 @@ def generate_launch_description():
         orca_on = LaunchConfiguration("enable_orca").perform(context).lower() == "true"
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
         mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
+        sr = LaunchConfiguration("speed_rate").perform(context)
         extra = {}
         if mp:
             extra["model_path"] = mp     # 非空才覆寫
         extra["initial_mode"] = mode
+        if sr != "":
+            extra["speed_rate"] = float(sr)   # 空=走 yaml；有給才覆寫（deploy_rl_shell 選單會帶）
         if vo_on or orca_on or recovery_on or mppi_on:
             extra["topic_cmd_vel"] = "/rover_rl/cmd_vel_desired"   # 改道給外層 wrapper
         return [Node(
@@ -633,6 +636,11 @@ def generate_launch_description():
         DeclareLaunchArgument("model_path", default_value="",
                               description="覆寫 yaml model_path"),
         DeclareLaunchArgument("initial_mode", default_value="nav"),
+        DeclareLaunchArgument("speed_rate", default_value="",
+                              description="覆寫 policy yaml 的 speed_rate（時間膨脹式降速，"
+                                          "rate<1 時感知量放大 1/rate、動作上限縮 ×rate）。"
+                                          "有效 0.05~1.0，policy_node 會 clamp。空=走 yaml。"
+                                          "deploy_rl_shell 選單會互動詢問（預設 0.6）"),
         DeclareLaunchArgument("params_file", default_value=default_params),
         DeclareLaunchArgument("preprocessor_params_file",
                               default_value=default_pre_params),
