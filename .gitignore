@@ -27,6 +27,9 @@ models/*.pt
 models/**/*.pt
 !models/.gitkeep
 
+# export_policy.py 的輸入 checkpoint 暫存（PC 端 scp 過來，車端只做匯出，不入庫）
+ckpt_in/
+
 # 改動前的整棵手動備份快照（CLAUDE.md 安全條款 #5）；git 歷史已有原版，不入庫
 backups/
 
