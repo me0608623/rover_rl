@@ -35,6 +35,13 @@ deploy_rl_select() {
             sa4_dense_v3f_30000.ts
             sa5_tc_g1_p30_270000.ts
             sa6_tc_dense_420k.ts
+            sa1r1_c1700_83d_k8.ts
+            sa4_v3f_240000.ts
+            sa5_v3f_tcadapt_60000.ts
+            sa6_v3h_nonoise_nodr_ck270000.ts
+            sa7_tc_dense_300000.ts
+            sa8_e2e_k8_cleanppo_89600.ts
+            w1c10_k8_e2e_1280.ts
         )
         local TS_FILES ALL_TS tf tb th hidden
         mapfile -t ALL_TS < <(ls -1 "$MODELS_DIR"/*.ts 2>/dev/null | sort)
@@ -54,12 +61,61 @@ deploy_rl_select() {
             for f in "${TS_FILES[@]}"; do
                 base=$(basename "$f"); short=""; desc=""
                 case "$base" in
+                    *sa1r1*)
+                        short="★SA1-R1 c1700   ✓ parity 過 · 僅空曠"
+                        desc="83D + action stacking ｜ 8 幀 LiDAR CNN（RNN 繞過）
+訓練含實測 VLP-16 噪聲 + 致動延遲 U{0,1,2}=0/200/400ms
+Nav20-clean 驗收 9/9（3 seeds × 3 延遲，SR≈100% / CR 0%）
+車端 parity：bundle 5.2e-06 / runtime 5.7e-06 · mismatch 0
+act_hist 分母 0.5 / 1.2（★不是 0.2 / π/15）
+🔴 只驗過 20×20m 空曠；走廊無主張，不得放進有行人的走廊
+r_min=0.5  ω_max=1.2  → policy_params_sa1r1 + lidar_preprocessor_params_sa1r1
+首跑必須：架空 + estop 在手，看 rl_w 有無極限環指紋" ;;
+                    *sa4_r3*)
+                        short="SA4-R3 it50   ⚠ SA4 on HOLD · 診斷跑"
+                        desc="83D + action stacking ｜ K=8 ｜ 契約與 sa1r1 逐字相同
+訓練含噪聲 + 延遲 U{0,1,2}，但只 6400 steps（sa1r1 的 1/34）
+實測(stage-4/seed818/d1=200ms，門檻 SR≥90 CR≤10)：
+  空曠 94.06%/CR 5.94% ✅ ｜ 走廊橫穿 81.13%/18.87% ❌ ｜ 正面對衝 78.21%/21.73% ❌
+車端 parity：bundle 5.7e-06 / runtime 5.7e-06 · mismatch 0
+🔴 無任何 SA4 通過聯合閘門(accepted_parent=null)→這是診斷跑不是已驗證能力
+🔴 走廊有人：橫向約每 5 個 episode 撞 1 次，只能當資料收集
+→ policy_params_sa4r3 + lidar_preprocessor_params_sa4r3" ;;
+                    *sa4_r2*)
+                        short="SA4-R2 c6400   ⚠ 僅正面對衝走廊"
+                        desc="83D + action stacking ｜ K=8 ｜ 契約與 sa1r1 逐字相同
+訓練含噪聲 + 延遲 U{0,1,2}，但只 6400 steps（sa1r1 的 1/34）
+實測(stage-4/seed818/d1=200ms)：
+  正面對衝 98.47%/CR 1.53% ✅ ← 唯一通過走廊 cell 的 SA4
+  走廊橫穿 83.05%/16.95% ❌ ｜ 空曠 **未量測**（無數據）
+車端 parity：bundle 8.1e-06 / runtime 9.1e-06 · mismatch 0（門檻內，餘裕較薄）
+🔴 SA4 on HOLD；用途很窄，驗延遲契約請改用 sa1r1
+→ policy_params_sa4r2 + lidar_preprocessor_params_sa4r2" ;;
                     *sa8_e2e*)
                         short="★e2e SA8 k8   ⚠ 未畢業"
                         desc="clean-PPO ｜ 79D stateless ｜ 8 幀 LiDAR CNN（RNN 繞過）
 warp 14靜+6動 · K8 · future 0.10 · anti-spin 0.15
 crash-run iter700 候選，四閘/情境待驗
 r_min=0.5  ω_max=1.2  → policy_params_e2e + lidar_preprocessor_params_e2e" ;;
+                    *w1c10*)
+                        short="🔴 W1-c10 k8   REAL-ROBOT FAIL"
+                        desc="🔴 2026-07-28 判定實車失效：|rl_w|>=0.83 佔 33.7% · 57s 內 13 次滿舵翻轉
+   延遲驅動極限環（delay/dt≈1.0）；此判定未被任何後續 handoff 推翻
+SA6 血緣最乾淨 ｜ 83D + action stacking ｜ 8 幀 LiDAR CNN（RNN 繞過）
+走廊四模式與 Gate2 皆優於 D0 · 窄縫 Gate5a 100%
+⚠ 零致動延遲/馬達滯後/物理DR/LiDAR噪聲訓練 → 實車延遲未建模
+r_min=0.5  ω_max=1.2  → policy_params_e2e + lidar_preprocessor_params_e2e" ;;
+                    *sa5r2*)
+                        short="SA5-R2 c250   ⚠ 未通過閘門（診斷用）"
+                        desc="83D + action stacking ｜ K=8 ｜ e2e 8 幀 LiDAR CNN（RNN 繞過）
+SA5-R2 訓練 300 輪，6 顆 checkpoint 全部 FAIL；c250 為相對最佳（1/6）
+固定驗收 (seed818, d1=200ms, rate=1.0)：
+  窄縫 SR 100% / CR 0%     低密度 0S1D SR 99.50%     空曠 SR 91.46%
+  走廊 4S2D 最差題型 random_2d CR 67.44%   mixed CR 52.29%
+🔴 hard gate FAIL、無 accepted parent → 診斷跑，不是已驗證能力
+🔴 行人 0.9~1.1 m/s 時：即使 0 障礙 1 行人也只有 SR 46% / CR 53.8%
+⚠ 本 config speed_rate=0.7；實測此血緣 0.7 差於 1.0（CR 38.82% → 58.77%）
+→ policy_params_sa5r2c250 + lidar_preprocessor_params_sa5r2c250" ;;
                     *e2e*)
                         short="★e2e SA4   ✓ 四閘全過"
                         desc="clean-PPO ｜ 79D stateless ｜ 4 幀 LiDAR CNN（RNN 繞過）
@@ -115,6 +171,11 @@ r_min=0.25  ω_max=1.2" ;;
                     # 偵測 variant（v3c / v3e / v3f 同架構家族），自動帶對應 *_<variant>.yaml
                     VARIANT=""
                     case "$CHOSEN_BASE" in
+                        *sa1r1*) VARIANT="sa1r1";;
+                        *sa4_r3*) VARIANT="sa4r3";;
+                        *sa4_r2*) VARIANT="sa4r2";;
+                        *w1c10*) VARIANT="w1c10";;
+                        *sa5r2*) VARIANT="sa5r2c250";;
                         *e2e*) VARIANT="e2e";;
                         *v3c*) VARIANT="v3c";;
                         *v3e*) VARIANT="v3e";;

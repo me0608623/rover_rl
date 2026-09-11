@@ -115,49 +115,65 @@ if ! printf '%s\n' "$@" | grep -qE '^enable_recovery:='; then
     fi
 fi
 
-# ── MPPI 靜態避障層詢問（RL 導航 + MPPI 靜態 + VO 動態，三層協作）──
-# 啟用後 policy 輸出改道 → MPPI(static_guard，吃 local costmap 避靜態) → VO(動態) → mux。
-# MPPI 吃 RL 意圖當 reference，只用 costmap 提早避靜態；動態仍交給 VO。
-# 需 /campusrover_local_costmap 在發（enable_costmap 預設 true，需 velodyne 在跑）。
-# 命令列已帶 enable_mppi:= 則跳過詢問、尊重覆寫。
+# ── MPPI 靜態避障層：已從互動選單移除（2026-08-19，車端指定停用）──
+# 仍可用命令列明確開啟：deploy_rl_shell enable_mppi:=true enable_costmap:=true
+# MPPI_ARG 保留空陣列，讓下面 launch 行與參數 snapshot 不必改結構。
 MPPI_ARG=()
-if ! printf '%s\n' "$@" | grep -qE '^enable_mppi:='; then
-    echo "┌─ MPPI 靜態避障層（RL 導航 + MPPI 靜態 + VO 動態） ───────────"
-    echo "│ 啟用後：policy → MPPI(靜態,吃 local costmap) → VO(動態) → mux。"
-    echo "│ MPPI 吃 RL 意圖當 reference，只用 costmap 提早避靜態障礙；動態仍交給 VO。"
-    echo "│ 需 /campusrover_local_costmap 在發（enable_costmap 預設開，需 velodyne 在跑）。"
-    echo "│ 建議搭配 VO=啟用；首次請架空 + 低速測。"
+
+# ── speed_rate（速度縮放）詢問 ──
+# policy_node 的 speed_rate：時間膨脹式降速——rate<1 時把感知量放大 1/rate、動作上限縮 ×rate。
+# 這裡選的值以 launch arg 覆寫該 checkpoint yaml 的 speed_rate（不改檔案，只影響本次 run）。
+# 有效範圍 0.05~1.0（policy_node 會 clamp）；選 y 則完全不覆寫、沿用 yaml 原值。
+# ⚠ 角向極限環（舞龍舞獅）是延遲問題，降 speed_rate 只縮線速度、damp 不到那個模態。
+# 命令列已帶 speed_rate:= 則跳過詢問、尊重覆寫。
+SPEED_RATE_ARG=()
+if ! printf '%s\n' "$@" | grep -qE '^speed_rate:='; then
+    echo "┌─ speed_rate 速度縮放（覆寫本次 run 的 yaml 值）─────────────"
+    echo "│ rate<1：感知量放大 1/rate、動作上限縮 ×rate（時間膨脹式降速）。"
+    echo "│ 有效範圍 0.05~1.0；Enter=0.6；輸入 y=沿用該 checkpoint yaml 原值。"
     echo "└──────────────────────────────────────────────────────────────"
-    read -rp "是否啟用 MPPI 靜態避障層？[y/N]（Enter=不啟用） " MPPI_SEL
-    case "$MPPI_SEL" in
-        [Yy]*)
-            # MPPI 需 local costmap 才會輸出（gate 卡 get_costmap_data_）→ 明確一起帶上 enable_costmap:=true
-            MPPI_ARG=("enable_mppi:=true" "enable_costmap:=true")
-            echo "[deploy_rl_shell] MPPI 靜態避障層：啟用（RL→MPPI→VO 三層，一併啟 local costmap）"
-            echo "[deploy_rl_shell] ⚠ MPPI 需 /campusrover_local_costmap → 確認 velodyne 在跑（costmap 吃點雲）"
-            ;;
-        *)
-            echo "[deploy_rl_shell] MPPI 靜態避障層：不啟用"
-            ;;
-    esac
+    while :; do
+        read -rp "speed_rate [0.6]（Enter=0.6，y=沿用 yaml）： " SR_SEL
+        case "$SR_SEL" in
+            '')
+                SPEED_RATE_ARG=("speed_rate:=0.6")
+                echo "[deploy_rl_shell] speed_rate：0.6（覆寫 yaml）"
+                break ;;
+            [Yy]|[Yy][Ee][Ss])
+                echo "[deploy_rl_shell] speed_rate：沿用 checkpoint yaml 原值（不覆寫）"
+                break ;;
+            *)
+                if awk -v v="$SR_SEL" 'BEGIN{exit !(v+0==v && v>=0.05 && v<=1.0)}' 2>/dev/null; then
+                    SPEED_RATE_ARG=("speed_rate:=$SR_SEL")
+                    echo "[deploy_rl_shell] speed_rate：$SR_SEL（覆寫 yaml）"
+                    break
+                fi
+                echo "  無效輸入：請輸入 0.05~1.0 的數字、Enter（=0.6）或 y（沿用 yaml）。" ;;
+        esac
+    done
 fi
 
 # ── 往返測試詢問（兩固定點 A↔B 連續來回，測避障）──
 # 把車手動開到 A/B 任一點停穩 → TUI 跳提示，按【空白鍵】開始往對向點來回。
 # 中途切 manual/estop 即中斷，手動開回任一點停穩再按空白鍵重啟。
 # 命令列已帶 enable_pingpong:= 則跳過此詢問、尊重覆寫。
+#
+# 常用點位（拓撲節點名）：
+#   c27 ↔ c28  = 預設短段往返（擺障礙物反覆測避障）
+#   c28 → c3   = 長走廊測試（c3 為長走廊終點）
 PINGPONG_ARGS=()
 if ! printf '%s\n' "$@" | grep -qE '^enable_pingpong:='; then
     echo "┌─ 兩固定點往返避障測試 ──────────────────────────────────────"
     echo "│ 車停在 A/B 任一點停穩 → TUI 提示按【空白鍵】開始往對向點，A↔B 來回。"
     echo "│ 需 NDT + routing 在跑（拓撲節點定位）；中途切 manual/estop 即中斷。"
+    echo "│ 預設 c27 ↔ c28（短段）；長走廊測試用 c28 → c3（c3 為長走廊終點）。"
     echo "└──────────────────────────────────────────────────────────────"
     read -rp "是否啟用往返測試？[Y/n]（Enter=啟用） " PP_SEL
     case "$PP_SEL" in
         [Nn]*) echo "[deploy_rl_shell] 往返測試：不啟用" ;;
         *)
-            read -rp "  A 點節點名 [c24]： " PP_A; PP_A="${PP_A:-c24}"
-            read -rp "  B 點節點名 [c27]： " PP_B; PP_B="${PP_B:-c27}"
+            read -rp "  A 點節點名 [c27]（長走廊用 c28）： " PP_A; PP_A="${PP_A:-c27}"
+            read -rp "  B 點節點名 [c28]（長走廊用 c3）： " PP_B; PP_B="${PP_B:-c28}"
             PINGPONG_ARGS=("enable_pingpong:=true" "pingpong_a:=$PP_A" "pingpong_b:=$PP_B")
             # 預設全自動來回（停穩免按空白鍵自動出發下一段）；命令列已帶 pingpong_auto_continue:= 則尊重覆寫
             if ! printf '%s\n' "$@" | grep -qE '^pingpong_auto_continue:='; then
@@ -224,7 +240,7 @@ echo "[deploy_rl_shell] 啟動 RL 棧（不含 NDT/LV-DOT，log → $LOG）…"
 # $VO_ARG 來自上面互動詢問（預設 enable_vo:=true）；lv-dot 沒開時 VO 退化為放行+ω clamp，安全。
 # $RECOVERY_ARG 只在有效 VO=true 時預設 enable_recovery:=true；純 RL 不啟動 recovery。
 # 放在 "$@" 前面：user 傳的同名參數在後面會覆寫（ros2 launch 重複參數取最後值），如 enable_vo:=false。
-ros2 launch rover_rl_bringup deploy_full.launch.py enable_ndt:=false enable_lvdot:=false "$VO_ARG" "$ORCA_ARG" "${RECOVERY_ARG[@]}" "${MPPI_ARG[@]}" rviz:=false "${EXTRA_ARGS[@]}" "${PINGPONG_ARGS[@]}" "$@" >"$LOG" 2>&1 &
+ros2 launch rover_rl_bringup deploy_full.launch.py enable_ndt:=false enable_lvdot:=false "$VO_ARG" "$ORCA_ARG" "${RECOVERY_ARG[@]}" "${MPPI_ARG[@]}" rviz:=false "${EXTRA_ARGS[@]}" "${SPEED_RATE_ARG[@]}" "${PINGPONG_ARGS[@]}" "$@" >"$LOG" 2>&1 &
 LAUNCH_PID=$!
 
 # ORCA 控制車模式：由 deploy_full.launch.py 的 enable_orca:=true 啟 orca_safety_node（在 RL 棧內），
@@ -264,6 +280,7 @@ if [ "$RECORD_BAG" = "1" ]; then
         echo "# 選單/命令列參數（含 model_path / config 選擇）:"
         echo "select_args: '${EXTRA_ARGS[*]}'"
         echo "vo_arg: '$VO_ARG'   mppi_arg: '${MPPI_ARG[*]}'   recovery_arg: '${RECOVERY_ARG[*]}'   static_avoid_arg: '${STATIC_AVOID_ARG[*]}'"
+        echo "speed_rate_arg: '${SPEED_RATE_ARG[*]}'   （空=沿用 checkpoint yaml）"
         for node in /rover_rl_policy /vo_safety_node /mppi_planner_node /recovery_supervisor_node; do
             echo ""
             echo "# ======================== $node ========================"
