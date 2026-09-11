@@ -420,17 +420,48 @@ deploy_rl_stop       # 停止整個棧
 
 **兩者分工（重要）**：
 - `deploy_rl` = 純 `ros2 launch deploy_full`，前景滾動 log。**Claude / 非互動 shell 用這個**（curses 在 pipe 會卡死，故 deploy_rl 不含 TUI）。Claude 要看狀態改用 `ros2 topic echo /rover_rl_policy/status`（JSON）。
-- `deploy_rl_shell` → `bash ~/rover_rl/deploy_rl_shell.sh`（**給人在真實終端機用**）：
+- `deploy_rl_shell` → `bash ~/rover_rl/deploy_rl_shell.sh`（**給人在真實終端機用**，流程如下，2026-08-19 更新）：
   1. **TTY 守門**：偵測非互動（`! -t 0/1`）→ 友善退出不硬跑 curses
-  2. **launch 前兩段互動詢問**（命令列已帶同名參數則各自跳過、尊重覆寫）：
-     - **選 checkpoint**：列 `~/rover_rl/models/*.ts`，Enter=沿用 yaml 預設；選到 `*v3c*` 自動帶 v3c config
-     - **是否啟用 VO 安全層**：`[Y/n]（Enter=啟用）`。選 Y→`enable_vo:=true`、n→`enable_vo:=false`。
-       預設啟用（沿用原行為）；啟用後 policy 改道 `/rover_rl/cmd_vel_desired`→vo_safety→mux，
-       且 TUI 多顯示「VO / VO參數」兩列。⚠ 此腳本預設不開 lv-dot → 即使選啟用，沒另開 `lv-dot`
-       時 VO 無障礙來源、退化為「放行 + ω 限幅」（TUI 顯示「放行（障礙源逾時/未偵測）」），這是正常安全退化。
-  3. `ros2 launch deploy_full` 丟**背景**（帶上選定的 model_path / `$VO_ARG`），log 導到 `~/rover_rl/logs/deploy_<時間>.log`
-  4. 等 `rover_rl_policy` 起來 → 前景跑 `status_tui`（curses 取得真實 TTY）
-  5. 按 `q` 或 Ctrl+C → trap（`trap - EXIT INT TERM` 先解除自身避免重入，**不用 `''` 遮蔽訊號**）呼叫 `rover_rl_stop.sh` 收棧
+  2. **啟動前殘留節點檢查**：用「安裝路徑」pgrep（`rover_rl_inference/lib/…`、`orca_filter/lib/…`、
+     `campusrover_routing|costmap_ros2|mot/lib/…`、`ros2 launch rover_rl_bringup`）掃孤兒，列出
+     PID / 已跑多久 / 是否孤兒 → 問 `[Y/n]（Enter=清除）`，SIGTERM → 2s → SIGKILL。
+     刻意不用節點名清單（那份永遠會漏），改掃安裝路徑 → 日後新增節點自動涵蓋。
+     ⚠ 只掃 rover_rl 棧自己的東西；NDT / LV-DOT / rosbridge / velodyne / 底盤 driver 分開啟的不碰。
+  3. **launch 前互動詢問**（每段若命令列已帶同名參數則各自跳過、尊重覆寫）：
+     - **選 checkpoint**（在共用的 `deploy_select.sh`，與 `deploy_rl` 同一套）：列
+       `~/rover_rl/models/*.ts`（`HIDE_TS` 清單內的舊模型不列，仍可 `model_path:=<絕對路徑>` 載入），
+       每項印短標籤 + 多行詳述；Enter = 沿用 `policy_params.yaml` 預設。選定後印該 checkpoint 的
+       `*.obs_spec.md`（觀測維度語義），並依檔名自動帶對應 `policy_params_<variant>.yaml` +
+       `lidar_preprocessor_params_<variant>.yaml`（sa1r1 / sa4r2 / sa4r3 / w1c10 / e2e / v3c / v3e /
+       v3f / v3h）；缺該 variant config 直接中止不亂跑。
+     - **安全層三選一**（`Enter=1`）：`1` VO（DWA 取樣+rollout 預測式避障/煞停）/ `2` ORCA（RVO2
+       half-plane，與 VO 互斥）/ `3` 都不啟用（policy 直送 mux）。選 1 或 2 都會把 policy 輸出改道
+       `/rover_rl/cmd_vel_desired` → 安全層 → mux，TUI 多顯示「VO / VO參數」兩列。
+       ⚠ 此腳本預設不開 lv-dot → 沒另開 `lv-dot` 時安全層無障礙來源、退化為「放行 + ω 限幅」
+       （TUI 顯示「放行（障礙源逾時/未偵測）」），這是正常安全退化。
+     - **Recovery Supervisor 不問、自動決定**：有效 `enable_vo:=true` → `enable_recovery:=true`
+       （取代 VO 內建倒退/脫困，保留 VO 其他煞車行為）；純 RL / ORCA → `false`。
+       命令列帶 `enable_recovery:=` 可覆寫。
+     - **speed_rate**（2026-08-19 新增）：`Enter=0.6` / 直接輸入 `0.05~1.0` 的數字 / `y` = 沿用該
+       checkpoint yaml 原值。以 launch arg `speed_rate:=` 覆寫，**不改 yaml 檔、只影響本次 run**。
+     - **是否啟用往返測試**：`[Y/n]（Enter=啟用）` → 再問 A 點（預設 `c27`）/ B 點（預設 `c28`）；
+       **長走廊測試用 `c28` → `c3`**（c3 為長走廊終點）。預設帶 `pingpong_auto_continue:=true`
+       （全自動來回，TUI 按 `a` 可切回按鍵模式）。
+     - **是否錄 ros bag**：`[Y/n]（Enter=錄）`，只錄輕量控制鏈 + 狀態 topic（不錄點雲影像）。
+     - ⛔ **MPPI 靜態避障層已於 2026-08-19 從選單移除**（車端指定停用）；仍可用命令列明確開啟：
+       `deploy_rl_shell enable_mppi:=true enable_costmap:=true`。
+  4. `ros2 launch deploy_full` 丟**背景**：固定帶 `enable_ndt:=false enable_lvdot:=false rviz:=false`
+     ＋上面選定的 model/config/安全層/recovery/speed_rate/pingpong；user 的 `"$@"` 排在最後
+     （ros2 launch 重複參數取最後值 → 命令列永遠贏）。log 導到 `~/rover_rl/logs/deploy_<時間>.log`
+  5. 等 `rover_rl_policy` 起來（最多 20s；launch 提早死會直接印 log 路徑並退出）
+  6. 有選錄 bag → 起 `ros2 bag record` 到 `~/rover_rl/logs/bags/deploy_<時間>/`（控制鏈各層 cmd_vel /
+     各 node `~/status` / joy / odom / sweep / costmap / goal / path / tf），同時背景 dump
+     `deploy_<時間>_params.yaml` 參數 snapshot（選單參數 ＋ policy/VO/MPPI/recovery 全參數；
+     `ros2 param dump` 一律包 `timeout 12`，防 zenoh 上 hang 住 subshell）
+  7. 前景跑 `status_tui`（curses 取得真實 TTY）
+  8. 按 `q` 或 Ctrl+C → trap（`trap - EXIT INT TERM` 先解除自身避免重入，**不用 `''` 遮蔽訊號**）：
+     先 SIGINT 收 bag（讓 rosbag2 正常寫 `metadata.yaml`，直接 kill 會壞檔）→ 呼叫 `rover_rl_stop.sh`
+     收棧 → 印本次 log / diag CSV / bag / 參數 snapshot 路徑
 
 **為何不把 TUI 放進 launch**：launch 子行程無 TTY，curses 會崩；故採「launch 背景 + TUI 前景」分離，且只在 `deploy_rl_shell` 提供。
 
@@ -697,13 +728,15 @@ ros2 run rover_rl_inference routing_click_bridge
   供 status_tui 顯示提示與底部狀態列。
 - **⚠ 需 NDT + routing 在跑**：靠拓撲節點 map-frame 定位判到點，沒 NDT（pose_src≠tf）會警告且判定失準。
   `deploy_rl_shell` 預設不啟 NDT → 先另開 `ndt` alias，或改用 `deploy_all`。
-- **啟動**：`deploy_rl_shell` 互動詢問「是否啟用往返測試」並可填 A/B 點名；或 launch 直接帶參數：
+- **啟動**：`deploy_rl_shell` 互動詢問「是否啟用往返測試」並可填 A/B 點名
+  （選單預設 **c27 ↔ c28**；**長走廊測試用 c28 → c3**，c3 為長走廊終點）；或 launch 直接帶參數：
   ```bash
   ros2 launch rover_rl_bringup deploy_full.launch.py \
-    enable_pingpong:=true pingpong_a:=c24 pingpong_b:=c27
+    enable_pingpong:=true pingpong_a:=c28 pingpong_b:=c3
   ```
-  launch 參數：`enable_pingpong`(預設 false) / `pingpong_a`(c24) / `pingpong_b`(c27) /
-  `pingpong_auto_nav`(true)。
+  launch 參數：`enable_pingpong`(預設 false) / `pingpong_a`(launch 預設 c24，選單給 c27) /
+  `pingpong_b`(launch 預設 c27，選單給 c28) / `pingpong_auto_nav`(true) /
+  `pingpong_auto_continue`(launch 預設 false，選單給 true)。
 - **操作流程**：① 手動把車開到 c24 或 c27 停穩 → ② TUI 跳「就緒，按空白鍵」→ ③ 按空白 → 車往對向點 →
   ④ 到達自動停車、TUI 再跳「就緒，按空白鍵」→ ⑤ 按空白走回來（如此每段確認來回）→
   要停就抓搖桿/estop（中斷）→ 手動開回任一點停穩、再按空白鍵重啟。
@@ -723,6 +756,7 @@ ros2 run rover_rl_inference routing_click_bridge
 | 往返測試按空白鍵沒反應 | 非 ready 狀態才會忽略空白鍵；或不在 TUI 焦點 | 先確認 TUI 跳「就緒」綠字才按；空白鍵只由 status_tui 攔截（deploy_rl_shell 才有 TUI） |
 | 往返測試 nodes_loaded=false | routing/get_route_info 沒起來 | 確認 routing_to_path + mapinfo_db_handler 在跑、`/get_route_info` service 存在 |
 | 跑起來但車原地震 | normalizer 期望維度與 model 不符（79/83/139 互錯，如 v3c 用了 SA6 yaml） | 看 launch log 的 `raw_obs=X used_obs=Y`，與 model 對照；v3c 應為 raw_obs=83 |
+| **走走停停（跑一段停 0.6s 再慢慢起步）** | 位姿跳變 guard 被 NDT 定位噪聲觸發 → fail-closed 急停（見下方「位姿跳變 guard 分級」） | 看 log 的 `位姿跳變 guard[rejected]` 頻率、status 的 `pose_guard_soft`/`pose_guard_hard`。soft 多=已被分級吸收（正常）；hard 多=NDT 真的在大跳，查 NDT 收斂 |
 | cmd 振幅異常大 | normalizer mean/var 沒 bake 進 model | 重新 export_policy.py（必須帶有 obs_normalizer 的 checkpoint） |
 | RViz Nav2 goal 不被收 | topic remap | 確認 `/goal_pose` 是 Nav2 standard，不是 `/move_base_simple/goal` |
 | /rover_rl/bev_image 沒畫面 | matplotlib Agg 依賴 | 確認 `pip install matplotlib` 已裝 |
@@ -845,6 +879,29 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
    → 見下方 sim-to-real gap #2。DWA 沒此問題因為只到 0.5。
 4. DWA 的加速度 5.0 是「速度 pair 取樣用」，不是真的輸出 5.0 猛加速（速度本身卡在 0.5）。
 
+## 位姿跳變 guard 分級（2026-08-21）
+
+`pose_jump_guard.py` 攔的是「兩拍之間的位姿變化超過車輛物理極限」。原本**一律**
+fail-closed（輸出 0 + 清 RNN/frame-stack + 連 3 拍合理才恢復）。2026-08-21 實車診斷發現
+這對 NDT 常態噪聲反應過度，是**走走停停的直接成因**，故改為依超標倍率 `ratio` 分兩級：
+
+| ratio | 級別 | 行為 |
+|---|---|---|
+| ≤ 1 | ok | 位姿可用 |
+| 1 < ratio < `pose_jump_hard_ratio`(2.0) | **soft** | **不停車**：改用 odom 遞推位姿（凍結 map→odom offset）續跑，不清 RNN/stack |
+| ≥ 2.0 | rejected | 維持原本 fail-closed 急停 |
+
+- soft 連續超過 `pose_jump_soft_max_consecutive`(10) 拍 → 升級硬停（定位真的失效時不能一直遞推漂）
+- soft 那拍的髒位姿**不會**成為下一拍基準，改寫入遞推值（否則跳變被默默吃下）
+- `pose_jump_hard_ratio: 1.0` = 關掉分級、回到舊的「一律硬停」行為
+- status JSON 新增 `pose_guard` / `pose_guard_soft` / `pose_guard_hard`，可在 bag/diag 觀察比例
+
+**為何是 2.0**：2026-08-21 那 7 段（190s）12 次 guard 觸發的超標倍率，11 次落在 1.01~1.32
+（NDT 常態噪聲），只有 1 次是 2.2（NDT 連續 6 幀不收斂後的補跳）。2.0 正好把兩者分開；
+而歷史那次災難跳變（0.05s 內 97.4°）是 28 倍，任何合理門檻都攔得到。
+
+⚠ 這是 **policy 端的緩解，不是根因修復**。根因在 NDT，見 gap #7。
+
 ## sim-to-real 已知 gap（按嚴重度排序）
 
 1. **LiDAR 高度 1.6m (訓練) vs 1.43m (實車)** — beam 角度落點不同
@@ -860,6 +917,23 @@ ONNX/TensorRT 在這個 model 上**完全沒收益**：
    **解法（已加）**：`policy_node` 新增 `cmd_delay_comp_s` 參數（預設 0.0=關）。>0 時推論前用 odom 測得速度把車姿往前積分這麼多秒、重算 goal_body，讓 obs 對齊「動作生效時」的車姿（仿 spot_rl `fast_info_calculate`，但只動 goal_body 視角、不動 velocity obs/網路/動作上限；用測得速度非命令速度，因 ω 跟隨率僅 ~12%、用命令會過補）。
    可熱調：`ros2 param set /rover_rl_policy cmd_delay_comp_s 0.2`；status JSON 有 `cmd_delay_comp_s` 可驗證。建議從 0.2 起、過大會領先過頭。
 6. **底盤 deadband 未知** — spot_rl 強制最小移動速度 `minimum_will_move_speed=0.14 m/s`（避免 policy 輸出微小速度但馬達不動）。rover_rl deadband 僅 0.02 m/s。若實車觀察到 policy 有輸出但輪子靜止，需量測實際底盤死區並調高 `cmd_alpha_linear` 或在 action_decoder 加 floor。
+7. **NDT 定位品質在此環境處於及格邊緣（2026-08-21 診斷）** — 這是「走走停停」的根因。
+   - **車靜止時 NDT 完美**：逐幀 map→odom 只變 5.6mm / 0.011°，30 秒全距 4.4cm，0 次不收斂。
+   - **車一動就抖**：map→odom 每次更新平均跳 **0.134m**（57% >0.1m、24% >0.3m），是靜止的 24 倍。
+     odom 本身乾淨（逐拍 0.03m/2.7°，與 odom_v/odom_w 一致）→ 抖的只有 NDT 這一段。
+   - **原因是匹配品質剛好卡在門檻上**：`converged_param_transform_probability:=1.6`，
+     而實測 transform_probability 分布 = 不收斂那些最大 1.599、收斂那些最小 1.609 —— 門檻
+     正好切在分布正中央。跑車 5 分鐘內 56 幀不收斂（1.9%），最長連續 23 幀（2.24s）。
+     不收斂時 `ndt.cpp` **不發布 ndt_pose**，等恢復時一次補上大修正 → 位姿大跳。
+   - 12 次 guard 觸發中 6 次前 1.5s 有不收斂（含最大那次 0.662m）；另 6 次是「勉強收斂但解在
+     ±0.2m 游移」。兩種機制都源自同一件事：這個環境的 NDT 匹配品質本來就在及格線附近。
+   - NDT 參數現況：`max_iterations: 10`（程式碼預設 30，被 yaml 壓到 10）、`resolution: 1.0`、
+     `step_size: 0.1`、`trans_epsilon: 1e-5`、`debug: false`。
+   - ⚠ `iteration_num` / `transform_probability` 兩個 publisher 在 `ndt.cpp` 建立了但
+     **從未 publish**，topic 永遠是空的 —— 想量收斂狀況只能讀節點 log 的 `[Not Converged]`。
+   - **policy 端已做緩解**（位姿跳變 guard 分級，見上），但根因未修；要治本得動 `~/ndt_ws`：
+     優先試 `max_iterations` 回到 30、再視走廊幾何調 `resolution`。調 `converged_param_*`
+     只是換一邊犧牲（調鬆=讓爛解進來，調緊=停更更久），不算修好。
 
 ## 與 PC 端的溝通介面
 
