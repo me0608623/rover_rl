@@ -148,14 +148,25 @@ fi
 
 # ── 4. ros bag 錄製 ──
 RECORD_BAG=0
+RECORD_CLOUD=0
 if [ "$IS_TTY" = "1" ]; then
-    echo "┌─ 錄製 ros bag（事後離線分析控制鏈/速度-距離曲線）────────────"
-    echo "│ 只錄控制鏈 + 狀態 topic（不錄點雲影像）→ 輕量，存 ~/rover_rl/logs/bags/。"
+    echo "┌─ 錄製 ros bag（事後回放看路線 / 離線分析）───────────────────"
+    echo "│ 預設只錄控制鏈 + 狀態 topic → 輕量，存 ~/rover_rl/logs/bags/。"
+    echo "│ 回放：ros2 bag play <bagdir> + rviz2 -d ~/rover_rl/rviz/replay_baseline.rviz"
     echo "└──────────────────────────────────────────────────────────────"
     read -rp "是否錄製 ros bag？[Y/n]（Enter=錄） " BAG_SEL
     case "$BAG_SEL" in
         [Nn]*) echo "[baseline] ros bag：不錄" ;;
-        *) RECORD_BAG=1; echo "[baseline] ros bag：錄製" ;;
+        *)
+            RECORD_BAG=1; echo "[baseline] ros bag：錄製"
+            # 論文要的「路線圖」通常需要障礙物當背景，但點雲很肥（VLP-16 約 1~2 GB/分）。
+            # 故預設不錄，只有明確要做回放截圖時才開。
+            read -rp "  是否一併錄點雲（回放看得到障礙物，但檔案大很多）？[y/N]（Enter=不錄） " CLOUD_SEL
+            case "$CLOUD_SEL" in
+                [Yy]*) RECORD_CLOUD=1; echo "[baseline]   點雲：錄（注意硬碟空間）" ;;
+                *) echo "[baseline]   點雲：不錄（回放只有軌跡與 TF）" ;;
+            esac
+            ;;
     esac
 fi
 
@@ -226,7 +237,11 @@ cleanup() {
         echo "$DIAG_CSVS" | while read -r f; do echo "  • $f"; done
         echo "  分析：ros2 run rover_rl_inference analyze_diag <上面的 csv>"
     fi
-    [ -n "$BAGDIR" ] && [ -d "$BAGDIR" ] && echo "[baseline] ros bag：$BAGDIR"
+    if [ -n "$BAGDIR" ] && [ -d "$BAGDIR" ]; then
+        echo "[baseline] ros bag：$BAGDIR"
+        echo "  回放看路線：ros2 bag play $BAGDIR"
+        echo "              rviz2 -d ~/rover_rl/rviz/replay_baseline.rviz   （Fixed Frame=odom）"
+    fi
     [ -n "$START_LVDOT" ] && echo "[baseline] ⚠ LV-DOT 是本腳本起的，要一併停請用：lv-dot_stop"
 }
 trap cleanup EXIT INT TERM
@@ -262,14 +277,18 @@ if [ "$RECORD_BAG" = "1" ]; then
     BAGDIR=~/rover_rl/logs/bags/baseline_${CONTROLLER}_$TS
     echo "[baseline] 開始錄 ros bag → $BAGDIR"
     # 控制鏈各層 + 量測來源；pid_vo 多錄 VO 前的 baseline_desired 才追得出 VO 改了什麼。
-    ros2 bag record -o "$BAGDIR" \
-        /input/nav_cmd_vel /rover_rl/cmd_vel_baseline_desired /output/cmd_vel /cmd_vel \
-        /vo_safety_node/status /rover_rl/pingpong/status \
-        /joy /input/joy_cmd_vel \
-        /odom /rover_rl/lidar_sweep_72 /campusrover_local_costmap \
-        /vo_interface/tracked_obstacles \
-        /goal_pose /global_path /tf /tf_static \
-        >"$LOG.bag.log" 2>&1 &
+    # /odom + /tf 是回放畫軌跡的最低需求（replay_baseline.rviz 用 Odometry display 的
+    # Keep 畫整段路線，baseline 沒有 policy 發的 /rover_rl/trail）。
+    BAG_TOPICS=(
+        /input/nav_cmd_vel /rover_rl/cmd_vel_baseline_desired /output/cmd_vel /cmd_vel
+        /vo_safety_node/status /rover_rl/pingpong/status
+        /joy /input/joy_cmd_vel
+        /odom /rover_rl/lidar_sweep_72 /campusrover_local_costmap
+        /vo_interface/tracked_obstacles
+        /goal_pose /global_path /tf /tf_static
+    )
+    [ "$RECORD_CLOUD" = "1" ] && BAG_TOPICS+=(/velodyne_points)
+    ros2 bag record -o "$BAGDIR" "${BAG_TOPICS[@]}" >"$LOG.bag.log" 2>&1 &
     BAG_PID=$!
 fi
 

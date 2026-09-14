@@ -295,6 +295,7 @@ class DiagLoggerNode(Node):
         self._obs = None
         self._sweep_min = None
         self._status = None        # dict（三層速度 + 延遲）
+        self._sweep_sectors = None  # baseline 無 policy status 時，自己從 sweep 算的方向距離
         self._status_t = 0.0       # 最近一次收到 policy status 的 monotonic 時間（開錄新鮮度檢查用）
         self._vo = None            # dict（VO 安全層 status；None=從未收到）
         self._vo_t = 0.0           # 最近一次收到 VO status 的 monotonic 時間
@@ -771,6 +772,21 @@ class DiagLoggerNode(Node):
         dist_m = m * (self.r_max - self.r_robot) + self.r_robot
         self._sweep_min = (dist_m, time.monotonic())
 
+        # ── 方向扇區距離（front/back/left/right）──
+        # 正常 RL 模式這四欄由 policy status 提供；但消融實驗的 baseline（controller=
+        # dwa/pid/pid_vo）沒有 policy_node → 那四欄會整段空白，而「速度 vs 前方障礙距離」
+        # 正是論文要的圖。這裡自己從同一份 sweep 還原，扇區切法與 policy_node 完全一致
+        # （bin36=前、每 bin 5°）。status 有值時仍以 status 為準（見 _tick 的填值順序）。
+        if len(msg.data) == 72:
+            span = self.r_max - self.r_robot
+            mm = [v * span + self.r_robot for v in msg.data]
+            self._sweep_sectors = {
+                "front_m": round(min(mm[28:45]), 2),
+                "left_m": round(min(mm[46:63]), 2),
+                "right_m": round(min(mm[10:27]), 2),
+                "back_m": round(min(mm[64:72] + mm[0:10]), 2),
+            }
+
     # ── 20Hz 寫列 ──
     def _tick(self) -> None:
         if not self._started:
@@ -902,6 +918,25 @@ class DiagLoggerNode(Node):
                 if _v is not None:
                     row[_k] = _v
             row["cnn_e2e"] = int(bool(st.get("cnn_e2e")))
+
+        # ── baseline（controller=dwa/pid/pid_vo，無 policy_node）的欄位補值 ──
+        # 消融實驗要的是「各演算法在相同來回點位的路線與速度變化」，這些欄位不能是空的。
+        # 只補 status 沒給的，RL 模式下 status 一律優先，行為不變。
+        #   方向距離：自己從 72-bin sweep 還原（見 _cb_sweep）
+        #   act_*   ：odom 實測速度（RL 模式下 policy 回報的 act_* 本來也是 odom 來的）
+        #   sent_*  ：實際送進 mux 的 cmd_vel（baseline 沒有 policy 的低通/slew 層，
+        #             送出值即控制器輸出，故 sent 等同 cmd）
+        #   rl_*    ：刻意留空 —— baseline 沒有「RL 意圖」這一層，填了會造成誤解
+        if self._sweep_sectors is not None:
+            for k, v in self._sweep_sectors.items():
+                if row.get(k) in (None, ""):
+                    row[k] = v
+        if row.get("act_v") in (None, "") and self._odom is not None:
+            row["act_v"] = row.get("odom_v", "")
+            row["act_w"] = row.get("odom_w", "")
+        if row.get("sent_v") in (None, "") and row.get("cmd_v") not in (None, ""):
+            row["sent_v"] = row["cmd_v"]
+            row["sent_w"] = row.get("cmd_w", "")
 
         # VO 安全層：node 在線(<1s 內有 status)=active；用其 status 旗標標記本拍有沒有動手
         vo_active = self._vo is not None and (now - self._vo_t) < 1.0
