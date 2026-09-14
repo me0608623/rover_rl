@@ -25,6 +25,13 @@
 
 只在使用者於 deploy_rl_shell / deploy_rl 互動詢問選「啟用往返測試」時，由 launch 帶
 enable_pingpong:=true 啟動；預設不啟。純測試輔助，與 RL 推論/避障邏輯完全解耦。
+
+消融實驗（DWA/PID baseline，無 policy_node）：
+  • require_policy_status:=false 時，姿態/速度改走 TF(map→base_frame) + /odom，
+    mode 視為恆 "nav"（baseline 控制器沒有 estop/manual 概念，交由 mux/實體
+    estop 把關）、nav_type 視為恆 "path"（跳過「路徑遺失重規劃」watchdog，
+    因為沒有 policy 的 subgoal-source 遙測可用）。
+  • RL 模式（預設 require_policy_status:=true）行為完全不變。
 """
 from __future__ import annotations
 
@@ -34,7 +41,10 @@ import time
 
 import rclpy
 from rclpy.node import Node
+from rclpy.time import Time
 from std_msgs.msg import String, Empty
+from nav_msgs.msg import Odometry
+from tf2_ros import Buffer, TransformListener
 from campusrover_msgs.srv import RoutingPath, ModuleInfo
 
 
@@ -62,6 +72,12 @@ class PingpongTestNode(Node):
         self.declare_parameter("topic_mode", "/rover_rl_policy/mode")
         self.declare_parameter("routing_service", "/routing_to_path/routing_call")
         self.declare_parameter("status_stale_s", 2.0)     # status 超過此秒數視為失聯
+        # False：無 policy_node 時的消融 baseline 模式（DWA/PID）——姿態/速度改走
+        # TF(map→base_frame) + /odom，不吃 /rover_rl_policy/status
+        self.declare_parameter("require_policy_status", True)
+        self.declare_parameter("map_frame", "map")
+        self.declare_parameter("base_frame", "base_footprint")
+        self.declare_parameter("topic_odom", "/odom")
         # 本節點對外狀態 / 開始觸發（TUI 顯示提示 + 空白鍵發 start）
         self.declare_parameter("topic_pp_status", "/rover_rl/pingpong/status")
         self.declare_parameter("topic_pp_start", "/rover_rl/pingpong/start")
@@ -80,6 +96,21 @@ class PingpongTestNode(Node):
         self._auto_continue = bool(self.get_parameter("auto_continue").value)
         self._auto_pause_ticks = int(self.get_parameter("auto_pause_ticks").value)
         self._stale_s = float(self.get_parameter("status_stale_s").value)
+        self._require_policy_status = bool(self.get_parameter("require_policy_status").value)
+        self._map_frame = self.get_parameter("map_frame").get_parameter_value().string_value
+        self._base_frame = self.get_parameter("base_frame").get_parameter_value().string_value
+
+        # ── baseline 模式（無 policy_node）：TF + /odom 取代 policy status ──
+        self._odom_speed = 0.0
+        if not self._require_policy_status:
+            self._tf_buffer = Buffer()
+            self._tf_listener = TransformListener(self._tf_buffer, self)
+            self.create_subscription(
+                Odometry, self.get_parameter("topic_odom")
+                .get_parameter_value().string_value, self._on_odom, 10)
+            self.get_logger().info(
+                "require_policy_status=false → 姿態/速度改走 "
+                f"TF({self._map_frame}→{self._base_frame}) + /odom（消融 baseline 模式）")
 
         # ── 路由拓撲節點座標表（name → (x,y)），由 /get_route_info 載入 ──
         self._nodes: dict[str, tuple[float, float]] = {}
@@ -214,9 +245,31 @@ class PingpongTestNode(Node):
         except (ValueError, TypeError):
             pass
 
+    def _on_odom(self, msg: Odometry):
+        self._odom_speed = abs(msg.twist.twist.linear.x)
+
+    def _pose_from_tf(self):
+        """baseline 模式（無 policy_node）：TF(map→base_frame) + /odom 取代 status。
+
+        mode 恆回 "nav"（baseline 控制器無 estop/manual 概念，安全把關交給
+        mux/實體 estop，不在本節點軟體層判斷）；nav_type 恆回 "path"（跳過
+        _tick_running 的路徑遺失重規劃 watchdog——沒有 policy 的 subgoal-source
+        遙測可用，寧可不誤觸發，也不要每 3s 亂重新規劃一次）。
+        """
+        try:
+            tf = self._tf_buffer.lookup_transform(
+                self._map_frame, self._base_frame, Time())
+        except Exception:
+            return None
+        x = tf.transform.translation.x
+        y = tf.transform.translation.y
+        return x, y, self._odom_speed, "nav", "path"
+
     # ── 工具 ──
     def _pose(self):
-        """回傳 (x, y, speed, mode, nav_type) 或 None（無有效 status）。"""
+        """回傳 (x, y, speed, mode, nav_type) 或 None（無有效姿態來源）。"""
+        if not self._require_policy_status:
+            return self._pose_from_tf()
         if self._status is None:
             return None
         if time.monotonic() - self._status_t > self._stale_s:
@@ -288,7 +341,10 @@ class PingpongTestNode(Node):
             return
         p = self._pose()
         if p is None:
-            self.get_logger().info("待命中：收不到 policy status（等 policy_node / NDT）…")
+            if self._require_policy_status:
+                self.get_logger().info("待命中：收不到 policy status（等 policy_node / NDT）…")
+            else:
+                self.get_logger().info(f"待命中：收不到 TF {self._map_frame}→{self._base_frame}（等 NDT）…")
             return
         x, y, _, mode, _ = p
         name, d = self._nearest_endpoint(x, y)

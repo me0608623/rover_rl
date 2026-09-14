@@ -32,7 +32,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
-from std_msgs.msg import String
+from std_msgs.msg import Float32MultiArray, String
 
 from vo_interface.msg import TrackedObstacleArray
 from vision_msgs.msg import Detection2DArray
@@ -68,6 +68,17 @@ class VOSafetyNode(Node):
         gp("topic_odom", "/odom")
         gp("topic_obstacles", "/vo_interface/tracked_obstacles")  # vo_interface 平滑追蹤
         gp("topic_goal_status", "/rover_rl_policy/status")  # policy status JSON（取 goal_dist/goal_ang_deg）
+        # --- 前方扇區（front/left/right/back_m）備援來源：直接吃 72-bin sweep ---
+        # 正常 RL 模式這些值由 policy status 提供（policy 已從 sweep 算好）。但消融實驗的
+        # baseline（controller=pid_vo）沒有 policy_node → status 永遠不發 → 前方 LiDAR 安全煞
+        # （front_brake/freeze/hardstop）整層失效。而 PID 本身零避障、VO 又只管動態障礙
+        # （見本檔開頭看門狗說明：「靜態仍由 RL 的 LiDAR sweep 擋」）→ 靜態障礙完全沒人擋。
+        # 故在 status 逾時時，直接訂閱 sweep 自行還原扇區距離，補回這層安全網。
+        # ⚠ status 新鮮時一律以 status 為準 → RL 路徑行為完全不變。
+        gp("topic_lidar_sweep", "/rover_rl/lidar_sweep_72")
+        gp("sweep_r_max_m", 20.0)          # 與 lidar_preprocessor 的正規化基準一致
+        gp("sweep_r_robot_m", 0.35)
+        gp("sweep_front_block_close_m", 1.2)   # 對齊 policy_node 的 front_block_close_m
         # --- 看門狗逾時 ---
         gp("timeout_desired_s", 0.5)   # RL cmd 超過此值沒更新 → 發 0
         gp("timeout_odom_s", 0.3)
@@ -201,6 +212,10 @@ class VOSafetyNode(Node):
         self.topic_odom = g("topic_odom").get_parameter_value().string_value
         self.topic_obs = g("topic_obstacles").get_parameter_value().string_value
         self.topic_goal_status = g("topic_goal_status").get_parameter_value().string_value
+        self.topic_sweep = g("topic_lidar_sweep").get_parameter_value().string_value
+        self.sweep_r_max = float(g("sweep_r_max_m").value)
+        self.sweep_r_robot = float(g("sweep_r_robot_m").value)
+        self.sweep_block_close = float(g("sweep_front_block_close_m").value)
         self.timeout_desired = float(g("timeout_desired_s").value)
         self.timeout_odom = float(g("timeout_odom_s").value)
         self.timeout_obs = float(g("timeout_obstacles_s").value)
@@ -321,7 +336,8 @@ class VOSafetyNode(Node):
         self._right_m: float | None = None  # 右側 LiDAR 淨空
         self._front_m: float | None = None  # 前方 LiDAR 最近距（前方安全煞用；含牆任何物）
         self._front_block_ratio: float | None = None  # ±30° 前方扇區填滿率（0~1）
-        self._sweep_t = 0.0                  # policy status（含 front_m）最後到達 monotonic 時間
+        self._sweep_t = 0.0                  # 扇區距離（含 front_m）最後更新 monotonic 時間（不分來源）
+        self._status_sweep_t = 0.0           # 其中「由 policy status 提供」的最後時間（決定要不要用備援）
         # 靜止人源快取
         self._yolo_betas: list[float] = []  # YOLO person 相機方位（rad，右正）
         self._yolo_t = 0.0
@@ -367,6 +383,9 @@ class VOSafetyNode(Node):
         self.create_subscription(TrackedObstacleArray, self.topic_obs,
                                  self._cb_obstacles, 10)
         # goal 來源：policy status JSON（純訂閱觀察，不耦合控制安全；收不到→退回純貼近 RL）
+        # 扇區距離備援來源（policy status 逾時才生效，見 _cb_lidar_sweep）
+        self.create_subscription(Float32MultiArray, self.topic_sweep,
+                                 self._cb_lidar_sweep, 5)
         self.create_subscription(String, self.topic_goal_status,
                                  self._cb_goal_status, 10)
         # 靜止人源訂閱（只滿血版啟用時才接）
@@ -422,6 +441,33 @@ class VOSafetyNode(Node):
         self._obs_t = time.monotonic()
 
     # ── goal 訂閱（policy status JSON；取 body-frame goal_dist/goal_ang_deg）──
+    def _cb_lidar_sweep(self, msg: Float32MultiArray) -> None:
+        """備援：policy status 沒在發時，直接從 72-bin sweep 還原前/左/右/後扇區距離。
+
+        公式與扇區切法完全對齊 policy_node（_sweep_to_meters + bins 28:45 / 46:63 /
+        10:27 / 64:72+0:10、front_block_ratio 取 30:43），確保 RL+VO 與 PID+VO 兩種
+        實驗條件下 VO 吃到的是同一組語意的值。
+
+        ⚠ policy status 新鮮時直接 return：RL 模式一律以 policy 算好的值為準，行為不變。
+        """
+        if (time.monotonic() - self._status_sweep_t) <= self.timeout_goal:
+            return
+        n = len(msg.data)
+        if n != 72:
+            return
+        span = self.sweep_r_max - self.sweep_r_robot
+        m = [v * span + self.sweep_r_robot for v in msg.data]
+        close = self.sweep_block_close
+        front = m[28:45]
+        self._front_m = round(min(front), 2)
+        self._left_m = round(min(m[46:63]), 2)
+        self._right_m = round(min(m[10:27]), 2)
+        self._back_m = round(min(m[64:72] + m[0:10]), 2)
+        block = m[30:43]
+        self._front_block_ratio = round(
+            sum(1 for v in block if v < close) / float(len(block)), 2)
+        self._sweep_t = time.monotonic()
+
     def _cb_goal_status(self, msg: String) -> None:
         try:
             d = json.loads(msg.data)
@@ -434,7 +480,9 @@ class VOSafetyNode(Node):
         self._right_m = _safe_float(d.get("right_m"))
         self._front_m = _safe_float(d.get("front_m"))  # 前方安全煞用
         self._front_block_ratio = _safe_float(d.get("front_block_ratio"))  # ±30° 前方填滿率
-        self._sweep_t = time.monotonic()               # 前方安全煞的新鮮度基準
+        now_sweep = time.monotonic()
+        self._sweep_t = now_sweep                      # 前方安全煞的新鮮度基準
+        self._status_sweep_t = now_sweep               # 有 policy status → 備援 sweep 回退讓位
         gd = _safe_float(d.get("goal_dist"))
         ga = _safe_float(d.get("goal_ang_deg"))
         if gd is None or ga is None:

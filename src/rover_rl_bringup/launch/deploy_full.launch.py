@@ -11,14 +11,33 @@
     [1] NDT 定位           — /velodyne_points → /ndt_pose + map→odom TF
     [2] Routing Engine     — generation_path service（拓撲路徑）
     [3] routing_to_path    — 橋接：routing service → /global_path topic
-    [4] Costmap            — local_costmap (RViz debug 用)
+    [4] Costmap            — local_costmap (RViz debug 用；controller=dwa/pid_vo 時是避障輸入)
     [5] MOT                — 動態障礙物追蹤
     [6] RViz               — 可視化
 
   rover_rl 棧:
     [7] lidar_preprocessor — /velodyne_points → /rover_rl/lidar_sweep_72
-    [8] policy_node        — sweep + odom + goal → /input/nav_cmd_vel
-    [9] bev_play           — 即時 BEV 圖 → /rover_rl/bev_image
+                             （所有 controller 都啟：diag 的碰撞指標 + VO 的前方安全煞備援都吃它）
+    [8] policy_node        — sweep + odom + goal → /input/nav_cmd_vel（僅 controller=rl）
+    [9] bev_play           — 即時 BEV 圖 → /rover_rl/bev_image（僅 controller=rl）
+
+  消融實驗 baseline（controller:=dwa|pid|pid_vo，論文用傳統演算法對照組）:
+    controller=dwa      — campusrover_move/dwa_planner（軌跡取樣 DWA，吃 /campusrover_local_costmap
+                           做靜態避障）→ /input/nav_cmd_vel。速度/角速度上限統一為底盤真實上限
+                           v=1.0 m/s, ω=1.2 rad/s（與 RL 實際可達上限一致，見 dwa_baseline 參數）。
+    controller=pid       — campusrover_move/path_following，關掉內建 DWA/costmap 避障
+                           （純路徑跟蹤，無避障）→ /input/nav_cmd_vel。同一組速度上限。
+    controller=pid_vo    — path_following（純跟蹤）→ /rover_rl/cmd_vel_baseline_desired
+                           → vo_safety_node（動態避障）→ /input/nav_cmd_vel。
+                           ⚠ PID 本身零避障、VO 只管動態障礙（靜態原本靠 RL 的 LiDAR 擋），
+                           故 vo_safety_node 在無 policy status 時會改直接吃 72-bin sweep
+                           還原 front/left/right_m，補回前方 LiDAR 安全煞（0.5m 硬停），
+                           否則靜態障礙（牆/家具）在此組合下完全沒人擋。
+    三者共用同一套 NDT/costmap/routing/LV-DOT/diag_logger/pingpong_test 基礎設施，只換
+    「誰在發 /input/nav_cmd_vel」，確保與 controller=rl 比較時公平（同 TF、同 costmap、
+    同測試協定）。diag_logger 的 experiment_tag 預設自動帶 controller 值。
+    pingpong_test 在非 rl controller 下會用 require_policy_status:=false（TF+/odom 取代
+    policy status），因為沒有 policy_node 可訂閱。
 
 使用方式：
   Terminal 1: 底盤 driver（提供 /odom + odom→base_link TF）
@@ -81,6 +100,7 @@ def generate_launch_description():
     enable_ndt = LaunchConfiguration("enable_ndt")
     log_level = LaunchConfiguration("log_level")
     map_file = LaunchConfiguration("map_file")
+    controller = LaunchConfiguration("controller")
 
     # ── Part 0: Map Server ──
     # 讀 yaml 地圖檔並持續發布到 /map（供 RViz / global_costmap / routing 用）
@@ -319,6 +339,12 @@ def generate_launch_description():
 
     # ── Part 6: rover_rl — LiDAR Preprocessor ──
     # 把 /velodyne_points 處理成 72-bin sweep（對齊訓練端公式）→ 發給 policy
+    # ⚠ 所有 controller 都要啟（含 dwa/pid/pid_vo baseline），不是只有 RL 需要：
+    #   1. diag_logger 用 sweep 算 lidar_collision（<lidar_collision_m 判碰撞）與
+    #      leg_min_sweep_m —— 那是論文 SR/TO/CR 的碰撞率來源，關掉等於 baseline 沒有碰撞指標。
+    #   2. vo_safety_node 在沒有 policy status 時（controller=pid_vo）改直接吃 sweep 還原
+    #      front/left/right_m，補回前方 LiDAR 安全煞（見 vo_safety_node._cb_lidar_sweep）。
+    #   policy 本身不在時它只是多發一個 topic，成本極低。
     preprocessor_node = Node(
         package="rover_rl_inference",
         executable="lidar_preprocessor",
@@ -338,6 +364,8 @@ def generate_launch_description():
     #     /rover_rl/cmd_vel_desired，讓外層 wrapper 接手後才送進 mux
     #     （policy 自己不直接發 /input/nav_cmd_vel）
     def make_policy_node(context, *args, **kwargs):
+        if LaunchConfiguration("controller").perform(context) != "rl":
+            return []   # 消融實驗 baseline（dwa/pid/pid_vo）不跑 RL policy
         mp = LaunchConfiguration("model_path").perform(context)
         mode = LaunchConfiguration("initial_mode").perform(context)
         lv = LaunchConfiguration("log_level").perform(context)
@@ -382,7 +410,10 @@ def generate_launch_description():
             "topic_obs_debug": "/rover_rl_policy/obs_debug",
         }],
         arguments=["--ros-args", "--log-level", log_level],
-        condition=IfCondition(enable_bev),
+        # 吃 policy 專屬的 obs_debug/lidar_sweep，baseline（dwa/pid/pid_vo）沒有這些資料
+        condition=IfCondition(PythonExpression([
+            "'", enable_bev, "' == 'true' and '", controller, "' == 'rl'"
+        ])),
     )
 
     # ── Part 9: rover_rl — 診斷記錄（被動，不影響推論）──
@@ -397,6 +428,11 @@ def generate_launch_description():
         wm = LaunchConfiguration("wandb_mode").perform(context)
         ar = LaunchConfiguration("auto_rearm").perform(context)
         ge = LaunchConfiguration("goal_change_eps_m").perform(context)
+        et = LaunchConfiguration("experiment_tag").perform(context)
+        ctrl = LaunchConfiguration("controller").perform(context)
+        # 消融實驗：留空自動帶 controller（rl/dwa/pid/pid_vo），有給才用自訂值
+        # （可自訂加場景後綴，如 dwa_fixed_obstacle）
+        ov["experiment_tag"] = et if et != "" else ctrl
         if rs != "":
             ov["require_start"] = _b(rs)
         if ew != "":
@@ -448,8 +484,9 @@ def generate_launch_description():
     # 無 VO 有 recovery→cmd_vel_recovery_in；都無→直接 /input/nav_cmd_vel。
     def make_mppi_static_guard_node(context, *args, **kwargs):
         mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
-        if not mppi_on:
-            return []
+        ctrl = LaunchConfiguration("controller").perform(context)
+        if not mppi_on or ctrl != "rl":
+            return []   # MPPI 吃 policy 的 /rover_rl/cmd_vel_desired，非 rl controller 沒有這個來源
         vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
         lv = LaunchConfiguration("log_level").perform(context)
@@ -496,8 +533,29 @@ def generate_launch_description():
     # 兩份完全獨立、同一個 vo_safety_node，換 yaml 就換行為，不互相干擾。
     def make_vo_safety_node(context, *args, **kwargs):
         vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
-        if not vo_on:
-            return []
+        ctrl = LaunchConfiguration("controller").perform(context)
+        lv0 = LaunchConfiguration("log_level").perform(context)
+        if ctrl == "pid_vo":
+            # 消融實驗 PID+VO 組：VO 吃 path_following 的純路徑跟蹤輸出（動態避障），
+            # 直接輸出到 mux；不套 RL 專屬的 mppi/recovery 相關 extra 覆寫。
+            # ⚠ 這裡「無視 enable_vo」刻意為之：選 controller=pid_vo 本身就是在要 VO。
+            #   若在此尊重 enable_vo:=false，path_following 已被 remap 去發
+            #   /rover_rl/cmd_vel_baseline_desired、卻沒有 VO 接手轉發到 /input/nav_cmd_vel
+            #   → 整條鏈斷掉、沒有任何節點發 cmd_vel，車完全不動且不報錯（靜默死路）。
+            #   要純 PID 無避障請用 controller:=pid，不要用 pid_vo + enable_vo:=false。
+            return [Node(
+                package="rover_rl_inference",
+                executable="vo_safety",
+                name="vo_safety_node",
+                output="screen",
+                emulate_tty=True,
+                parameters=[LaunchConfiguration("vo_params_file"), {
+                    "topic_cmd_in": "/rover_rl/cmd_vel_baseline_desired",
+                }],
+                arguments=["--ros-args", "--log-level", lv0],
+            )]
+        if ctrl != "rl" or not vo_on:
+            return []   # dwa / pid（純）自己不接 VO；rl 則照 enable_vo 決定
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
         static_avoid_on = LaunchConfiguration("enable_static_avoid").perform(context).lower() == "true"
         mppi_on = LaunchConfiguration("enable_mppi").perform(context).lower() == "true"
@@ -555,7 +613,8 @@ def generate_launch_description():
         arguments=["--ros-args", "--log-level", log_level],
         condition=IfCondition(PythonExpression([
             "'", LaunchConfiguration("enable_orca"), "' == 'true' and '",
-            LaunchConfiguration("enable_recovery"), "' != 'true'"
+            LaunchConfiguration("enable_recovery"), "' != 'true' and '",
+            controller, "' == 'rl'"
         ])),
     )
 
@@ -566,8 +625,9 @@ def generate_launch_description():
     #   policy → VO → /rover_rl/cmd_vel_recovery_in → [recovery_supervisor] → /input/nav_cmd_vel
     def make_recovery_supervisor_node(context, *args, **kwargs):
         recovery_on = LaunchConfiguration("enable_recovery").perform(context).lower() == "true"
-        if not recovery_on:
-            return []
+        ctrl = LaunchConfiguration("controller").perform(context)
+        if not recovery_on or ctrl != "rl":
+            return []   # Recovery 吃 policy 的 /rover_rl/cmd_vel_desired 鏈，非 rl controller 不適用
         vo_on = LaunchConfiguration("enable_vo").perform(context).lower() == "true"
         lv = LaunchConfiguration("log_level").perform(context)
         extra = {
@@ -587,26 +647,144 @@ def generate_launch_description():
         )]
     recovery_supervisor_node = OpaqueFunction(function=make_recovery_supervisor_node)
 
+    # ── Part 11d: 消融實驗 baseline 演算法（controller:=dwa|pid|pid_vo）──
+    # 兩個節點都是既有、已在此車上跑過的 campusrover_move 演算法（非新寫），只是這裡
+    # 加上「速度/角速度上限統一為底盤真實上限」的參數組，跟 RL 做公平比較。
+    #
+    # controller=dwa：真正的軌跡取樣 DWA，吃 /campusrover_local_costmap 做靜態避障，
+    #   直接輸出 /input/nav_cmd_vel（需 enable_costmap:=true，預設已開）。
+    dwa_baseline_node = Node(
+        package="campusrover_move",
+        executable="dwa_planner",
+        name="dwa_planner",
+        output="screen",
+        remappings=[
+            ("elevator_path", "/rover_rl/_baseline_unused_elevator"),
+            ("global_path", "/global_path"),
+            ("costmap", "/campusrover_local_costmap"),
+            ("cmd_vel", "/input/nav_cmd_vel"),
+            ("odom", "/odom"),
+        ],
+        parameters=[{
+            "robot_frame": "base_link",
+            "arriving_range_dis": 0.1,
+            "arriving_range_angle": 0.05,
+            "max_linear_acceleration": 5.0,   # 只影響 DWA 內部速度取樣範圍，非致動器限制
+            "max_angular_acceleration": 5.0,
+            "max_linear_velocity": 1.0,       # 消融實驗統一底盤上限（與 RL 實際可達上限一致）
+            "min_linear_velocity": -1.0,
+            "max_angular_velocity": 1.2,
+            "min_angular_velocity": -1.2,
+            "target_point_dis": 3.0,
+            "threshold_occupied": 2.0,
+            # footprint_* 在 dwa_planner.cpp 裡宣告/讀取後未再使用（死參數，真正的靜態避障
+            # 由下面 obstacle_max_dis/min_dis 配合 costmap cost weight 做軌跡評分達成）。
+            # 仍填真實車身外框數字（見 pid_baseline_node 同款註解），純粹避免將來對照時混淆。
+            "footprint_max_x": 0.8,
+            "footprint_min_x": -0.40,
+            "footprint_max_y": 0.40,
+            "footprint_min_y": -0.40,
+            "obstacle_max_dis": 3.0,
+            "obstacle_min_dis": 0.3,
+            "obstable_cost_weight": 1.5,
+            "target_dis_weight": 1.0,
+            "velocity_weight": 1.0,
+            "trajectory_num": 10,
+            "trajectory_point_num": 10,
+            "simulation_time": 6.0,
+            "target_bias": 0.1,
+            "min_angle_of_linear_profile": 0.1,
+            "max_angle_of_linear_profile": 0.8,
+            "enable_linear_depend_angular": True,
+            "enable_costmap_obstacle": True,
+            "direction_inverse": False,
+        }],
+        condition=IfCondition(PythonExpression([
+            "'", controller, "' == 'dwa'"
+        ])),
+    )
+
+    # controller=pid / pid_vo：path_following，關掉內建 DWA/costmap 避障（純路徑跟蹤），
+    #   pid   → 直接輸出 /input/nav_cmd_vel（無避障，論文原始對照組）
+    #   pid_vo→ 輸出到 /rover_rl/cmd_vel_baseline_desired，交給上面的 vo_safety_node
+    #           做動態避障後再送 /input/nav_cmd_vel
+    pid_baseline_node = Node(
+        package="campusrover_move",
+        executable="path_following",
+        name="path_following",
+        output="screen",
+        remappings=[
+            ("elevator_path", "/rover_rl/_baseline_unused_elevator"),
+            ("global_path", "/global_path"),
+            ("costmap", "/campusrover_local_costmap"),
+            ("odom", "/odom"),
+            ("cmd_vel", PythonExpression([
+                "'/rover_rl/cmd_vel_baseline_desired' if '", controller,
+                "' == 'pid_vo' else '/input/nav_cmd_vel'"
+            ])),
+        ],
+        parameters=[{
+            "robot_frame": "base_link",
+            "arriving_range_dis": 0.1,
+            "arriving_range_angle": 0.05,
+            "max_linear_velocity": 1.0,   # 消融實驗統一底盤上限
+            "max_angular_velocity": 1.2,
+            "target_point_dis": 0.6,
+            "threshold_occupied": 2.0,
+            # footprint_* 是 path_following.cpp CostmapCallback() 的「停車框」（障礙物落入即
+            # obstacle_stop_cmd_=true），但目前 enable_costmap_obstacle=False 時該函式開頭就
+            # return，此框連同 obstacle_detect_max_dis/min_dis 一併不執行（純路徑跟蹤、零避障，
+            # 已讀原始碼確認）。數字仍對齊 RL 側真值（policy_params.yaml 訓練半徑 0.35、實際
+            # 半寬 0.26、diag_logger/vo_params 的車體轉彎外接圓 0.40）：左右取 ±0.40（與 VO
+            # r_robot 一致），前方 0.40 車身 + 0.42 煞停距離（v=1.0 / chassis acc_max=1.2 算得
+            # v²/2a）≈0.8。只在未來把 enable_costmap_obstacle 打開做「PID+costmap 停車」變體
+            # 時才會生效，先備著避免踩到舊的離譜數字。
+            "footprint_max_x": 0.8,
+            "footprint_min_x": -0.40,
+            "footprint_max_y": 0.40,
+            "footprint_min_y": -0.40,
+            "speed_pid_k": 0.8,
+            "min_angle_of_linear_profile": 0.1,
+            "max_angle_of_linear_profile": 0.8,
+            "obstacle_range": 0.3,
+            "enable_linear_depend_angular": True,
+            "enable_costmap_obstacle": False,        # 純路徑跟蹤，避障交給 VO 或不做
+            "enable_dwa_obstacle_avoidance": False,   # 不掛內建 DWA 避障，保持「傳統 PID」對照組乾淨
+            "enable_pullover_mode": False,
+            "direction_inverse": False,
+        }],
+        condition=IfCondition(PythonExpression([
+            "'", controller, "' in ('pid', 'pid_vo')"
+        ])),
+    )
+
     # ── Part 12: 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）──
     # 把車手動開到 A/B 任一點停穩 → 自動規劃往對向點，A↔B 無限來回，供反覆測避障。
     # 與 RL 推論/避障完全解耦：只訂閱 policy status、呼叫 routing、必要時切 mode=nav。
-    pingpong_test_node = Node(
-        package="rover_rl_inference",
-        executable="pingpong_test",
-        name="pingpong_test",
-        output="screen",
-        emulate_tty=True,
-        parameters=[{
-            "point_a": LaunchConfiguration("pingpong_a"),
-            "point_b": LaunchConfiguration("pingpong_b"),
-            "building": "itc",
-            "floor": "3",
-            "auto_set_nav": LaunchConfiguration("pingpong_auto_nav"),
-            "auto_continue": LaunchConfiguration("pingpong_auto_continue"),
-        }],
-        arguments=["--ros-args", "--log-level", log_level],
-        condition=IfCondition(LaunchConfiguration("enable_pingpong")),
-    )
+    # 消融實驗（controller!=rl）沒有 policy_node，姿態/mode 改走 TF+/odom
+    # （require_policy_status:=false，見 pingpong_test_node.py 的 baseline 模式）
+    def make_pingpong_test_node(context, *args, **kwargs):
+        ctrl = LaunchConfiguration("controller").perform(context)
+        lv = LaunchConfiguration("log_level").perform(context)
+        return [Node(
+            package="rover_rl_inference",
+            executable="pingpong_test",
+            name="pingpong_test",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "point_a": LaunchConfiguration("pingpong_a"),
+                "point_b": LaunchConfiguration("pingpong_b"),
+                "building": "itc",
+                "floor": "3",
+                "auto_set_nav": LaunchConfiguration("pingpong_auto_nav"),
+                "auto_continue": LaunchConfiguration("pingpong_auto_continue"),
+                "require_policy_status": ctrl == "rl",
+            }],
+            arguments=["--ros-args", "--log-level", lv],
+            condition=IfCondition(LaunchConfiguration("enable_pingpong")),
+        )]
+    pingpong_test_node = OpaqueFunction(function=make_pingpong_test_node)
 
     # ── Banner ──
     banner = LogInfo(msg=(
@@ -620,12 +798,15 @@ def generate_launch_description():
         "    [4] Costmap (可選)\n"
         "    [5] MOT (可選)\n"
         "    [6] RViz\n"
-        "  rover_rl 棧:\n"
+        "  rover_rl 棧 (controller=rl 才啟):\n"
         "    [7] lidar_preprocessor\n"
         "    [8] policy_node\n"
         "    [9] bev_play\n"
         "    [10] LV-DOT 動態偵測 (/onboard_detector/*)\n"
-        "  排除: DWA + AIT* (由 RL policy + routing 取代)\n"
+        "  消融實驗 baseline (controller=dwa|pid|pid_vo 才啟):\n"
+        "    [11] dwa_planner / path_following → /input/nav_cmd_vel\n"
+        "  排除: DWA + AIT* 預設關（controller=dwa 時由此開回 DWA；"
+        "AIT* 一律用 routing 取代）\n"
         "================================"
     ))
 
@@ -633,6 +814,20 @@ def generate_launch_description():
         # ── args ──
         # 在此設定所有啟動參數的「預設值」與說明，可在命令列覆寫
         # 例：ros2 launch ... deploy_full.launch.py initial_mode:=idle enable_mot:=false
+        DeclareLaunchArgument("controller", default_value="rl",
+                              description="rl|dwa|pid|pid_vo — 消融實驗用，決定誰發 "
+                                          "/input/nav_cmd_vel。rl=policy_node(可疊 mppi/vo/orca/"
+                                          "recovery，現況預設)；dwa=campusrover_move/dwa_planner"
+                                          "（軌跡取樣 DWA + costmap 靜態避障）；pid="
+                                          "campusrover_move/path_following（純路徑跟蹤，無避障）；"
+                                          "pid_vo=path_following + vo_safety_node（動態避障）。"
+                                          "非 rl 時 lidar_preprocessor/policy_node/bev/mppi/orca/"
+                                          "recovery 一律不啟，NDT/costmap/routing/LV-DOT/diag_logger/"
+                                          "pingpong_test 照常共用。"),
+        DeclareLaunchArgument("experiment_tag", default_value="",
+                              description="診斷記錄 experiment_tag。留空自動帶 controller 值"
+                                          "（rl/dwa/pid/pid_vo），可自訂加場景後綴如 "
+                                          "dwa_fixed_obstacle"),
         DeclareLaunchArgument("model_path", default_value="",
                               description="覆寫 yaml model_path"),
         DeclareLaunchArgument("initial_mode", default_value="nav"),
@@ -719,9 +914,15 @@ def generate_launch_description():
                               description="往返測試 B 點（routing 拓撲節點名）"),
         DeclareLaunchArgument("pingpong_auto_nav", default_value="true",
                               description="往返測試啟動時自動切 mode=nav 讓 RL 接手"),
-        DeclareLaunchArgument("pingpong_auto_continue", default_value="false",
+        DeclareLaunchArgument("pingpong_auto_continue",
+                              default_value=PythonExpression([
+                                  "'false' if '", controller, "' == 'rl' else 'true'"
+                              ]),
                               description="往返測試全自動模式：就緒後不必按空白鍵、停穩自動出發下一段"
-                                          "（執行中可用 TUI 'a' 鍵熱切換）"),
+                                          "（執行中可用 TUI 'a' 鍵熱切換）。"
+                                          "⚠ controller!=rl 時預設 true：空白鍵是 status_tui 攔截後發的，"
+                                          "而 baseline（dwa/pid/pid_vo）沒有 policy status 可餵 TUI、"
+                                          "不會跑 status_tui → 沒人能按空白鍵，false 會永遠卡在「就緒」。"),
         DeclareLaunchArgument("map_file",
                               default_value="/home/aa/maps/4v3F.yaml"),
         DeclareLaunchArgument("log_level", default_value="info"),
@@ -768,6 +969,10 @@ def generate_launch_description():
         vo_safety_node,
         orca_safety_node,
         recovery_supervisor_node,
+
+        # 消融實驗 baseline（controller:=dwa|pid|pid_vo 才啟，預設 rl 不啟這兩個）
+        dwa_baseline_node,
+        pid_baseline_node,
 
         # 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）
         pingpong_test_node,
