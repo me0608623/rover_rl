@@ -734,7 +734,32 @@ def generate_launch_description():
             v = act_v * rate
             w = act_w * rate
 
-        return [
+        # ── 感測條件也要對齊：r_min 決定「多近的點會被整個丟掉」 ──
+        # lidar_preprocess.py:81 `mask = (r >= r_min)`——比 r_min 近的回波被**丟棄**，
+        # 該方向若沒有更遠的回波，那個 bin 會變成 1.0（= 無回波 = r_max），
+        # 也就是障礙物太近時 sweep 顯示的是「空曠」而不是「很近」。
+        # 而各 variant 的 r_min 差很多（預設 0.9 / sa* 0.5 / v3* 0.25），r_max 與 r_robot
+        # 則全部一致（20.0 / 0.35）。baseline 若沿用預設的 0.9、RL 用 0.25，兩組的
+        # 近場感測能力就不對等，而且 vo_safety 給 pid_vo 的前方 0.5 m 硬停會永遠不觸發
+        # （front_m 最小只會是 0.9）。故對齊速度上限時一併換掉 preprocessor 參數檔。
+        extra = []
+        if align:
+            pre = os.path.join(os.path.dirname(path),
+                               os.path.basename(path).replace("policy_params",
+                                                              "lidar_preprocessor_params"))
+            given = LaunchConfiguration("preprocessor_params_file").perform(context)
+            if not os.path.isfile(pre):
+                extra.append(LogInfo(msg=(
+                    f"\n⚠ 找不到對應的 preprocessor 參數檔 {os.path.basename(pre)}，"
+                    f"沿用 {os.path.basename(given)}"
+                    f"\n  → 兩組的 r_min（近場盲區）可能不一致，近場感測條件不對等\n")))
+            elif os.path.abspath(given) != os.path.abspath(pre):
+                extra.append(SetLaunchConfiguration("preprocessor_params_file", pre))
+                extra.append(LogInfo(msg=(
+                    f"[消融實驗] 感測參數一併對齊 → {os.path.basename(pre)}"
+                    f"（r_min 與 RL 組相同）")))
+
+        return extra + [
             SetLaunchConfiguration("baseline_v_final", f"{v:.4f}"),
             SetLaunchConfiguration("baseline_w_final", f"{w:.4f}"),
             SetLaunchConfiguration("baseline_v_neg", f"{-v:.4f}"),
@@ -1194,6 +1219,11 @@ def generate_launch_description():
         mot_node,
         mot_marker_node,
 
+        # ⚠ baseline_limits 要排在 preprocessor_node 之前：它除了廣播速度上限，
+        #   還會在 align_rl_config 模式下改寫 preprocessor_params_file（對齊 r_min），
+        #   排在後面的話 preprocessor 已經拿舊值建好節點了。
+        baseline_limits,
+
         # rover_rl 棧
         preprocessor_node,
         policy_node,
@@ -1213,9 +1243,7 @@ def generate_launch_description():
         recovery_supervisor_node,
 
         # 消融實驗 baseline（controller:=dwa|pid|pid_vo|mppi 才啟，預設 rl 一個都不啟）
-        # ⚠ baseline_limits 必須排在四個節點之前：它用 SetLaunchConfiguration 廣播
-        #   算好的速度上限，下面四個都靠那組值（順序顛倒會拿到未定義的 configuration）。
-        baseline_limits,
+        # （baseline_limits 已在 preprocessor_node 之前執行，速度上限與感測參數都已廣播）
         dwa_baseline_node,
         pid_baseline_node,
         mppi_baseline_node,
