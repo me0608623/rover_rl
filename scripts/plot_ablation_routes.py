@@ -25,6 +25,9 @@ python3 scripts/plot_ablation_routes.py --index ... --speed --speed-col cmd_v
 
 # 4) 背景換成 2D 佔據地圖（比較乾淨，適合黑白印刷）
 python3 scripts/plot_ablation_routes.py --index ... --map grid
+
+# 5) 分段圖：每段一格，看單段行為與段間一致性（多組時每組一列，同段上下對齊）
+python3 scripts/plot_ablation_routes.py --index ... --per-leg
 """
 from __future__ import annotations
 
@@ -238,6 +241,64 @@ def plot_compare(groups, args, bbox):
     return fig
 
 
+def plot_per_leg(groups, args, bbox):
+    """每段一張子圖，共用座標範圍與背景 —— 看單段行為與段間一致性。
+
+    疊圖能看整體分布，但看不出「哪一段偏了、偏在哪裡」。分段圖每格只畫一段，
+    座標範圍與背景固定，段與段之間可直接對位比較。
+
+    排版：單組時排成接近正方形的網格；多組時每組佔一列（同一行=同一段序），
+    四組對比時同一段的四種走法會上下對齊。
+    """
+    multi = len(groups) > 1
+    if multi:
+        nrow = len(groups)
+        ncol = max(len(v) for v in groups.values())
+    else:
+        n = len(next(iter(groups.values())))
+        ncol = int(np.ceil(np.sqrt(n)))
+        nrow = int(np.ceil(n / ncol))
+
+    fig, axes = plt.subplots(nrow, ncol, figsize=(args.width * ncol / 2.6,
+                                                  args.height * nrow / 2.2),
+                             squeeze=False)
+    # 背景點雲每格都要畫，總點數 = max_points × 格數 會很慢；分攤後每格用少一點
+    bg_args = argparse.Namespace(**vars(args))
+    bg_args.max_points = max(8000, args.max_points // max(1, nrow * ncol))
+
+    spare = list(FALLBACK_COLORS)
+    # (row, col, tag, color, traj) 的攤平清單：多組→每組一列；單組→依序填滿網格
+    cells = []
+    for r, (tag, trajs) in enumerate(groups.items()):
+        color = _color_of(tag, spare)
+        for i, t in enumerate(trajs):
+            row, col = (r, i) if multi else (i // ncol, i % ncol)
+            cells.append((row, col, tag, color, t, i + 1))
+    used = {(c[0], c[1]) for c in cells}
+    for row in range(nrow):
+        for col in range(ncol):
+            if (row, col) not in used:
+                axes[row][col].axis("off")
+
+    for row, col, tag, color, t, leg_no in cells:
+            ax = axes[row][col]
+            _bg(ax, bg_args, bbox)
+            ax.plot(t["x"], t["y"], color=color, lw=2.0, alpha=0.95, zorder=3)
+            ax.plot(t["x"][0], t["y"][0], "o", color=color, ms=7, mec="k", mew=0.7, zorder=4)
+            ax.plot(t["x"][-1], t["y"][-1], "s", color=color, ms=7, mec="k", mew=0.7, zorder=4)
+            ax.set_xlim(bbox[0], bbox[1])
+            ax.set_ylim(bbox[2], bbox[3])
+            ax.set_aspect("equal", adjustable="box")
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"{tag} #{leg_no}", fontsize=9)
+    fig.suptitle(args.title or L("分段行駛路線（每格一段，○起點 □終點）",
+                                 "Per-run routes (one panel per run; o=start, s=end)"),
+                 fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    return fig
+
+
 def plot_speed(groups, args, bbox):
     n = len(groups)
     ncol = min(n, 2)
@@ -292,6 +353,8 @@ def main() -> int:
     bg.add_argument("--max-points", type=int, default=120000, help="背景點雲下採樣上限")
 
     ap.add_argument("--speed", action="store_true", help="改畫「每演算法一張子圖、依速度上色」")
+    ap.add_argument("--per-leg", action="store_true",
+                    help="改畫「每段一張子圖」（看單段行為與段間一致性；多組時每組一列）")
     ap.add_argument("--speed-col", default="cmd_v",
                     help="速度欄：cmd_v(送進mux) / act_v(odom實測) / odom_v。預設 cmd_v")
     ap.add_argument("--margin", type=float, default=3.0, help="軌跡外擴邊界(m)")
@@ -342,7 +405,12 @@ def main() -> int:
     bbox = _bbox_of(groups, args.margin)
     print(f"繪圖範圍 x[{bbox[0]:.1f},{bbox[1]:.1f}] y[{bbox[2]:.1f},{bbox[3]:.1f}]")
 
-    fig = plot_speed(groups, args, bbox) if args.speed else plot_compare(groups, args, bbox)
+    if args.per_leg:
+        fig = plot_per_leg(groups, args, bbox)
+    elif args.speed:
+        fig = plot_speed(groups, args, bbox)
+    else:
+        fig = plot_compare(groups, args, bbox)
 
     out = args.out or os.path.expanduser(
         f"~/rover_rl/logs/ablation_routes_{'speed' if args.speed else 'compare'}"
