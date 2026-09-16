@@ -777,8 +777,17 @@ def generate_launch_description():
             "robot_frame": "base_link",
             "arriving_range_dis": 0.1,
             "arriving_range_angle": 0.05,
-            "max_linear_acceleration": 5.0,   # 只影響 DWA 內部速度取樣範圍，非致動器限制
-            "max_angular_acceleration": 5.0,
+            # ⚠ 這兩個「不是致動器限制」，而是**速度取樣窗口的半寬**：
+            #   v 候選 = statu_v_ ± max_linear_acceleration × delta_t(0.05)
+            #   ω 候選 = 0.1·目標角差 ± max_angular_acceleration × delta_t(0.05)
+            # 原本角向給 5.0 → 取樣範圍只有 ±0.25 rad/s，加上目標偏置最多 ±0.56，
+            # **永遠碰不到 1.2 的角速度上限**，等於把 DWA 的轉向能力砍掉一半以上
+            # （dwa_planner.cpp:648 用 w_center 當中心而非 statu_w_，statu_w_ 賦值後從未被讀，
+            #   是實作缺陷；這裡不改該 package 的 C++——它同時是 campusrover 正式導航元件——
+            #   改以放大取樣窗口讓 DWA 能用滿自己的角速度上限，對 baseline 較公平）。
+            # 24.0 × 0.05 = 1.2 rad/s，剛好覆蓋整個角速度範圍。
+            "max_linear_acceleration": 5.0,
+            "max_angular_acceleration": 24.0,
             # ⚠ 速度上限一律由 Part 11c-2 的 resolve_baseline_limits 算出（對齊 RL 的
             #   act_max × speed_rate），不要在這裡填死數字——RL 的實體上限隨 checkpoint
             #   與啟動時選的 speed_rate 變動（0.35~1.00 m/s），填死等於送 baseline 速度優勢。
@@ -802,9 +811,18 @@ def generate_launch_description():
             "obstable_cost_weight": 1.5,
             "target_dis_weight": 1.0,
             "velocity_weight": 1.0,
-            "trajectory_num": 10,
-            "trajectory_point_num": 10,
-            "simulation_time": 6.0,
+            "trajectory_num": 10,             # → 取樣 10×20 = 200 條軌跡（與 MPPI 的 230 條相當）
+            # ⚠ simulation_time 原為 6.0，但 local costmap 只有 6×6 m、base_link 在正中心
+            #   → 前方僅 3.0 m 可用（local_costmap.cpp:64 origin = -size/2）。
+            #   6.0 s × 0.6 m/s = 3.6 m 會超出地圖，而 get_cost_at_point 對出界回傳 -1.0、
+            #   整條軌跡被判無效（dwa_planner.cpp:1046）→ 只有 v < 0.5 m/s 的軌跡能存活，
+            #   DWA 被自己的參數壓在 0.5 m/s 以下，而且彎曲軌跡因為走得近反而不出界
+            #   → 系統性偏好轉彎而非直行。2.5 s × 1.0 m/s = 2.5 m < 3.0 m，留 0.5 m 餘裕。
+            # trajectory_point_num 同步 10→20：碰撞檢查點間距 = v × (sim/點數)，
+            #   原本 0.6 s 步長在 v=1.0 時間距 0.6 m，剛好等於 costmap 膨脹半徑（會擦邊漏檢）；
+            #   0.125 s 步長把間距壓到 0.125 m，遠小於膨脹半徑。
+            "trajectory_point_num": 20,
+            "simulation_time": 2.5,
             "target_bias": 0.1,
             "min_angle_of_linear_profile": 0.1,
             "max_angle_of_linear_profile": 0.8,
