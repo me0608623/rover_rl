@@ -30,9 +30,11 @@ alias deploy_rl_stop='bash ~/rover_rl_stop.sh'
 #   是否已在跑（沒跑會問要不要一併啟）。前景是純文字狀態行（非 curses，pipe 也能跑）。
 #   與 RL 共用同一套 NDT/costmap/routing/diag/pingpong，只換誰發 /input/nav_cmd_vel。
 #   例：deploy_baseline_shell  /  deploy_baseline_shell controller:=pid_vo
-#   停止：deploy_rl_stop（與 RL 棧共用同一個 stop 腳本）
+#   停止：deploy_baseline_stop（＝ deploy_rl_stop，同一支 rover_rl_stop.sh；
+#         已涵蓋 dwa_planner / path_following / baseline_status_line 與 orphan wrapper）
 alias deploy_baseline_shell='bash ~/rover_rl/deploy_baseline_shell.sh'
 alias deploy_baseline='deploy_baseline_shell'
+alias deploy_baseline_stop='bash ~/rover_rl_stop.sh'
 # record_teleop：純被動錄「人工示範操控速度」（模仿學習用）。標籤原樣轉給腳本。
 #   例：record_teleop backup_demo_1  /  record_teleop backup_demo_1 --secs 60
 #   輸出 ~/rover_rl/logs/teleop/teleop_<時間>_<標籤>/，Ctrl+C 停並印倒退段落分析。
