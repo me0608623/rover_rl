@@ -67,6 +67,7 @@ class PingpongTestNode(Node):
         # 全自動模式：就緒後不必按空白鍵，停穩後自動出發下一段（可執行中用 TUI 'a' 鍵熱切換）。
         self.declare_parameter("auto_continue", False)      # 初始是否啟用全自動
         self.declare_parameter("auto_pause_ticks", 4)       # 2Hz × 4 = 2s 就緒緩衝再自動發（給中斷空間）
+        self.declare_parameter("routing_retry_s", 3.0)      # routing 回空後多久重試（baseline 唯一的重試路徑）
         # 介接 topic / service
         self.declare_parameter("topic_status", "/rover_rl_policy/status")
         self.declare_parameter("topic_mode", "/rover_rl_policy/mode")
@@ -94,6 +95,7 @@ class PingpongTestNode(Node):
         self._arrive_dwell = int(self.get_parameter("arrive_dwell_ticks").value)
         self._auto_set_nav = bool(self.get_parameter("auto_set_nav").value)
         self._auto_continue = bool(self.get_parameter("auto_continue").value)
+        self._routing_retry_s = float(self.get_parameter("routing_retry_s").value)
         self._auto_pause_ticks = int(self.get_parameter("auto_pause_ticks").value)
         self._stale_s = float(self.get_parameter("status_stale_s").value)
         self._require_policy_status = bool(self.get_parameter("require_policy_status").value)
@@ -163,6 +165,7 @@ class PingpongTestNode(Node):
         self._start_count = 0          # 就緒 dwell 計數
         self._arrive_count = 0         # 到達 dwell 計數
         self._lost_path_count = 0      # RUNNING 中無 path 計數（觸發重新規劃）
+        self._retry_routing_at = 0.0   # >0 表示排定了重試時間（routing 回空後設定）
         self._auto_pause_count = 0     # 全自動模式：就緒緩衝計數
         self._warned_pose_src = False
 
@@ -322,7 +325,14 @@ class PingpongTestNode(Node):
             res = future.result()
             n = sum(len(p.poses) for p in res.routing) if res and res.routing else 0
             if n == 0:
-                self.get_logger().warn("routing 回空路徑（稍後 watchdog 會重試）")
+                # ⚠ 不能只靠 _tick_running 的 watchdog：它的判據是 nav_type != "path"，
+                #   而 baseline（require_policy_status=false）下 nav_type 恆為 "path"
+                #   → 條件永遠不成立、計數被歸零 → 第一次回空之後就再也不會重試，車永遠不動。
+                #   （實測：2026-09-16 controller=mppi，routing 在 working_floor 發布前被呼叫而回空，
+                #     之後 27 秒完全沒有重試。）故在此直接把重試排進來。
+                self._retry_routing_at = time.monotonic() + self._routing_retry_s
+                self.get_logger().warn(
+                    f"routing 回空路徑 → {self._routing_retry_s:.0f}s 後自動重試")
         except Exception as e:
             self.get_logger().error(f"routing 呼叫異常: {e}")
 
@@ -485,6 +495,14 @@ class PingpongTestNode(Node):
                     f"{f'全自動模式將自動往 {other}' if self._auto_continue else f'按【空白鍵】往 {other}'}")
             return
         self._arrive_count = 0
+
+        # routing 回空後排定的重試（baseline 下唯一會生效的重試路徑，見 _on_routing_done）
+        if self._retry_routing_at and time.monotonic() >= self._retry_routing_at:
+            self._retry_routing_at = 0.0
+            if not self._routing_inflight:
+                self.get_logger().warn(f"重試 routing：{self._from} → {self._target}")
+                self._call_routing(self._from, self._target)
+            return
 
         # 路徑遺失 watchdog：RUNNING 但無 path（routing 回空 / 被清）連續數拍 → 重規劃
         if nav_type != "path" and not self._routing_inflight:

@@ -131,7 +131,14 @@ class RoutingToPathNode(Node):
             callback_group=self._cb_group)
 
         self._lock = threading.Lock()
-        self._floor_timer = self.create_timer(10.0, self._publish_floor)
+        # ⚠ 原本是 10.0 秒才發一次。routing_engine 在收到 working_floor 之前，任何
+        #   generation_path 呼叫都回 "No data for server yet." + 空路徑。往返測試若在
+        #   車已經停在 A/B 點上時啟動，pingpong 約 6 秒就會呼叫 routing → 必定落在
+        #   這個空窗內（實測 2026-09-16：呼叫於 +6.3s、working_floor 發於 +10.0s）。
+        #   改成 1 Hz 連發數次：第一則提早到 +1s，後續幾則對付 zenoh 的 pub/sub 配對延遲
+        #   （同 map_loader 對付 transient_local 競態的做法）。
+        self._floor_pub_count = 0
+        self._floor_timer = self.create_timer(1.0, self._publish_floor)
 
         self.get_logger().info(
             f"routing_to_path 啟動\n"
@@ -268,15 +275,23 @@ class RoutingToPathNode(Node):
         nx, ny = self._nodes[name]
         return name, math.hypot(nx - x, ny - y)
 
+    FLOOR_PUB_TIMES = 8      # 1 Hz × 8 = 涵蓋原本 10s 的窗口，但第一則在 +1s 就送出
+
     def _publish_floor(self):
-        # routing_engine 要先收到 working_floor 才會載入對應樓層的拓撲圖；
-        # 發一次就夠（cancel timer），重複發無益。
+        # routing_engine 要先收到 working_floor 才會載入對應樓層的拓撲圖。
+        # 連發數次而非一次：訂閱端可能還沒配對好（zenoh），早發的那幾則會掉。
+        # 重複收到同一樓層對 engine 是冪等的（重新載入同一份拓撲）。
         msg = WorkingFloor()
         msg.building = self._building
         msg.floor = self._floor
         self.pub_floor.publish(msg)
-        self.get_logger().info(f"已發布 working_floor: building={self._building}, floor={self._floor}")
-        self._floor_timer.cancel()  # 只發一次
+        self._floor_pub_count += 1
+        if self._floor_pub_count == 1:
+            self.get_logger().info(
+                f"已發布 working_floor: building={self._building}, floor={self._floor}"
+                f"（1 Hz 連發 {self.FLOOR_PUB_TIMES} 次確保 routing_engine 收到）")
+        if self._floor_pub_count >= self.FLOOR_PUB_TIMES:
+            self._floor_timer.cancel()
 
     def _handle_call(self, request, response):
         """外部呼叫 → 轉發給 routing_engine → 結果 publish 到 /global_path."""
