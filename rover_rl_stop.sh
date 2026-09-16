@@ -35,6 +35,9 @@ ROS_NODE_PATTERNS=(
     "mppi_planner"        # 抓 mppi_planner_node / mppi_planner_0520_node（含重複多開實例）
     "dwa_planner"          # 消融實驗 baseline（controller=dwa）
     "path_following"       # 消融實驗 baseline（controller=pid/pid_vo）
+    "baseline_arm"         # 消融實驗：arm 上面三個 planner 的橋接節點。
+                           # ⚠ 一定要跟著清：它殘留的話會把下一次（或殘留的）planner
+                           #    重新 arm 起來，變成沒人察覺的第二個 cmd_vel 來源。
 )
 
 for pattern in "${ROS_NODE_PATTERNS[@]}"; do
@@ -87,7 +90,7 @@ if [ -n "$LAUNCH_PIDS" ]; then
     kill -SIGKILL $LAUNCH_PIDS 2>/dev/null
 fi
 
-# ── Step 4.5: 清除 orphan deploy_rl_shell wrapper（重複重啟 / snapshot 卡住會殘留）──
+# ── Step 4.5: 清除 orphan deploy_rl_shell / deploy_baseline_shell wrapper（重複重啟 / snapshot 卡住會殘留）──
 # ⚠ 排除「本 stop 腳本自己的祖先鏈」：若本腳本是被某個 deploy_rl_shell 的 q-cleanup 呼叫的，
 #   那個 shell 正在正常收尾，不能殺它（否則 trap 收尾中斷）。standalone 執行時祖先無 shell → 全清。
 SELF_CHAIN=" "
@@ -97,9 +100,9 @@ while [ "${_p:-0}" -gt 1 ]; do
     _p=$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ')
     [ -z "$_p" ] && break
 done
-for pid in $(pgrep -f "deploy_rl_shell.sh" 2>/dev/null); do
+for pid in $(pgrep -f "deploy_rl_shell.sh\|deploy_baseline_shell.sh" 2>/dev/null); do
     case "$SELF_CHAIN" in *" $pid "*) continue ;; esac   # 跳過自己的祖先鏈（正在 q-cleanup 的 shell）
-    echo "[rover_rl_stop] 清除 orphan deploy_rl_shell wrapper: $pid"
+    echo "[rover_rl_stop] 清除 orphan deploy shell wrapper: $pid"
     kill -SIGKILL "$pid" 2>/dev/null
 done
 
@@ -133,11 +136,11 @@ ZOMBIES=$(ps -eo pid,stat,cmd 2>/dev/null | awk '$2 ~ /Z/ && /routing_engine|rou
 if [ -n "$ZOMBIES" ]; then
     echo "[rover_rl_stop] 偵測到殭屍進程（待 init 回收，通常數秒內自動消失）: $ZOMBIES"
 fi
-REMAINING=$(pgrep -f "rover_rl_policy\|vo_safety\|recovery_supervisor\|orca_safety\|pingpong_test\|diag_logger\|rover_rl_lidar\|rover_rl_bev\|routing_to_path\|routing_click\|routing_engine_node\|mapinfo_db_handler\|mppi_planner\|dwa_planner\|path_following" 2>/dev/null)
+REMAINING=$(pgrep -f "rover_rl_policy\|vo_safety\|recovery_supervisor\|orca_safety\|pingpong_test\|diag_logger\|rover_rl_lidar\|rover_rl_bev\|routing_to_path\|routing_click\|routing_engine_node\|mapinfo_db_handler\|mppi_planner\|dwa_planner\|path_following\|baseline_arm" 2>/dev/null)
 STRAY=$(pgrep -f "ros2 service call.*RoutingPath\|ros2 service call.*generation_path\|sweep_routes\|bin/ros2 param dump\|status_tui\|baseline_status_line" 2>/dev/null)
 # orphan wrapper（排除自己祖先鏈）也納入殘留判定
 STRAY_SHELL=""
-for pid in $(pgrep -f "deploy_rl_shell.sh" 2>/dev/null); do
+for pid in $(pgrep -f "deploy_rl_shell.sh\|deploy_baseline_shell.sh" 2>/dev/null); do
     case "$SELF_CHAIN" in *" $pid "*) continue ;; esac
     STRAY_SHELL="$STRAY_SHELL $pid"
 done

@@ -91,15 +91,17 @@ if has_arg controller "$@"; then
 elif [ "$IS_TTY" = "1" ]; then
     echo "┌─ 選擇消融實驗 controller ────────────────────────────────────"
     echo "│ [1] dwa     軌跡取樣 DWA（campusrover_move/dwa_planner）"
-    echo "│             吃 costmap 做靜態避障，本身就是完整的傳統區域規劃器"
-    echo "│ [2] pid     純路徑跟蹤（path_following，關掉所有避障）"
-    echo "│             論文的原始對照組：完全沒有避障能力"
+    echo "│             吃 costmap 避障（含行人的當下位置），不預測速度"
+    echo "│ [2] mppi    取樣式 MPC（campusrover_move/mppi_planner 原生 path 模式）"
+    echo "│             230 條 rollout × 前瞻 + costmap 避障，比 DWA 現代的對照組"
     echo "│ [3] pid_vo  純路徑跟蹤 + VO 動態避障層"
-    echo "│             ⚠ PID 零避障、VO 只管動態 → 靜態靠 VO 的前方 LiDAR 煞（0.5m 硬停）"
+    echo "│             反應式→預測式對照：VO 吃 LV-DOT 追蹤速度做預測避障"
     echo "└──────────────────────────────────────────────────────────────"
+    echo "  （controller:=pid 純路徑跟蹤零避障組已於 2026-09-16 移出實驗矩陣，"
+    echo "    程式碼仍在，需要時用命令列 deploy_baseline_shell controller:=pid 啟動）"
     read -rp "選擇 [1-3]（Enter=1 dwa）： " C_SEL
     case "$C_SEL" in
-        2) CONTROLLER=pid ;;
+        2) CONTROLLER=mppi ;;
         3) CONTROLLER=pid_vo ;;
         *) CONTROLLER=dwa ;;
     esac
@@ -108,6 +110,81 @@ else
     echo "[baseline] 非互動環境：未指定 controller → 預設 dwa"
 fi
 echo "[baseline] ▶ controller = $CONTROLLER"
+
+# ── 1b. 速度上限：必須與 RL 組一致（消融實驗公平性的核心）──
+# RL 的實體上限不是 yaml 的 act_max_*，而是 act_max × speed_rate
+# （policy_node.py:117-118，speed_rate 同時縮線速度與角速度）。
+# 各 checkpoint 的 speed_rate 從 0.35 到 1.0 都有，deploy_rl_shell 啟動時還會再問一次
+# → 用「底盤上限 1.0/1.2」跑 baseline 會比 RL 快 43%~186%，路線/速度比較直接失效。
+ALIGN_ARGS=()
+if ! has_arg align_rl_config "$@" && ! has_arg baseline_max_v "$@" && [ "$IS_TTY" = "1" ]; then
+    echo "┌─ 速度上限（⚠ 必須與 RL 組一致，否則這次數據不能用）──────────"
+    echo "│ RL 實體上限 = act_max × speed_rate，隨 checkpoint 與啟動時選的 speed_rate 變動。"
+    echo "│ [1] 對齊某組 RL config（自動換算，不會手算錯）  ← 推薦"
+    echo "│ [2] 直接輸入數字（已經知道 RL 那邊跑多少）"
+    echo "│ [3] 底盤真實上限 1.0 / 1.2（只有 RL 也跑 speed_rate=1.0 時才等價）"
+    echo "└──────────────────────────────────────────────────────────────"
+    read -rp "選擇 [1-3]（Enter=1 對齊）： " SPD_SEL
+    case "$SPD_SEL" in
+        2)
+            read -rp "  線速度上限 v (m/s)： " MV
+            read -rp "  角速度上限 ω (rad/s)： " MW
+            ALIGN_ARGS=("baseline_max_v:=${MV}" "baseline_max_w:=${MW}")
+            echo "[baseline] 速度上限：v=${MV} ω=${MW}（手動指定）"
+            ;;
+        3)
+            ALIGN_ARGS=("baseline_max_v:=1.0" "baseline_max_w:=1.2")
+            echo "[baseline] ⚠ 速度上限：v=1.0 ω=1.2（底盤真實上限）"
+            echo "[baseline] ⚠ RL 組若不是 speed_rate=1.0，兩組速度不對等，比較結果會被質疑"
+            ;;
+        *)
+            # 列出所有 RL config 與其換算後的實體上限，讓人直接挑
+            mapfile -t CFGS < <(python3 - <<'PY'
+import glob, os, yaml
+for f in sorted(glob.glob(os.path.expanduser(
+        "~/rover_rl/src/rover_rl_bringup/config/policy_params*.yaml"))):
+    if ".bak" in f:
+        continue
+    try:
+        p = list(yaml.safe_load(open(f, encoding="utf-8")).values())[0]["ros__parameters"]
+        v = float(p.get("act_max_linear_velocity", 1.0))
+        w = float(p.get("act_max_angular_velocity", 1.2))
+        r = float(p.get("speed_rate", 1.0))
+    except Exception:
+        continue
+    print(f"{os.path.basename(f)}\t{v*r:.2f}\t{w*r:.2f}\t{r}")
+PY
+)
+            echo "┌─ 選擇 RL 組用的 config（baseline 會換算成同樣的實體上限）────"
+            i=1
+            for line in "${CFGS[@]}"; do
+                name=$(echo "$line" | cut -f1); ev=$(echo "$line" | cut -f2)
+                ew=$(echo "$line" | cut -f3); rt=$(echo "$line" | cut -f4)
+                printf "│ [%d] %-30s 實體 v=%s ω=%s (rate %s)\n" "$i" "$name" "$ev" "$ew" "$rt"
+                i=$((i+1))
+            done
+            echo "└──────────────────────────────────────────────────────────────"
+            read -rp "選擇 [1-$((i-1))]： " CFG_SEL
+            if [ -n "$CFG_SEL" ] && [ "$CFG_SEL" -ge 1 ] 2>/dev/null \
+               && [ "$CFG_SEL" -le "${#CFGS[@]}" ]; then
+                SEL_NAME=$(echo "${CFGS[$((CFG_SEL-1))]}" | cut -f1)
+                SEL_RATE=$(echo "${CFGS[$((CFG_SEL-1))]}" | cut -f4)
+                ALIGN_ARGS=("align_rl_config:=${SEL_NAME}")
+                echo "[baseline] 對齊 ${SEL_NAME}（yaml speed_rate=${SEL_RATE}）"
+                # deploy_rl_shell 啟動 RL 時會現場問 speed_rate 並覆寫 yaml，
+                # 兩邊不一致的話這次比較就白跑了，所以一定要問。
+                echo "  ⚠ 啟動 RL 那次，speed_rate 選單有沒有改成別的值？"
+                read -rp "  有的話輸入該數字（Enter=就是 ${SEL_RATE}）： " RATE_OV
+                if [ -n "$RATE_OV" ]; then
+                    ALIGN_ARGS+=("align_speed_rate:=${RATE_OV}")
+                    echo "[baseline] speed_rate 覆寫為 ${RATE_OV}"
+                fi
+            else
+                echo "[baseline] ⚠ 未選擇 → 退回底盤上限 1.0/1.2（可能與 RL 不對等）"
+            fi
+            ;;
+    esac
+fi
 
 # ── 2. experiment_tag（診斷分組標籤，論文分析用）──
 EXP_TAG_ARG=()
@@ -256,13 +333,14 @@ echo "[baseline] 啟動 baseline 棧（controller=$CONTROLLER）→ $LOG"
 # 參數順序：本腳本算出的在前，user 的 "$@" 在最後 → ros2 launch 重複參數取最後值，命令列永遠贏。
 ros2 launch rover_rl_bringup deploy_full.launch.py \
     controller:="$CONTROLLER" "$NDT_ARG" "$LVDOT_ARG" rviz:=false \
-    "${EXP_TAG_ARG[@]}" "${PINGPONG_ARGS[@]}" "$@" >"$LOG" 2>&1 &
+    "${ALIGN_ARGS[@]}" "${EXP_TAG_ARG[@]}" "${PINGPONG_ARGS[@]}" "$@" >"$LOG" 2>&1 &
 LAUNCH_PID=$!
 
 # ── 等待「這個 controller 對應的節點」起來（不是等 rover_rl_policy——baseline 沒有它）──
 case "$CONTROLLER" in
-    dwa) WAIT_NODE="dwa_planner" ;;
-    *)   WAIT_NODE="path_following" ;;
+    dwa)  WAIT_NODE="dwa_planner" ;;
+    mppi) WAIT_NODE="mppi_planner_node" ;;
+    *)    WAIT_NODE="path_following" ;;
 esac
 echo -n "[baseline] 等待 $WAIT_NODE 啟動"
 for _ in $(seq 1 40); do

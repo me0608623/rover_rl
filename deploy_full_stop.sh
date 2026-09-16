@@ -23,6 +23,7 @@ for pat in \
   "campusrover_move/lib/campusrover_move/mppi_planner" \
   "campusrover_move/lib/campusrover_move/dwa_planner" \
   "campusrover_move/lib/campusrover_move/path_following" \
+  "rover_rl_inference/lib/rover_rl_inference/baseline_arm" \
   "baseline_status_line" \
   "onboard_detector/lib/onboard_detector/detector_node" \
   "yolov11_detector_node" "yolo_venv/bin/python" \
@@ -48,10 +49,10 @@ sleep 3
 echo "[deploy_full_stop] 已補發空 Path 清除 NDT 殘留軌跡 (/traj)"
 
 echo "[deploy_full_stop] 3) 檢查殘留..."
-n=$(ps -eo cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|pingpong_test|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|mppi_planner|dwa_planner|path_following|baseline_status_line|routing_engine|routing_to_path|routing_click|local_costmap|global_costmap|mot_node|mot_marker|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | wc -l)
+n=$(ps -eo cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|pingpong_test|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|mppi_planner|dwa_planner|path_following|baseline_arm|baseline_status_line|routing_engine|routing_to_path|routing_click|local_costmap|global_costmap|mot_node|mot_marker|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | wc -l)
 if [ "$n" -eq 0 ]; then
   echo "[deploy_full_stop] ✅ 全部已停、清乾淨 (殘留 0)"
 else
   echo "[deploy_full_stop] ⚠ 仍有 $n 個殘留:"
-  ps -eo pid,cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|mppi_planner|dwa_planner|path_following|baseline_status_line|routing|costmap|mot_node|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | head
+  ps -eo pid,cmd --no-headers | grep -E "deploy_full.launch|detector_node|policy_node|vo_safety|recovery_supervisor|orca_safety|ndt_localizer|voxel_grid_filter|world_to_map|yolov11|status_tui|lidar_preprocessor|mppi_planner|dwa_planner|path_following|baseline_arm|baseline_status_line|routing|costmap|mot_node|bev_play|map_loader|simple_map_publisher|yolo_venv" | grep -v grep | head
 fi

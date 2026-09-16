@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""baseline_status_line.py — 消融實驗 baseline（dwa/pid/pid_vo）的前景簡易狀態行。
+"""baseline_status_line.py — 消融實驗 baseline（dwa/pid/pid_vo/mppi）的前景簡易狀態行。
 
 為什麼不用 status_tui：status_tui 幾乎所有欄位都從 /rover_rl_policy/status 解出來，
 baseline 沒有 policy_node → 那個 topic 永遠不發，整個面板會卡在「等待 policy_node…」。

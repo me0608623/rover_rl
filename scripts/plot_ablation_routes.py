@@ -17,7 +17,8 @@ python3 scripts/plot_ablation_routes.py \
     --run dwa=~/rover_rl/logs/diag/diag_A \
     --run pid=~/rover_rl/logs/diag/diag_B \
     --run pid_vo=~/rover_rl/logs/diag/diag_C \
-    --run rl=~/rover_rl/logs/diag/diag_D
+    --run mppi=~/rover_rl/logs/diag/diag_D \
+    --run rl=~/rover_rl/logs/diag/diag_E
 
 # 3) 速度變化：每個演算法一張子圖，軌跡依速度上色
 python3 scripts/plot_ablation_routes.py --index ... --speed --speed-col cmd_v
@@ -71,8 +72,10 @@ DEFAULT_GRID_YAML = "/home/aa/maps/4v3F.yaml"
 # 各 controller 的固定配色：同一演算法在不同圖表中顏色一致，論文才好對照
 TAG_COLORS = {
     "rl": "#d62728", "dwa": "#1f77b4", "pid": "#2ca02c", "pid_vo": "#ff7f0e",
+    "mppi": "#9467bd",
 }
-FALLBACK_COLORS = ["#9467bd", "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
+# ⚠ 這裡不能再放 TAG_COLORS 已用掉的顏色，否則某組 baseline 會跟固定配色撞色
+FALLBACK_COLORS = ["#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
 # ── 讀資料 ──

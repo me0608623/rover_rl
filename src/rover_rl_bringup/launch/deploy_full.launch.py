@@ -21,7 +21,7 @@
     [8] policy_node        — sweep + odom + goal → /input/nav_cmd_vel（僅 controller=rl）
     [9] bev_play           — 即時 BEV 圖 → /rover_rl/bev_image（僅 controller=rl）
 
-  消融實驗 baseline（controller:=dwa|pid|pid_vo，論文用傳統演算法對照組）:
+  消融實驗 baseline（controller:=dwa|pid|pid_vo|mppi，論文用傳統演算法對照組）:
     controller=dwa      — campusrover_move/dwa_planner（軌跡取樣 DWA，吃 /campusrover_local_costmap
                            做靜態避障）→ /input/nav_cmd_vel。速度/角速度上限統一為底盤真實上限
                            v=1.0 m/s, ω=1.2 rad/s（與 RL 實際可達上限一致，見 dwa_baseline 參數）。
@@ -33,7 +33,20 @@
                            故 vo_safety_node 在無 policy status 時會改直接吃 72-bin sweep
                            還原 front/left/right_m，補回前方 LiDAR 安全煞（0.5m 硬停），
                            否則靜態障礙（牆/家具）在此組合下完全沒人擋。
-    三者共用同一套 NDT/costmap/routing/LV-DOT/diag_logger/pingpong_test 基礎設施，只換
+    controller=mppi      — campusrover_move/mppi_planner 的原生 path-following 模式
+                           （取樣式 MPC：batch 230 × horizon 70 步 × dt 0.05 = 3.5s 前瞻，
+                           path_follow/path_align/goal/obstacle cost）→ /input/nav_cmd_vel。
+                           參數 rover_rl_bringup/config/mppi_baseline.yaml，vx_max 拉到 1.0
+                           與其他組對齊、dynamic critic 關（型別接不上 LV-DOT），
+                           故與 dwa 同條件：都只吃 /campusrover_local_costmap 的靜態障礙。
+                           ⚠ 與 enable_mppi:=true 的 static_guard 三層協作模式是兩回事，
+                           後者吃 RL 的 reference_cmd、不吃 global_path，只在 controller=rl 啟。
+
+    ⚠ 四組 baseline 都需要 baseline_arm 節點呼叫 planner_function* service 才會動
+      （三個 planner 都是 action_flag_=false 開機，不 arm 就完全不發 cmd_vel 且不報錯），
+      該 service 同時覆寫速度上限與避障開關 → 統一上限的真值在 baseline_arm，見 Part 11e。
+
+    四者共用同一套 NDT/costmap/routing/LV-DOT/diag_logger/pingpong_test 基礎設施，只換
     「誰在發 /input/nav_cmd_vel」，確保與 controller=rl 比較時公平（同 TF、同 costmap、
     同測試協定）。diag_logger 的 experiment_tag 預設自動帶 controller 值。
     pingpong_test 在非 rl controller 下會用 require_policy_status:=false（TF+/odom 取代
@@ -54,6 +67,8 @@
 """
 import os
 
+import yaml
+
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (
@@ -62,12 +77,14 @@ from launch.actions import (
     IncludeLaunchDescription,   # 引入其他 launch 檔（NDT 子模組用）
     LogInfo,                    # 啟動 banner
     OpaqueFunction,             # 啟動時讀參數真值再建節點（policy 用）
+    SetLaunchConfiguration,     # 算好的 baseline 速度上限廣播給多個節點共用
     TimerAction,                # 延遲啟動（NDT 子模組需等地圖/降採樣就緒）
 )
 from launch.conditions import IfCondition   # 依 bool 參數決定節點是否啟動
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -430,9 +447,22 @@ def generate_launch_description():
         ge = LaunchConfiguration("goal_change_eps_m").perform(context)
         et = LaunchConfiguration("experiment_tag").perform(context)
         ctrl = LaunchConfiguration("controller").perform(context)
-        # 消融實驗：留空自動帶 controller（rl/dwa/pid/pid_vo），有給才用自訂值
+        # 消融實驗：留空自動帶 controller（rl/dwa/pid/pid_vo/mppi），有給才用自訂值
         # （可自訂加場景後綴，如 dwa_fixed_obstacle）
         ov["experiment_tag"] = et if et != "" else ctrl
+        # 消融實驗重現性：diag 的 <csv>_params.json 是「事後證明兩組跑在同一組上限」的
+        # 唯一載體，但它只抓 policy_node_name 指到的那一個節點的參數，baseline 沒有
+        # policy_node → 15 秒後逾時、params 整個空白，速度上限無從查證。
+        # 改指向該 controller 的 planner 節點，記下它實際拿到的速度上限與演算法參數。
+        # （planner 的 C++ service callback 改的是成員變數、不寫回 parameter server，
+        #   但那份值與 baseline_arm 送進去的來自同一個 resolve_baseline_limits，故一致。）
+        if ctrl != "rl":
+            ov["policy_node_name"] = {
+                "dwa": "dwa_planner",
+                "pid": "path_following",
+                "pid_vo": "path_following",
+                "mppi": "mppi_planner_node",
+            }.get(ctrl, "baseline_arm")
         if rs != "":
             ov["require_start"] = _b(rs)
         if ew != "":
@@ -647,6 +677,84 @@ def generate_launch_description():
         )]
     recovery_supervisor_node = OpaqueFunction(function=make_recovery_supervisor_node)
 
+    # ── Part 11c-2: 算出 baseline 的速度上限（消融實驗公平性的核心）──
+    # ⚠ 這段是「跟 RL 對齊」的唯一真值來源，dwa / pid / mppi / baseline_arm 四處共用。
+    #
+    # RL 的實體速度上限不是 yaml 的 act_max_*_velocity，而是：
+    #     實體 v = act_max_linear_velocity  × speed_rate
+    #     實體 ω = act_max_angular_velocity × speed_rate        (policy_node.py:117-118)
+    # speed_rate 是「時間膨脹」，**同時**縮線速度與角速度，而且：
+    #   · 每個 checkpoint 的 yaml 值都不同（0.35 ~ 1.0，實體 v 從 0.35 到 1.00 m/s）
+    #   · deploy_rl_shell 啟動時還會再問一次 speed_rate，現場覆寫 yaml
+    # → 把 baseline 硬編成「底盤上限 1.0/1.2」會讓它比 RL 快 43%~186%，
+    #   「相同點位的路線與速度變化」這個比較直接失效。
+    #
+    # 用法（二選一）：
+    #   align_rl_config:=sa4r2              ← 推薦：自動讀該 RL yaml 換算，不會手算錯
+    #   align_rl_config:=sa4r2 align_speed_rate:=0.7   ← RL 啟動時現場改過 speed_rate 就補這個
+    #   baseline_max_v:=0.7 baseline_max_w:=0.84       ← 直接給數字
+    def resolve_baseline_limits(context, *args, **kwargs):
+        if LaunchConfiguration("controller").perform(context) == "rl":
+            return []
+        v = float(LaunchConfiguration("baseline_max_v").perform(context))
+        w = float(LaunchConfiguration("baseline_max_w").perform(context))
+        align = LaunchConfiguration("align_rl_config").perform(context).strip()
+        src = "baseline_max_v/w 直接指定"
+
+        if align:
+            # 接受 variant 名（sa4r2）、檔名（policy_params_sa4r2.yaml）或絕對路徑
+            if os.path.isabs(align):
+                path = align
+            elif align.endswith(".yaml"):
+                path = os.path.join(rl_pkg, "config", align)
+            else:
+                path = os.path.join(rl_pkg, "config", f"policy_params_{align}.yaml")
+            if not os.path.isfile(path):
+                return [LogInfo(msg=(
+                    f"\n🔴 align_rl_config='{align}' 找不到對應檔案：{path}\n"
+                    f"   速度上限無法對齊 RL，這次的比較數據不可用。請確認 variant 名稱。\n"
+                ))]
+            with open(path, encoding="utf-8") as fh:
+                rp = list(yaml.safe_load(fh).values())[0]["ros__parameters"]
+            act_v = float(rp.get("act_max_linear_velocity", 1.0))
+            act_w = float(rp.get("act_max_angular_velocity", 1.2))
+            rate = float(rp.get("speed_rate", 1.0))
+            # speed_rate 也縮加速度（policy_node.py:1328/1332），所以 RL 的實體加速度
+            # 同樣要 ×rate。這兩個數字**目前不會自動套到 baseline**（見下方 LogInfo 的
+            # 提醒）：加速度限制在 dwa 是取樣範圍（改了不限制輸出）、在 mppi 才是真限制，
+            # 硬壓會改變演算法本身的行為。先顯性印出落差，要不要對齊是論文方法論決策。
+            acc_v = float(rp.get("act_max_linear_accel", 0.5)) * rate
+            acc_w = float(rp.get("act_max_angular_accel", 3.0)) * rate
+            override = LaunchConfiguration("align_speed_rate").perform(context).strip()
+            if override:
+                rate = float(override)
+                src = f"對齊 {os.path.basename(path)}（speed_rate 由命令列覆寫為 {rate}）"
+            else:
+                src = f"對齊 {os.path.basename(path)}（yaml speed_rate={rate}）"
+            v = act_v * rate
+            w = act_w * rate
+
+        return [
+            SetLaunchConfiguration("baseline_v_final", f"{v:.4f}"),
+            SetLaunchConfiguration("baseline_w_final", f"{w:.4f}"),
+            SetLaunchConfiguration("baseline_v_neg", f"{-v:.4f}"),
+            SetLaunchConfiguration("baseline_w_neg", f"{-w:.4f}"),
+            LogInfo(msg=(
+                f"\n[消融實驗] baseline 速度上限 v={v:.3f} m/s  ω={w:.3f} rad/s"
+                f"\n            來源：{src}"
+                f"\n            ⚠ RL 組必須跑在同一組上限（RL 實體上限 = act_max × speed_rate），"
+                f"否則路線/速度比較無效"
+                + (f"\n            ── 加速度（目前未對齊，僅供判讀）──"
+                   f"\n            RL 實體加速度：線 {acc_v:.2f} m/s²  角 {acc_w:.2f} rad/s²"
+                   f"\n            baseline：dwa 無輸出加速度限制（5.0 僅取樣範圍）／"
+                   f"mppi 線 1.5 角 10.0／pid 內部步進"
+                   f"\n            → baseline 起步會比 RL 猛，畫「速度變化」曲線時要一併說明"
+                   if align else "")
+                + "\n"
+            )),
+        ]
+    baseline_limits = OpaqueFunction(function=resolve_baseline_limits)
+
     # ── Part 11d: 消融實驗 baseline 演算法（controller:=dwa|pid|pid_vo）──
     # 兩個節點都是既有、已在此車上跑過的 campusrover_move 演算法（非新寫），只是這裡
     # 加上「速度/角速度上限統一為底盤真實上限」的參數組，跟 RL 做公平比較。
@@ -671,10 +779,15 @@ def generate_launch_description():
             "arriving_range_angle": 0.05,
             "max_linear_acceleration": 5.0,   # 只影響 DWA 內部速度取樣範圍，非致動器限制
             "max_angular_acceleration": 5.0,
-            "max_linear_velocity": 1.0,       # 消融實驗統一底盤上限（與 RL 實際可達上限一致）
-            "min_linear_velocity": -1.0,
-            "max_angular_velocity": 1.2,
-            "min_angular_velocity": -1.2,
+            # ⚠ 速度上限一律由 Part 11c-2 的 resolve_baseline_limits 算出（對齊 RL 的
+            #   act_max × speed_rate），不要在這裡填死數字——RL 的實體上限隨 checkpoint
+            #   與啟動時選的 speed_rate 變動（0.35~1.00 m/s），填死等於送 baseline 速度優勢。
+            #   另注意：這四個值會在 arm 時被 planner_function_dwa 的 speed_parameter 覆寫，
+            #   baseline_arm 吃的是同一組 LaunchConfiguration，兩邊保證一致。
+            "max_linear_velocity": ParameterValue(LaunchConfiguration("baseline_v_final"), value_type=float),
+            "min_linear_velocity": ParameterValue(LaunchConfiguration("baseline_v_neg"), value_type=float),
+            "max_angular_velocity": ParameterValue(LaunchConfiguration("baseline_w_final"), value_type=float),
+            "min_angular_velocity": ParameterValue(LaunchConfiguration("baseline_w_neg"), value_type=float),
             "target_point_dis": 3.0,
             "threshold_occupied": 2.0,
             # footprint_* 在 dwa_planner.cpp 裡宣告/讀取後未再使用（死參數，真正的靜態避障
@@ -727,8 +840,9 @@ def generate_launch_description():
             "robot_frame": "base_link",
             "arriving_range_dis": 0.1,
             "arriving_range_angle": 0.05,
-            "max_linear_velocity": 1.0,   # 消融實驗統一底盤上限
-            "max_angular_velocity": 1.2,
+            # ⚠ 同 dwa：對齊 RL 的實體上限，由 resolve_baseline_limits 算出
+            "max_linear_velocity": ParameterValue(LaunchConfiguration("baseline_v_final"), value_type=float),
+            "max_angular_velocity": ParameterValue(LaunchConfiguration("baseline_w_final"), value_type=float),
             "target_point_dis": 0.6,
             "threshold_occupied": 2.0,
             # footprint_* 是 path_following.cpp CostmapCallback() 的「停車框」（障礙物落入即
@@ -757,6 +871,89 @@ def generate_launch_description():
             "'", controller, "' in ('pid', 'pid_vo')"
         ])),
     )
+
+    # controller=mppi：取樣式 MPC baseline（campusrover_move/mppi_planner 原生 path 模式）。
+    #   ⚠ 與 Part 10b 的 static_guard 是同一支 executable、完全不同用法，別混淆：
+    #       static_guard = 吃 RL 的 reference_cmd、不吃 global_path（RL 導航 + MPPI 只做靜態避障）
+    #       baseline     = 吃 /global_path 自己導航，是獨立的傳統演算法對照組
+    #   參數檔 mppi_baseline.yaml 沒設 static_guard_mode → C++ 預設 false（mppi_planner.cpp:138），
+    #   即原生 path-following 模式：path_follow/path_align/goal/obstacle cost 全部生效。
+    def make_mppi_baseline_node(context, *args, **kwargs):
+        if LaunchConfiguration("controller").perform(context) != "mppi":
+            return []
+        lv = LaunchConfiguration("log_level").perform(context)
+        cfg = LaunchConfiguration("mppi_baseline_params_file").perform(context)
+        if not cfg:
+            cfg = os.path.join(rl_pkg, "config", "mppi_baseline.yaml")
+        return [Node(
+            package="campusrover_move",
+            executable="mppi_planner",
+            name="mppi_planner_node",
+            output="screen",
+            emulate_tty=True,
+            # yaml 之後疊一層速度覆寫：mppi 的 serviceCallback 不吃 speed_parameter
+            # （dwa/pid 才吃），所以它的上限只能從 parameters 進來。
+            # vx_min 保持 yaml 的 0.0（正常行進禁止倒車），只覆寫上限與角速度對稱範圍。
+            parameters=[cfg, {
+                "vx_max": ParameterValue(LaunchConfiguration("baseline_v_final"),
+                                         value_type=float),
+                "wz_max": ParameterValue(LaunchConfiguration("baseline_w_final"),
+                                         value_type=float),
+                "wz_min": ParameterValue(LaunchConfiguration("baseline_w_neg"),
+                                         value_type=float),
+            }],
+            arguments=["--ros-args", "--log-level", lv],
+            remappings=[
+                ("global_path", "/global_path"),
+                ("costmap", LaunchConfiguration("mppi_costmap_topic")),
+                ("cmd_vel", "/input/nav_cmd_vel"),
+                ("odom", "/odom"),
+                ("elevator_path", "/rover_rl/_baseline_unused_elevator"),
+                # LV-DOT 發的是 onboard_detector/DynamicObstacleArray，這裡要的是
+                # campusrover_msgs/DynamicObstacleArray —— 型別不相容接不上，
+                # 故 yaml 已關 dynamic critic，此處 remap 到空 topic（與 dwa 同條件：只吃 costmap）
+                ("dynamic_obstacles", "/rover_rl/_baseline_unused_dynobs"),
+                ("reference_cmd", "/rover_rl/_baseline_unused_refcmd"),
+            ],
+        )]
+    mppi_baseline_node = OpaqueFunction(function=make_mppi_baseline_node)
+
+    # ── Part 11e: baseline planner 的 arm 橋接（controller!=rl 才啟）──
+    # 為什麼一定要有：dwa_planner / path_following / mppi_planner 三者都是
+    # action_flag_=false 開機，控制迴圈開頭就 return（dwa:327 / pid:358 / mppi:414）
+    # → 不呼叫 planner_function* service，車完全不動而且不印任何錯誤。
+    # 且該 service 會覆寫 launch parameters 裡的速度上限與避障開關：
+    #     max_linear_velocity_ = req->speed_parameter.linear.x;   (dwa:1179 / pid:1035)
+    #     enable_costmap_obstacle_ = req->obstacle_avoidance.data;
+    # → **消融實驗「統一速度上限 v=1.0 / ω=1.2」的真正生效點在這個節點，不是上面的
+    #   parameters 區塊**（那份只在 service 呼叫前短暫生效）。兩邊數字必須一致。
+    def make_baseline_arm_node(context, *args, **kwargs):
+        ctrl = LaunchConfiguration("controller").perform(context)
+        if ctrl == "rl":
+            return []
+        lv = LaunchConfiguration("log_level").perform(context)
+        return [Node(
+            package="rover_rl_inference",
+            executable="baseline_arm",
+            name="baseline_arm",
+            output="screen",
+            emulate_tty=True,
+            parameters=[{
+                "controller": ctrl,
+                # 與 dwa/pid/mppi 同一組數字（resolve_baseline_limits 算出）。
+                # ⚠ 這裡才是 dwa/pid 真正生效的上限：service 的 speed_parameter 會覆寫
+                #   planner 的 parameters，兩邊必須來自同一個來源，否則悄悄不一致。
+                "max_linear_velocity": float(
+                    LaunchConfiguration("baseline_v_final").perform(context)),
+                "max_angular_velocity": float(
+                    LaunchConfiguration("baseline_w_final").perform(context)),
+                # dwa 要吃 costmap 做靜態避障；pid/pid_vo 刻意零避障（交給 VO 或不做）。
+                # mppi 的 serviceCallback 不讀這欄，靜態避障由 yaml 的 obstacle critic 決定。
+                "obstacle_avoidance": ctrl == "dwa",
+            }],
+            arguments=["--ros-args", "--log-level", lv],
+        )]
+    baseline_arm_node = OpaqueFunction(function=make_baseline_arm_node)
 
     # ── Part 12: 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）──
     # 把車手動開到 A/B 任一點停穩 → 自動規劃往對向點，A↔B 無限來回，供反覆測避障。
@@ -803,8 +1000,9 @@ def generate_launch_description():
         "    [8] policy_node\n"
         "    [9] bev_play\n"
         "    [10] LV-DOT 動態偵測 (/onboard_detector/*)\n"
-        "  消融實驗 baseline (controller=dwa|pid|pid_vo 才啟):\n"
-        "    [11] dwa_planner / path_following → /input/nav_cmd_vel\n"
+        "  消融實驗 baseline (controller=dwa|pid|pid_vo|mppi 才啟):\n"
+        "    [11] dwa_planner / path_following / mppi_planner → /input/nav_cmd_vel\n"
+        "    [12] baseline_arm（arm 上面的 planner，缺它車不會動）\n"
         "  排除: DWA + AIT* 預設關（controller=dwa 時由此開回 DWA；"
         "AIT* 一律用 routing 取代）\n"
         "================================"
@@ -815,18 +1013,21 @@ def generate_launch_description():
         # 在此設定所有啟動參數的「預設值」與說明，可在命令列覆寫
         # 例：ros2 launch ... deploy_full.launch.py initial_mode:=idle enable_mot:=false
         DeclareLaunchArgument("controller", default_value="rl",
-                              description="rl|dwa|pid|pid_vo — 消融實驗用，決定誰發 "
+                              description="rl|dwa|pid|pid_vo|mppi — 消融實驗用，決定誰發 "
                                           "/input/nav_cmd_vel。rl=policy_node(可疊 mppi/vo/orca/"
                                           "recovery，現況預設)；dwa=campusrover_move/dwa_planner"
                                           "（軌跡取樣 DWA + costmap 靜態避障）；pid="
                                           "campusrover_move/path_following（純路徑跟蹤，無避障）；"
-                                          "pid_vo=path_following + vo_safety_node（動態避障）。"
+                                          "pid_vo=path_following + vo_safety_node（動態避障）；"
+                                          "mppi=campusrover_move/mppi_planner 原生 path 模式"
+                                          "（取樣式 MPC，3.5s 前瞻 + costmap 靜態避障，"
+                                          "參數 mppi_baseline.yaml）。"
                                           "非 rl 時 lidar_preprocessor/policy_node/bev/mppi/orca/"
                                           "recovery 一律不啟，NDT/costmap/routing/LV-DOT/diag_logger/"
                                           "pingpong_test 照常共用。"),
         DeclareLaunchArgument("experiment_tag", default_value="",
                               description="診斷記錄 experiment_tag。留空自動帶 controller 值"
-                                          "（rl/dwa/pid/pid_vo），可自訂加場景後綴如 "
+                                          "（rl/dwa/pid/pid_vo/mppi），可自訂加場景後綴如 "
                                           "dwa_fixed_obstacle"),
         DeclareLaunchArgument("model_path", default_value="",
                               description="覆寫 yaml model_path"),
@@ -888,6 +1089,29 @@ def generate_launch_description():
         DeclareLaunchArgument("mppi_params_file", default_value="",
                               description="MPPI static_guard 參數檔。空=用 campusrover_move 內建 "
                                           "config/mppi_static_guard.yaml"),
+        DeclareLaunchArgument("align_rl_config", default_value="",
+                              description="⭐消融實驗公平性：把 baseline 的速度上限自動對齊某組 RL "
+                                          "設定。給 variant 名（sa4r2）、檔名"
+                                          "（policy_params_sa4r2.yaml）或絕對路徑；"
+                                          "換算 = act_max_*_velocity × speed_rate"
+                                          "（policy_node.py:117-118，speed_rate 同時縮 v 與 ω）。"
+                                          "留空則用 baseline_max_v/w 的值。"),
+        DeclareLaunchArgument("align_speed_rate", default_value="",
+                              description="覆寫 align_rl_config 讀到的 speed_rate。"
+                                          "⚠ deploy_rl_shell 啟動 RL 時會現場問一次 speed_rate "
+                                          "（Enter=0.6）並覆寫 yaml → RL 那次實際跑的值若與 yaml "
+                                          "不同，這裡要填一樣的數字，否則兩組上限不一致。"),
+        DeclareLaunchArgument("baseline_max_v", default_value="1.0",
+                              description="baseline 線速度上限 (m/s)。⚠ 預設 1.0 是底盤真實上限，"
+                                          "只有 RL 也跑在 speed_rate=1.0（如 sa1r1）時才等價；"
+                                          "其他 checkpoint 請用 align_rl_config 自動換算。"),
+        DeclareLaunchArgument("baseline_max_w", default_value="1.2",
+                              description="baseline 角速度上限 (rad/s)。同上，預設是底盤真實上限。"),
+        DeclareLaunchArgument("mppi_baseline_params_file", default_value="",
+                              description="controller:=mppi 的參數檔。留空用 rover_rl_bringup/"
+                                          "config/mppi_baseline.yaml（原生 path 模式，vx_max 對齊 "
+                                          "1.0、dynamic critic 關）。⚠ 不要拿 mppi_static_guard.yaml "
+                                          "餵這裡，那份是 RL 三層協作用的、不吃 global_path"),
         DeclareLaunchArgument("mppi_costmap_topic", default_value="/campusrover_local_costmap",
                               description="MPPI 靜態避障吃的 local costmap topic（需 enable_costmap）"),
         DeclareLaunchArgument("enable_orca", default_value="false",
@@ -970,9 +1194,15 @@ def generate_launch_description():
         orca_safety_node,
         recovery_supervisor_node,
 
-        # 消融實驗 baseline（controller:=dwa|pid|pid_vo 才啟，預設 rl 不啟這兩個）
+        # 消融實驗 baseline（controller:=dwa|pid|pid_vo|mppi 才啟，預設 rl 一個都不啟）
+        # ⚠ baseline_limits 必須排在四個節點之前：它用 SetLaunchConfiguration 廣播
+        #   算好的速度上限，下面四個都靠那組值（順序顛倒會拿到未定義的 configuration）。
+        baseline_limits,
         dwa_baseline_node,
         pid_baseline_node,
+        mppi_baseline_node,
+        # ⚠ 上面三個 planner 都需要 arm 才會發 cmd_vel，缺這個節點車不動且不報錯
+        baseline_arm_node,
 
         # 兩固定點往返避障測試（預設關，enable_pingpong:=true 開啟）
         pingpong_test_node,

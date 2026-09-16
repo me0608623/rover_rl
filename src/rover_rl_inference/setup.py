@@ -51,6 +51,8 @@ setup(
             "recovery_supervisor = rover_rl_inference.recovery_supervisor_node:main",
             # 兩固定點往返避障測試：車停在 A/B 任一點即自動規劃往對向點，無限來回
             "pingpong_test = rover_rl_inference.pingpong_test_node:main",
+            # 消融實驗：arm campusrover_move 的傳統 planner（不呼叫 service 車不會動）
+            "baseline_arm = rover_rl_inference.baseline_arm_node:main",
         ],
     },
 )
