@@ -243,10 +243,24 @@ mppi_planner_node:
     # 目標判定參數
     # ============================================================================
     # 到達目標的距離閾值（米）
+    # ⚠ 維持 0.1：dwa_planner / path_following 在 deploy_full.launch.py:803,884 也被
+    #   明確設成 0.1（覆寫了 C++ 預設 0.2），三個 planner 實跑必須同基準才公平。
+    #   2026-09-17 曾想放寬到 0.2，查 launch 後撤回——繞圈的真因不是容差而是缺少
+    #   位置鎖存（見下方 goal_latch_*）；log 已證 MPPI 摸得到 0.1m 圈（dist=0.089/0.077）。
     arriving_range_dis: 0.1
 
     # 到達目標的角度閾值（弧度）
+    # ⚠ 同上，維持 0.05 與 dwa/pid 一致。
     arriving_range_angle: 0.05
+
+    # ── 位置到達鎖存（2026-09-17 新增，對齊 dwa_planner 語義）──
+    # 摸到 arriving_range_dis 一次就鎖住，之後只對齊角度、不再重算位置。
+    # 沒有鎖存時，定位噪聲會把 dist 抖出容差圈 → 每次都退回 MPPI 前進階段 → 繞圈。
+    # 鎖存後偏離超過此距離才解除（有人推車 / 定位大跳的保險）
+    goal_latch_release_dis: 0.6
+    # 終點位移超過此值視為新的一段目標 → 解鎖
+    # （routing_to_path 是 2Hz 重發同一條 path，不能一收到 path 就解鎖）
+    goal_latch_new_goal_eps: 0.3
 
     # 開始考慮目標成本的距離閾值（米）
     # 當機器人距離目標小於此值時，目標成本才會被考慮
